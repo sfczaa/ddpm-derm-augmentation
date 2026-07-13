@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# large / generated artifacts — keep the folder skeleton + docs, ignore contents
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+!outputs/README.md
+*.pt
+*.pth
+*.ckpt
+
+# never commit the dataset itself (HAM10000 is non-commercial licensed)
+data/
+
+# local project handoff / experiment records — keep off GitHub
+/COLAB_RESUME_SOP.md
+/EXPERIMENT_LOG.docx
+/EXPERIMENT_LOG.md
+/HANDOFF.md
