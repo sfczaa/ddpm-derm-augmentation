@@ -3,10 +3,14 @@
 Portfolio project: **can a DDPM actually help a downstream classifier** on the
 imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
 (dermatofibroma, only 115 images). End goal is a deployable demo
-(FastAPI + Docker + Hugging Face Spaces).
+(FastAPI + Docker, with versioned assets on Hugging Face Hub).
 
-> Status: **Stage 1 (data layer + C0/C1 classifier baseline) scaffolded and
-> smoke-tested.** DDPM (Stage 2) and deployment (Stage 4) are not built yet.
+> Status: **The formal matched-585 experiment is complete and the Stage 4
+> deployment MVP is implemented.** The selected deploy candidate is C1@585
+> seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
+> safety paths are locally verified. Real deployment-only checkpoint inference
+> and the FastAPI runtime were exercised in Colab; Docker build and the public
+> Render deployment are still unvalidated.
 
 ## What exists now
 
@@ -22,6 +26,15 @@ ddpm-derm-augmentation/
   scripts/
     smoke_test.py        # torch-free verification of data + metrics
     aggregate_results.py # mean +/- std across seeds
+    export_deploy_checkpoint.py
+    package_gallery_for_deploy.py
+  app/                   # FastAPI service + browser UI
+  deploy/                # immutable deploy metadata + class mapping
+  tests/test_deploy.py   # torch-free asset/input/API tests
+  Dockerfile
+  Dockerfile.render
+  render.yaml
+  requirements-deploy.txt
   notebooks/
     colab_classifier_baseline.py   # `# %%` cell script for Colab
   requirements.txt
@@ -34,7 +47,12 @@ torch and are meant to run on Colab.
 
 ## Data
 
-Not committed (HAM10000 is non-commercial licensed; `.gitignore` excludes it).
+Not committed (`.gitignore` excludes it). The ISIC 2018 distribution identifies
+HAM10000 as CC BY-NC 4.0, so this project and public demo are non-commercial and
+must retain attribution, a license link, and an indication of modifications.
+Credit: HAM10000 Dataset © ViDIR Group, Department of Dermatology, Medical
+University of Vienna; Tschandl, Rosendahl & Kittler, *Scientific Data* 5,
+180161 (2018), https://doi.org/10.1038/sdata.2018.161.
 The dataset lives **inside the project** at `data/` (10k images + `manifests/`),
 so the whole project is a single self-contained upload. The code finds a data
 dir containing `manifests/class_to_idx.json` in this order
@@ -103,29 +121,76 @@ See `outputs/README.md` for the full layout and where to drop files you ran.
 The agreed composition is **585 = 85 real train df + 500 generated**, so both
 C1 and C4 run with `--df-target-count 585`.
 
-**C4 status:** the torch-free wiring is implemented and smoke-tested locally
-(`build_classifier_frame("C4", ...)`, a portable synthetic manifest, and the
-`sample_ddpm` → `publish_synthetic` staging/validate/publish flow). The formal
-epoch-100 generated dataset and the GPU C1/C4 classifier runs have **not** been
-executed yet. C4 reads its synthetic df from an explicit
-`--generated-manifest` (relative image paths, resolved against the manifest
-dir); there is no default synthetic directory.
+**C4 status:** the formal epoch-100 synthetic dataset and matched-585 C1/C4
+runs are complete. Across three seeds, C1@585 test df F1 was 0.660 +/- 0.042
+and C4@585 was 0.612 +/- 0.042. This does not support a downstream benefit
+from the current synthetic data; the fixed-split, small-df result is
+suggestive only. C4 still reads an explicit portable generated manifest.
 
-## Not done yet (next milestones, in order)
+## Stage 4 deployment MVP
 
-1. **Formal epoch-100 synthetic df on Colab** — sample 500 df from the epoch-100
-   EMA snapshot onto `/content` staging, then `publish_synthetic` to the
-   versioned `outputs/synthetic_df/epoch0100_seed0/` (writes `_READY.json` only
-   after a destination re-validation). *(Stage-1 C0/C1 baseline already done.)*
-2. **Matched-585 C1/C4 on Colab** — C1 (`--df-target-count 585`) and C4
-   (`--df-target-count 585 --generated-manifest .../epoch0100_seed0/synthetic_df.csv`)
-   × 3 seeds into a **new** `outputs/classifier_df585/` base (Stage-1
-   `outputs/classifier/` is left intact). C0 is reused from Stage 1.
-3. **Combined C0/C1/C4 aggregation + figures** — `aggregate_results.py` reads
-   one dir per call, so the Stage-1 C0 and the matched-585 C1/C4 are currently
-   summarised as two tables; a single C0/C1/C4 view still needs a small update.
-4. **Stage 4 — deployment**: FastAPI inference + gallery, Docker, HF Spaces,
-   medical disclaimer, license notice.
+The service provides `/health`, `/api/predict`, `/api/gallery`, OpenAPI docs,
+and a browser UI. Uploads are held in memory only. Extension, MIME type,
+content format, dimensions, and a 5 MB size limit are enforced before
+inference. Startup fails on missing or mismatched checkpoint hash, class map,
+gallery `_READY.json`, metadata, manifest, or image files.
+
+Default local assets:
+
+```text
+DDPM_DERM_MODEL_PATH=outputs/classifier_df585/checkpoints/C1_seed2/best.pt
+DDPM_DERM_MODEL_MANIFEST=deploy/model_manifest.json
+DDPM_DERM_CLASS_MAP_PATH=deploy/class_to_idx.json
+DDPM_DERM_GALLERY_DIR=outputs/synthetic_df/epoch0100_seed0
+```
+
+The inference transform is the training evaluation transform: RGB, resize to
+128x128, tensor conversion, and ImageNet normalization. The model is ResNet-18
+with the original seven-class mapping. The gallery is the first 24 rows of the
+published 500-row manifest, not manually selected, and no DDPM runs per request.
+
+Local API tests (do not load torch):
+
+```powershell
+$env:PYTHONPATH="src;."
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Docker uses read-only model and gallery mounts; the checkpoint is never copied
+into the image or committed to Git:
+
+```powershell
+docker build -t ddpm-derm-demo .
+docker run --rm -p 7860:7860 `
+  --mount type=bind,source="${PWD}\outputs\classifier_df585\checkpoints\C1_seed2\best.pt",target=/models/best.pt,readonly `
+  --mount type=bind,source="${PWD}\outputs\synthetic_df",target=/gallery,readonly `
+  ddpm-derm-demo
+```
+
+Then check `http://localhost:7860/health`, `/docs`, and the upload UI. This
+repository has not yet been Docker-built locally.
+See `deploy/README_SPACE.md` for the Hugging Face Spaces handoff.
+
+Hugging Face currently requires a paid plan for Docker Spaces, so the free
+public deployment route uses `Dockerfile.render` and the root `render.yaml`.
+The image build downloads pinned public Hub revisions: a 42.7 MB
+deployment-only checkpoint derived without retraining, and a SHA-verified 3 MB
+archive containing the exact 500-image gallery. The single-archive asset path
+was downloaded and safely extracted locally. See `deploy/README_RENDER.md`.
+
+In Colab, the deployment-only checkpoint produced seven probabilities with no
+pandas import. A full Uvicorn/FastAPI health and prediction request returned
+HTTP 200 with the disclaimer; measured RSS was 385.5 MB current and 408.9 MB
+peak. These are user-run Colab results, not a completed Render validation.
+
+## Remaining deployment validation
+
+1. Build `Dockerfile.render` and test `/health`, valid upload, invalid upload, and
+   gallery rendering.
+2. Push the reviewed deployment files to GitHub and create the Render Blueprint
+   on the explicit free plan.
+3. Run the public URL acceptance checks in `deploy/README_RENDER.md`. Record the
+   URL only after those checks pass, including one cold-start check.
 
 ## Constraints honored
 

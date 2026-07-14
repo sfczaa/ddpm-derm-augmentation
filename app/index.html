@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HAM10000 Portfolio Demo</title>
+  <style>
+    :root { color-scheme: light; --ink:#18211d; --muted:#647069; --paper:#f4f1e9;
+      --card:#fffdf8; --accent:#146b55; --line:#d8d6cd; --warn:#8b3d2e; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+    main { width:min(1080px,92vw); margin:0 auto; padding:48px 0 72px; }
+    header { display:grid; grid-template-columns:1.4fr 1fr; gap:32px; align-items:end; margin-bottom:32px; }
+    h1 { font:700 clamp(2.3rem,6vw,5rem)/.95 Georgia,serif; margin:0 0 16px; letter-spacing:-.04em; }
+    h2 { font:700 1.6rem/1.2 Georgia,serif; margin:0 0 16px; }
+    p { margin:0 0 12px; } .eyebrow { color:var(--accent); font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:24px; box-shadow:0 12px 30px #24352d0d; }
+    .warning { border-left:5px solid var(--warn); color:#57261d; }
+    .workspace { display:grid; grid-template-columns:minmax(260px,.8fr) 1.2fr; gap:24px; margin:24px 0 40px; }
+    label { display:block; font-weight:700; margin-bottom:8px; }
+    input[type=file] { width:100%; padding:12px; border:1px dashed var(--accent); border-radius:12px; background:#f7fbf8; }
+    button { width:100%; margin-top:14px; border:0; border-radius:12px; padding:13px 18px; color:white;
+      background:var(--accent); font-weight:800; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    #preview { display:none; width:100%; max-height:260px; object-fit:contain; border-radius:12px; margin-top:14px; background:#eee; }
+    #status { min-height:24px; margin-top:12px; color:var(--muted); }
+    .prediction { display:none; } .prediction strong { font-size:1.25rem; color:var(--accent); }
+    .bar-row { display:grid; grid-template-columns:52px 1fr 64px; gap:10px; align-items:center; margin:9px 0; }
+    .bar { height:12px; background:#e5e6df; border-radius:99px; overflow:hidden; }
+    .bar > span { display:block; height:100%; background:var(--accent); }
+    .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:12px; }
+    .gallery figure { margin:0; } .gallery img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:12px; background:#ddd; }
+    .gallery figcaption { font-size:.72rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
+    .small { color:var(--muted); font-size:.9rem; }
+    footer { margin-top:48px; padding-top:24px; border-top:1px solid var(--line); color:var(--muted); font-size:.85rem; }
+    footer a { color:var(--accent); }
+    @media (max-width:760px) { header,.workspace { grid-template-columns:1fr; } main { padding-top:28px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><div class="eyebrow">Technical portfolio demo</div><h1>Skin lesion classifier</h1>
+      <p>Upload one dermatoscopic image to view probabilities for the seven HAM10000 classes.</p></div>
+    <div class="card warning"><strong>Not a medical device.</strong><p>For education and portfolio demonstration only. Never use this output for diagnosis or treatment. The model can be wrong and its training population is limited.</p></div>
+  </header>
+
+  <section class="workspace">
+    <form id="form" class="card">
+      <h2>Try an image</h2><label for="image">JPG, PNG, or WebP · maximum 5 MB</label>
+      <input id="image" name="image" type="file" accept="image/jpeg,image/png,image/webp" required>
+      <img id="preview" alt="Local upload preview"><button id="submit" type="submit">Run classifier</button>
+      <div id="status" role="status"></div><p class="small">The server processes uploads in memory and does not save them.</p>
+    </form>
+    <div id="prediction" class="card prediction"><h2>Model output</h2><p>Top class: <strong id="top"></strong></p>
+      <div id="bars"></div><p class="small">These are model probabilities, not diagnostic confidence or clinical risk.</p></div>
+  </section>
+
+  <section><div class="eyebrow">Pre-generated, versioned output</div><h2>Synthetic df gallery</h2>
+    <p class="small" id="gallery-note">Loading gallery…</p><div id="gallery" class="gallery"></div></section>
+  <footer>
+    <strong>Data attribution and license.</strong> This non-commercial portfolio demo uses the
+    HAM10000 Dataset © ViDIR Group, Department of Dermatology, Medical University of Vienna,
+    distributed with the ISIC 2018 data under
+    <a href="https://creativecommons.org/licenses/by-nc/4.0/" rel="noopener noreferrer">CC BY-NC 4.0</a>.
+    Please cite Tschandl, Rosendahl &amp; Kittler,
+    <a href="https://doi.org/10.1038/sdata.2018.161" rel="noopener noreferrer">Scientific Data 5, 180161 (2018)</a>.
+    Changes in this project include a fixed lesion-level split, resizing, classifier training,
+    and generation of the derived synthetic gallery. No endorsement by the dataset creators is implied.
+  </footer>
+</main>
+<script>
+const form=document.querySelector('#form'), input=document.querySelector('#image'), preview=document.querySelector('#preview');
+const statusEl=document.querySelector('#status'), submit=document.querySelector('#submit');
+input.addEventListener('change',()=>{const f=input.files[0]; if(!f){preview.style.display='none';return;} preview.src=URL.createObjectURL(f); preview.style.display='block';});
+form.addEventListener('submit',async(e)=>{e.preventDefault(); const f=input.files[0]; if(!f)return; submit.disabled=true; statusEl.textContent='Running inference…';
+  const body=new FormData(); body.append('image',f);
+  try { const res=await fetch('/api/predict',{method:'POST',body}); const data=await res.json(); if(!res.ok)throw new Error(data.detail||'Request failed');
+    document.querySelector('#prediction').style.display='block'; document.querySelector('#top').textContent=data.predicted_class; const bars=document.querySelector('#bars'); bars.replaceChildren();
+    data.probabilities.forEach(p=>{const row=document.createElement('div'); row.className='bar-row'; const name=document.createElement('span'); name.textContent=p.class_name;
+      const bar=document.createElement('div'); bar.className='bar'; const fill=document.createElement('span'); fill.style.width=`${(p.probability*100).toFixed(2)}%`; bar.append(fill);
+      const value=document.createElement('span'); value.textContent=`${(p.probability*100).toFixed(1)}%`; row.append(name,bar,value); bars.append(row);}); statusEl.textContent='Complete.';
+  } catch(err){statusEl.textContent=err.message;} finally {submit.disabled=false;}
+});
+fetch('/api/gallery').then(r=>r.json()).then(data=>{document.querySelector('#gallery-note').textContent=`${data.version} · ${data.selection}`; const root=document.querySelector('#gallery');
+  data.items.forEach(item=>{const fig=document.createElement('figure'), img=document.createElement('img'), cap=document.createElement('figcaption'); img.src=item.url; img.alt='Pre-generated synthetic df example'; img.loading='lazy'; cap.textContent=item.image_id; fig.append(img,cap); root.append(fig);});
+}).catch(()=>{document.querySelector('#gallery-note').textContent='Gallery unavailable.';});
+</script>
+</body>
+</html>
