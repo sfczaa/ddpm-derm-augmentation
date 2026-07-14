@@ -1,0 +1,46 @@
+FROM python:3.12-slim AS assets
+
+ARG HF_MODEL_REPO=sfczaa/ddpm-derm-c1-seed2
+ARG HF_MODEL_REVISION=30b41486b5353f2a99aceecef2fc41b178c2697b
+ARG HF_DATASET_REPO=sfczaa/ddpm-derm-synthetic-gallery
+ARG HF_DATASET_REVISION=60b046e4c2ae77f1505e8c2b426c24763741c3a5
+ARG HF_GALLERY_ARCHIVE_SHA256=da3d582082323728e2b0558c27e26af124c683dacf336915d1212acd8abd0bc5
+
+RUN python -m pip install --no-cache-dir "huggingface_hub>=0.30,<2"
+COPY deploy/download_render_assets.py /tmp/download_render_assets.py
+RUN python /tmp/download_render_assets.py \
+    --model-repo "$HF_MODEL_REPO" \
+    --model-revision "$HF_MODEL_REVISION" \
+    --dataset-repo "$HF_DATASET_REPO" \
+    --dataset-revision "$HF_DATASET_REVISION" \
+    --gallery-archive-sha256 "$HF_GALLERY_ARCHIVE_SHA256" \
+    --output-root /assets
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    DDPM_DERM_MODEL_PATH=/assets/model/deploy_weights.pt \
+    DDPM_DERM_MODEL_MANIFEST=/assets/model/model_manifest.json \
+    DDPM_DERM_CLASS_MAP_PATH=/app/deploy/class_to_idx.json \
+    DDPM_DERM_GALLERY_DIR=/assets/gallery/epoch0100_seed0
+
+WORKDIR /app
+
+COPY requirements-deploy.txt ./
+RUN python -m pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
+    python -m pip install --no-cache-dir -r requirements-deploy.txt
+
+COPY --from=assets /assets /assets
+COPY src ./src
+COPY app ./app
+COPY deploy ./deploy
+COPY deploy/class_to_idx.json ./data/manifests/class_to_idx.json
+
+EXPOSE 10000
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --no-access-log"]

@@ -1,0 +1,14 @@
+.git
+.claude
+__pycache__
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+data
+outputs
+notebooks
+tests
+EXPERIMENT_LOG*
+HANDOFF.md
+COLAB_RESUME_SOP.md
