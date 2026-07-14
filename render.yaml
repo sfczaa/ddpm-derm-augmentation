@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ddpm-derm-augmentation-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.render
+    healthCheckPath: /health

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "checkpoint_sha256": "c55134294687a753cff44ac5bac5a4896f85adde1be943697feab08129350752",
+  "variant": "C1",
+  "seed": 2,
+  "selection_rule": "highest best_val_df_f1 among matched-585 C1 seeds 0, 1, and 2",
+  "best_val_df_f1": 0.7407407407407408,
+  "source_results": "outputs/classifier_df585/results/results_C1_seed2.json",
+  "architecture": "resnet18",
+  "image_size": 128,
+  "df_target_count": 585,
+  "class_to_idx": {
+    "akiec": 0,
+    "bcc": 1,
+    "bkl": 2,
+    "df": 3,
+    "mel": 4,
+    "nv": 5,
+    "vasc": 6
+  },
+  "preprocessing": {
+    "color_mode": "RGB",
+    "resize": [128, 128],
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225]
+  },
+  "gallery": {
+    "version": "epoch0100_seed0",
+    "rows": 500,
+    "epoch": 100,
+    "seed": 0,
+    "num_steps": 50,
+    "eta": 0.0,
+    "weights": "ema_state_dict",
+    "class_name": "df",
+    "class_idx": 3
+  }
+}
