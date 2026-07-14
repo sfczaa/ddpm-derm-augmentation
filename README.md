@@ -9,8 +9,9 @@ imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
 > deployment MVP is implemented.** The selected deploy candidate is C1@585
 > seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
 > safety paths are locally verified. Real deployment-only checkpoint inference
-> and the FastAPI runtime were exercised in Colab; Docker build and the public
-> Render deployment are still unvalidated.
+> and the FastAPI runtime were exercised in Colab. The Render Free remote Docker
+> build and public demo endpoints were validated on 2026-07-14; a local Docker
+> build was not run because Docker CLI is unavailable on the local machine.
 
 ## What exists now
 
@@ -178,19 +179,22 @@ deployment-only checkpoint derived without retraining, and a SHA-verified 3 MB
 archive containing the exact 500-image gallery. The single-archive asset path
 was downloaded and safely extracted locally. See `deploy/README_RENDER.md`.
 
+Public demo: https://ddpm-derm-augmentation-demo.onrender.com
+
 In Colab, the deployment-only checkpoint produced seven probabilities with no
 pandas import. A full Uvicorn/FastAPI health and prediction request returned
 HTTP 200 with the disclaimer; measured RSS was 385.5 MB current and 408.9 MB
 peak. These are user-run Colab results, not a completed Render validation.
 
-## Remaining deployment validation
+## Deployment validation status
 
-1. Build `Dockerfile.render` and test `/health`, valid upload, invalid upload, and
-   gallery rendering.
-2. Push the reviewed deployment files to GitHub and create the Render Blueprint
-   on the explicit free plan.
-3. Run the public URL acceptance checks in `deploy/README_RENDER.md`. Record the
-   URL only after those checks pass, including one cold-start check.
+The Render Blueprint built commit `df75c05` on the explicit free plan. Public
+checks passed for `/health`, OpenAPI, one valid prediction, MIME mismatch 415,
+damaged-image 400, the 24-item gallery API, an actual PNG gallery response,
+visible attribution, and the medical disclaimer. The first request during a
+free-tier cold start briefly returned Render's `x-render-routing: no-server`
+404; the following health request woke the service and returned 200. Local
+`docker build` remains unrun and must not be described as locally validated.
 
 ## Constraints honored
 
