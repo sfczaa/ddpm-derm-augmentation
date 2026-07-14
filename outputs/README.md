@@ -13,10 +13,16 @@ outputs/
         last.pt                  latest epoch (+ optimizer) -> use with --resume
     results/
       results_<variant>_seed<seed>.json   final test metrics + per-epoch history
-  ddpm/            (stage 2, not built yet)
+  ddpm/
     checkpoints/   DDPM/U-Net weights
     samples/       preview grids during training
-  synthetic_df/    (stage 2) generated df images that feed classifier C4
+  synthetic_df/
+    epoch0100_seed0/       published 500-image gallery; _READY.json required
+  deploy/                  derived deployment-only artifacts; never overwrite source runs
+    C1_seed2/
+      deploy_weights.pt    model_state/config/class map only
+      model_manifest.json  records deploy and source checkpoint hashes
+    gallery_epoch0100_seed0.zip  exact validated gallery transport archive
   figures/         plots for the report (loss curves, confusion matrices, ...)
 ```
 
@@ -32,8 +38,16 @@ outputs/
 - **The dataset itself** → NOT here. It stays in the top-level `data/` folder
   (a sibling of this project). It is git-ignored and non-commercially licensed;
   never commit it. On Colab, upload it to Drive and set `DDPM_DERM_DATA_DIR`.
-- **DDPM stuff / synthetic df / figures** → the folders above are placeholders
-  for stage 2; empty for now.
+- **Stage 4 deploy checkpoint** → the selected local candidate is
+  `outputs/classifier_df585/checkpoints/C1_seed2/best.pt`. It remains ignored
+  and must be mounted or published as a separate model asset, never committed.
+  `scripts/export_deploy_checkpoint.py` derives the smaller
+  `outputs/deploy/C1_seed2/deploy_weights.pt` without changing the formal file.
+- **Stage 4 gallery** → only use the versioned
+  `outputs/synthetic_df/epoch0100_seed0/` directory after validating its
+  `_READY.json`; do not fall back to an unversioned manifest.
+  `scripts/package_gallery_for_deploy.py` creates the transport ZIP only after
+  validating the complete versioned gallery.
 
 ## Checkpoint contents
 
