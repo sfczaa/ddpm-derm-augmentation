@@ -14,6 +14,5 @@ torchvision>=0.15
 # --- stage 2: DDPM generator (Colab) ---
 diffusers>=0.27      # UNet2DModel (class-conditional noise predictor)
 
-# --- optional / later milestones ---
-# fastapi>=0.110      # deployment (stage 4)
-# uvicorn>=0.29       # deployment (stage 4)
+# --- stage 4 deployment ---
+# See requirements-deploy.txt for the CPU FastAPI container dependencies.
