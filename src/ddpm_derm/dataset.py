@@ -10,10 +10,10 @@ import pandas as pd
 from PIL import Image
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
-from . import config
+from . import config, ddpm_sampler
 
 # HAM10000 images are RGB dermatoscopy photos; ImageNet stats are a fine default
 # because the classifier backbone is ImageNet-pretrained.
@@ -111,12 +111,29 @@ def build_ddpm_dataloader(
     batch_size: int = 64,
     train: bool = True,
     num_workers: int = 2,
+    sampler_strategy: str = ddpm_sampler.DEFAULT_SAMPLER_STRATEGY,
+    sampler_generator=None,
 ) -> DataLoader:
     dataset = HAMDataset(frame, transform=build_ddpm_transforms(img_size, train=train))
+    plan = ddpm_sampler.sampling_plan(sampler_strategy)
+    if not train and plan["use_weighted_sampler"]:
+        raise ValueError("sqrt_balanced sampler is only valid for DDPM training")
+    sampler = None
+    if train and plan["use_weighted_sampler"]:
+        weights = ddpm_sampler.per_sample_weights(
+            frame["label_idx"].tolist(), sampler_strategy
+        )
+        sampler = WeightedRandomSampler(
+            torch.as_tensor(weights, dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+            generator=sampler_generator,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=train,
+        shuffle=train and plan["shuffle"],
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=train,

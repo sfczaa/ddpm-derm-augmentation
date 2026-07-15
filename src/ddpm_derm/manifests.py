@@ -43,6 +43,18 @@ def class_counts(frame: pd.DataFrame) -> dict[str, int]:
     return {config.IDX_TO_CLASS[i]: int(counts.get(i, 0)) for i in range(config.NUM_CLASSES)}
 
 
+def load_ddpm_train_frame(
+    limit: int | None = None, seed: int = 0
+) -> pd.DataFrame:
+    """Load only the fixed train manifest for DDPM training."""
+    frame = load_split("train")
+    if limit is not None:
+        frame = frame.sample(
+            n=min(limit, len(frame)), random_state=seed
+        ).reset_index(drop=True)
+    return frame
+
+
 def oversample_class(
     frame: pd.DataFrame, class_idx: int, target_count: int, seed: int = 42
 ) -> pd.DataFrame:

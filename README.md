@@ -128,6 +128,31 @@ and C4@585 was 0.612 +/- 0.042. This does not support a downstream benefit
 from the current synthetic data; the fixed-split, small-df result is
 suggestive only. C4 still reads an explicit portable generated manifest.
 
+## Post-Stage-4 exploratory sqrt-balanced DDPM
+
+The frozen natural-sampling DDPM and its formal outputs remain unchanged. A
+separate exploratory path can reduce class imbalance more gently: a train row
+in class c receives weight 1 / sqrt(n_c), then
+WeightedRandomSampler(replacement=True, num_samples=len(train)) draws an
+epoch. This is not fully class-balanced.
+
+The natural strategy is the default and keeps the historical shuffled
+DataLoader. sqrt_balanced must be selected explicitly and requires isolated
+checkpoint, snapshot, preview, and metadata paths. Resume rejects a different
+sampler strategy. The standalone metadata and checkpoint record the strategy,
+train class counts, row weights, expected proportions, seed, fixed config,
+train-only source, Git commit, and output paths.
+
+All exploratory Drive artifacts live under:
+
+~~~text
+outputs/exploratory_balanced_ddpm/<version>/
+~~~
+
+See COLAB_BALANCED_DDPM.md for the tiny smoke, resume checks, 100-epoch run,
+and versioned candidate-generation commands. No downstream C0/C1/C4 run is
+started by that workflow.
+
 ## Stage 4 deployment MVP
 
 The service provides `/health`, `/api/predict`, `/api/gallery`, OpenAPI docs,
