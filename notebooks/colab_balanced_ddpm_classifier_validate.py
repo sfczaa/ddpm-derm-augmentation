@@ -98,7 +98,6 @@ VALIDATION_ROOT = (
 VALIDATION_DIR = VALIDATION_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 assert not FORMAL_RUN_DIR.exists(), f"formal run already exists; stop: {FORMAL_RUN_DIR}"
 assert not VALIDATION_DIR.exists()
-VALIDATION_DIR.mkdir(parents=True)
 
 protected = [
     OUTPUTS_DIR / "classifier",

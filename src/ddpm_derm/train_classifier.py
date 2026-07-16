@@ -76,6 +76,22 @@ def _load_trusted_checkpoint(path, device) -> dict:
     return torch.load(path, map_location=device, weights_only=False)
 
 
+def _ensure_durable_directory(path) -> Path:
+    """Create one output directory and keep it non-empty on Drive FUSE."""
+    path = Path(path)
+    if not path.is_dir():
+        if not path.parent.is_dir():
+            raise FileNotFoundError(
+                f"output parent directory is missing; refusing recursive mkdir: "
+                f"{path.parent}"
+            )
+        path.mkdir()
+    marker = path / ".directory_ready"
+    if not marker.is_file():
+        marker.write_text("ready\n", encoding="utf-8")
+    return path
+
+
 def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
                     run_identity, val_metrics=None) -> None:
     """Write a checkpoint atomically (tmp + replace) so a Colab disconnect
@@ -101,7 +117,13 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
         local_tmp = Path(handle.name)
     try:
         torch.save(payload, local_tmp)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.parent.is_dir():
+            if args.run_label:
+                raise FileNotFoundError(
+                    "prepared checkpoint directory disappeared; refusing "
+                    f"recursive mkdir: {path.parent}"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_tmp, drive_tmp)
         drive_tmp.replace(path)
     finally:
@@ -214,8 +236,16 @@ def main(argv=None) -> None:
     )
     ckpt_dir = base_dir / "checkpoints" / f"{args.variant}_seed{args.seed}"
     results_dir = base_dir / "results"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    if args.run_label:
+        base_dir = _ensure_durable_directory(base_dir)
+        checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
+        ckpt_dir = _ensure_durable_directory(
+            checkpoint_root / f"{args.variant}_seed{args.seed}"
+        )
+        results_dir = _ensure_durable_directory(base_dir / "results")
+    else:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
     print(f"[run] variant={args.variant} seed={args.seed} epochs={args.epochs} "
           f"img={args.img_size} bs={args.batch_size} lr={args.lr} device={device}")
     print(f"[identity] run_label={args.run_label!r} "
@@ -355,7 +385,13 @@ def main(argv=None) -> None:
         },
     }
     out_path = results_dir / f"results_{args.variant}_seed{args.seed}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not out_path.parent.is_dir():
+        if args.run_label:
+            raise FileNotFoundError(
+                "prepared results directory disappeared; refusing recursive "
+                f"mkdir: {out_path.parent}"
+            )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"[done] results -> {out_path}")
     print(f"[done] best.pt (val df_f1={best_val_f1:.4f}, for eval/deploy) + "

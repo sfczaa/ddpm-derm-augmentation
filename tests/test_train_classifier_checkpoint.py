@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ddpm_derm.train_classifier import (  # noqa: E402
+    _ensure_durable_directory,
     _load_trusted_checkpoint,
     save_checkpoint,
 )
@@ -33,8 +34,54 @@ class ClassifierCheckpointTests(unittest.TestCase):
 
         self.assertEqual(checkpoint["rng_state"]["numpy"][0], "MT19937")
 
-    def test_checkpoint_stages_locally_and_recreates_publish_directory(self):
-        """Drive shortcuts can drop an empty directory before the first save."""
+    def test_durable_directory_is_marked_and_reused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "drive"
+            parent.mkdir()
+            directory = parent / "run"
+
+            self.assertEqual(_ensure_durable_directory(directory), directory)
+            self.assertEqual(
+                (directory / ".directory_ready").read_text(encoding="utf-8"),
+                "ready\n",
+            )
+            self.assertEqual(_ensure_durable_directory(directory), directory)
+
+    def test_checkpoint_publishes_into_prepared_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "drive"
+            parent.mkdir()
+            checkpoint_dir = _ensure_durable_directory(parent / "checkpoints")
+            destination = checkpoint_dir / "last.pt"
+            model = Mock()
+            model.state_dict.return_value = {"weight": torch.tensor([1.0])}
+            optimizer = Mock()
+            optimizer.state_dict.return_value = {"state": {}}
+
+            def fake_save(payload, path):
+                Path(path).write_bytes(b"serialized checkpoint")
+
+            with patch(
+                "ddpm_derm.train_classifier.torch.save", side_effect=fake_save
+            ):
+                save_checkpoint(
+                    destination,
+                    model,
+                    optimizer,
+                    epoch=1,
+                    best_val_f1=0.0,
+                    history=[],
+                    args=argparse.Namespace(
+                        seed=0, run_label="validation_smoke"
+                    ),
+                    run_identity={"git_commit": "test"},
+                )
+
+            self.assertEqual(destination.read_bytes(), b"serialized checkpoint")
+            self.assertFalse(destination.with_suffix(".pt.tmp").exists())
+
+    def test_exploratory_checkpoint_refuses_to_recreate_missing_parent(self):
+        """Recursive mkdir can fork one Drive path into duplicate folders."""
         with tempfile.TemporaryDirectory() as temp:
             destination = Path(temp) / "drive" / "checkpoints" / "last.pt"
             destination.parent.mkdir(parents=True)
@@ -52,18 +99,21 @@ class ClassifierCheckpointTests(unittest.TestCase):
             with patch(
                 "ddpm_derm.train_classifier.torch.save", side_effect=fake_save
             ):
-                save_checkpoint(
-                    destination,
-                    model,
-                    optimizer,
-                    epoch=1,
-                    best_val_f1=0.0,
-                    history=[],
-                    args=argparse.Namespace(seed=0),
-                    run_identity={"git_commit": "test"},
-                )
+                with self.assertRaisesRegex(FileNotFoundError, "refusing"):
+                    save_checkpoint(
+                        destination,
+                        model,
+                        optimizer,
+                        epoch=1,
+                        best_val_f1=0.0,
+                        history=[],
+                        args=argparse.Namespace(
+                            seed=0, run_label="validation_smoke"
+                        ),
+                        run_identity={"git_commit": "test"},
+                    )
 
-            self.assertEqual(destination.read_bytes(), b"serialized checkpoint")
+            self.assertFalse(destination.parent.exists())
             self.assertNotEqual(serialized_to[0].parent, destination.parent)
             self.assertFalse(serialized_to[0].exists())
             self.assertFalse(destination.with_suffix(".pt.tmp").exists())
