@@ -5,7 +5,7 @@
 # classifier run. It cannot start the formal 3-seed × 20-epoch experiment.
 
 # %%
-EXPECTED_COMMIT = "3748a657a62113dd095387d2ffc4505bb39726b1"
+EXPECTED_COMMIT = "b665151dc572ded319d3ffe475eec02c076c2bfe"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
 BRANCH = "balanced-ddpm-exploration"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
