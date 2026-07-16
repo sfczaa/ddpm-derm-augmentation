@@ -350,10 +350,18 @@ def validate_seed(seed):
         "learning_rate": 3e-4, "weight_decay": 1e-4,
         "df_target_count": 585, "pretrained": True, "limit": None,
     }
-    for path in (best, last):
+    for path, expected_epoch in ((best, None), (last, 20)):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         assert checkpoint["run_identity"] == identity
-        assert len(checkpoint["history"]) == 20
+        checkpoint_epoch = checkpoint["epoch"]
+        checkpoint_history = checkpoint["history"]
+        assert 1 <= checkpoint_epoch <= 20
+        assert len(checkpoint_history) == checkpoint_epoch
+        assert [h["epoch"] for h in checkpoint_history] == list(
+            range(1, checkpoint_epoch + 1)
+        )
+        if expected_epoch is not None:
+            assert checkpoint_epoch == expected_epoch
     return result
 
 def stream_with_heartbeat(command, heartbeat_seconds=120):
