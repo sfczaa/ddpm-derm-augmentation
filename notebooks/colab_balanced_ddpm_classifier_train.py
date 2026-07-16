@@ -83,7 +83,7 @@ from PIL import Image
 import torch
 
 assert torch.cuda.is_available(), "T4/CUDA required"
-DRIVE_PROJECT_DIR = Path("/content/drive/MyDrive/ddpm-derm-augmentation")
+DRIVE_PROJECT_DIR = Path("/content/drive/MyDrive/ddpm-derm-augmentation").resolve()
 DRIVE_DATA_DIR = DRIVE_PROJECT_DIR / "data"
 LOCAL_DATA_DIR = Path("/content/data")
 OUTPUTS_DIR = DRIVE_PROJECT_DIR / "outputs"

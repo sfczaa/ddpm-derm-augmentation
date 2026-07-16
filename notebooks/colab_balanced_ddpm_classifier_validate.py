@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 import pandas as pd
 from PIL import Image
 
-DRIVE_PROJECT_DIR = Path("/content/drive/MyDrive/ddpm-derm-augmentation")
+DRIVE_PROJECT_DIR = Path("/content/drive/MyDrive/ddpm-derm-augmentation").resolve()
 DRIVE_DATA_DIR = DRIVE_PROJECT_DIR / "data"
 LOCAL_DATA_DIR = Path("/content/data")
 OUTPUTS_DIR = DRIVE_PROJECT_DIR / "outputs"
