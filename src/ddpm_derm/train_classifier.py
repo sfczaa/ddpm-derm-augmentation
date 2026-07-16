@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -91,9 +93,19 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
     }
     if val_metrics is not None:
         payload["val_metrics"] = val_metrics
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp)
-    tmp.replace(path)
+    path = Path(path)
+    drive_tmp = path.with_suffix(path.suffix + ".tmp")
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{path.stem}_", suffix=path.suffix, delete=False
+    ) as handle:
+        local_tmp = Path(handle.name)
+    try:
+        torch.save(payload, local_tmp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local_tmp, drive_tmp)
+        drive_tmp.replace(path)
+    finally:
+        local_tmp.unlink(missing_ok=True)
 
 
 @torch.no_grad()
@@ -343,6 +355,7 @@ def main(argv=None) -> None:
         },
     }
     out_path = results_dir / f"results_{args.variant}_seed{args.seed}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"[done] results -> {out_path}")
     print(f"[done] best.pt (val df_f1={best_val_f1:.4f}, for eval/deploy) + "
