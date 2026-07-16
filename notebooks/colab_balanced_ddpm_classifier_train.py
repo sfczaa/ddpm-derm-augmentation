@@ -256,6 +256,18 @@ import time
 env = os.environ.copy()
 env.update(PYTHONPATH=str(PROJECT_DIR / "src"), PYTHONUNBUFFERED="1")
 
+def wait_for_files(paths, timeout_seconds=120):
+    paths = tuple(paths)
+    deadline = time.monotonic() + timeout_seconds
+    missing = [path for path in paths if not path.is_file()]
+    while missing and time.monotonic() < deadline:
+        time.sleep(1)
+        missing = [path for path in paths if not path.is_file()]
+    assert not missing, (
+        f"Drive artifacts not visible after {timeout_seconds}s: "
+        + ", ".join(map(str, missing))
+    )
+
 def result_path(seed):
     return RUN_DIR / "results" / f"results_C4_seed{seed}.json"
 
@@ -266,7 +278,7 @@ def validate_seed(seed):
     result_file = result_path(seed)
     best = checkpoint_dir(seed) / "best.pt"
     last = checkpoint_dir(seed) / "last.pt"
-    assert result_file.is_file() and best.is_file() and last.is_file()
+    wait_for_files((result_file, best, last))
     result = json.loads(result_file.read_text(encoding="utf-8"))
     assert result["variant"] == "C4" and result["seed"] == seed
     assert len(result["history"]) == 20

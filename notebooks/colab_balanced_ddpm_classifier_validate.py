@@ -190,6 +190,20 @@ print("repository smoke + torch-free classifier guards passed; GPU:", torch.cuda
 # ## 4. Tiny C4-sqrt run, strict resume, mismatch rejection, Drive-only restore
 
 # %%
+import time
+
+def wait_for_files(paths, timeout_seconds=120):
+    paths = tuple(paths)
+    deadline = time.monotonic() + timeout_seconds
+    missing = [path for path in paths if not path.is_file()]
+    while missing and time.monotonic() < deadline:
+        time.sleep(1)
+        missing = [path for path in paths if not path.is_file()]
+    assert not missing, (
+        f"Drive artifacts not visible after {timeout_seconds}s: "
+        + ", ".join(map(str, missing))
+    )
+
 def run_stream(command, expect_success=True):
     process = subprocess.Popen(
         command, cwd=PROJECT_DIR / "src", env=env,
@@ -223,7 +237,7 @@ assert "checkpoint_saved=last.pt" in fresh_output
 last_path = VALIDATION_DIR / "checkpoints" / "C4_seed0" / "last.pt"
 best_path = VALIDATION_DIR / "checkpoints" / "C4_seed0" / "best.pt"
 result_path = VALIDATION_DIR / "results" / "results_C4_seed0.json"
-assert last_path.is_file() and best_path.is_file() and result_path.is_file()
+wait_for_files((last_path, best_path, result_path))
 checkpoint = torch.load(last_path, map_location="cpu", weights_only=False)
 identity = checkpoint["run_identity"]
 assert checkpoint["epoch"] == 1 and len(checkpoint["history"]) == 1
