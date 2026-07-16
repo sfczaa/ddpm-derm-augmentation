@@ -7,7 +7,7 @@
 # account's own MyDrive so a shortcut mount cannot split or drop directories.
 
 # %%
-EXPECTED_COMMIT = "f575380efb042937c9f124c217cee9b1da981fee"
+EXPECTED_COMMIT = "2ea7a63834f55473ebaf6477bad3b33a538eb083"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
 BRANCH = "balanced-ddpm-exploration"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
