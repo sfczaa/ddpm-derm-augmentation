@@ -69,6 +69,11 @@ def _set_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
+def _load_trusted_checkpoint(path, device) -> dict:
+    """Load a checkpoint produced by this trainer, including its RNG state."""
+    return torch.load(path, map_location=device, weights_only=False)
+
+
 def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
                     run_identity, val_metrics=None) -> None:
     """Write a checkpoint atomically (tmp + replace) so a Colab disconnect
@@ -236,7 +241,7 @@ def main(argv=None) -> None:
 
     last_path = ckpt_dir / "last.pt"
     if args.resume and last_path.exists():
-        ckpt = torch.load(last_path, map_location=device)
+        ckpt = _load_trusted_checkpoint(last_path, device)
         saved_identity = ckpt.get("run_identity")
         if saved_identity is None:
             if args.run_label or args.variant == "C4":
@@ -299,7 +304,7 @@ def main(argv=None) -> None:
         model.load_state_dict(best_state)
     elif (ckpt_dir / "best.pt").exists():
         # e.g. resumed a run that had already finished all epochs
-        best_ckpt = torch.load(ckpt_dir / "best.pt", map_location=device)
+        best_ckpt = _load_trusted_checkpoint(ckpt_dir / "best.pt", device)
         best_identity = best_ckpt.get("run_identity")
         if best_identity is None:
             if args.run_label or args.variant == "C4":
