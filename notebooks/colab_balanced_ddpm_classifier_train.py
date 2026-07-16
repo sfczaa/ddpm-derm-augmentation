@@ -3,6 +3,9 @@
 # Run only after the executed validation notebook has been reviewed. This
 # notebook trains seeds 0/1/2 sequentially, resumes from Drive, validates every
 # completed seed, aggregates results, and writes descriptive comparisons only.
+# Shared project files are read-only inputs; checkpoints go to the signed-in
+# account's own MyDrive. Resume with that same account unless the run folder has
+# first been shared or copied to another account.
 
 # %%
 RUN_MODE = "fresh"  # "fresh" or "resume"
@@ -13,6 +16,7 @@ EXPECTED_COMMIT = "f575380efb042937c9f124c217cee9b1da981fee"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
 BRANCH = "balanced-ddpm-exploration"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
+RUN_STORAGE_DIRNAME = "ddpm-derm-classifier-runs"
 assert RUN_MODE in {"fresh", "resume"}
 assert RUN_VERSION == "c4_sqrt_balanced_v1"
 assert len(EXPECTED_COMMIT) == 40 and EXPECTED_COMMIT != "REPLACE_AFTER_PUSH", (
@@ -87,20 +91,69 @@ DRIVE_PROJECT_DIR = Path("/content/drive/MyDrive/ddpm-derm-augmentation").resolv
 DRIVE_DATA_DIR = DRIVE_PROJECT_DIR / "data"
 LOCAL_DATA_DIR = Path("/content/data")
 OUTPUTS_DIR = DRIVE_PROJECT_DIR / "outputs"
-EXPLORATORY_ROOT = OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_balanced_seed0_v1"
-CANDIDATE_DIR = EXPLORATORY_ROOT / "candidate_synthetic_df" / "epoch0100_seed0"
+SOURCE_EXPLORATORY_ROOT = OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_balanced_seed0_v1"
+CANDIDATE_DIR = SOURCE_EXPLORATORY_ROOT / "candidate_synthetic_df" / "epoch0100_seed0"
 CANDIDATE_MANIFEST = CANDIDATE_DIR / "synthetic_df.csv"
-RUN_DIR = EXPLORATORY_ROOT / "downstream_classifier" / RUN_VERSION
+RUNNER_OUTPUTS_DIR = Path("/content/drive/MyDrive") / RUN_STORAGE_DIRNAME
+resolved_runner_outputs = RUNNER_OUTPUTS_DIR.resolve()
+assert str(resolved_runner_outputs).startswith("/content/drive/MyDrive/"), (
+    "runner output root must belong to the signed-in account, not a shared "
+    f"shortcut: {resolved_runner_outputs}"
+)
+
+def ensure_runner_directory(path):
+    path = Path(path)
+    assert path.parent.is_dir(), f"runner output parent is missing: {path.parent}"
+    if not path.is_dir():
+        path.mkdir()
+    marker = path / ".directory_ready"
+    marker.write_text("ready\n", encoding="utf-8")
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+    return path
+
+def ensure_runner_tree(path):
+    path = Path(path)
+    current = ensure_runner_directory(RUNNER_OUTPUTS_DIR)
+    for part in path.relative_to(RUNNER_OUTPUTS_DIR).parts:
+        current = ensure_runner_directory(current / part)
+    return current
+
+RUNNER_DOWNSTREAM_ROOT = ensure_runner_tree(
+    RUNNER_OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_balanced_seed0_v1"
+    / "downstream_classifier"
+)
+RUN_DIR = RUNNER_DOWNSTREAM_ROOT / RUN_VERSION
 RUN_METADATA = RUN_DIR / "run_metadata.json"
 RUNNING_MARKER = RUN_DIR / "_RUNNING.json"
 COMPLETED_MARKER = RUN_DIR / "_COMPLETED.json"
 FROZEN_RESULTS = OUTPUTS_DIR / "classifier_df585" / "results"
+probe = RUNNER_OUTPUTS_DIR / f".write_probe_{uuid.uuid4().hex}.json"
+child_probe = RUNNER_OUTPUTS_DIR / f".child_write_probe_{uuid.uuid4().hex}.txt"
+try:
+    probe.write_text(json.dumps({"write": "ok"}), encoding="utf-8")
+    assert json.loads(probe.read_text(encoding="utf-8")) == {"write": "ok"}
+    subprocess.run(
+        [
+            sys.executable, "-c",
+            "from pathlib import Path; import sys; "
+            "assert Path(sys.argv[1]).read_text(encoding='utf-8'); "
+            "Path(sys.argv[2]).write_text('child-ok\\n', encoding='utf-8')",
+            str(probe), str(child_probe),
+        ],
+        check=True,
+    )
+    assert child_probe.read_text(encoding="utf-8") == "child-ok\n"
+finally:
+    probe.unlink(missing_ok=True)
+    child_probe.unlink(missing_ok=True)
+print("shared project source:", DRIVE_PROJECT_DIR)
+print("runner-owned output root:", RUNNER_OUTPUTS_DIR)
 
 if LOCAL_DATA_DIR.exists():
     shutil.rmtree(LOCAL_DATA_DIR)
 shutil.copytree(DRIVE_DATA_DIR, LOCAL_DATA_DIR)
 os.environ["DDPM_DERM_DATA_DIR"] = str(LOCAL_DATA_DIR)
-os.environ["DDPM_DERM_OUTPUTS_DIR"] = str(OUTPUTS_DIR)
+os.environ["DDPM_DERM_OUTPUTS_DIR"] = str(RUNNER_OUTPUTS_DIR)
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -190,13 +243,14 @@ def write_json_atomic(path, value):
 expected_shared = {
     "run_version": RUN_VERSION,
     "git_commit": EXPECTED_COMMIT,
+    "runner_output_root": str(RUNNER_OUTPUTS_DIR),
     "candidate_manifest_sha256": CANDIDATE_SHA256,
     "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
     "fixed_config": FIXED_CONFIG,
 }
 if RUN_MODE == "fresh":
     assert not RUN_DIR.exists(), f"fresh mode refuses existing run root: {RUN_DIR}"
-    RUN_DIR.mkdir(parents=True)
+    ensure_runner_tree(RUN_DIR)
     protected_before = inventory(protected)
     metadata = {
         **expected_shared,
