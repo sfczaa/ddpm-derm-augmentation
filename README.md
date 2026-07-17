@@ -128,6 +128,53 @@ and C4@585 was 0.612 +/- 0.042. This does not support a downstream benefit
 from the current synthetic data; the fixed-split, small-df result is
 suggestive only. C4 still reads an explicit portable generated manifest.
 
+## Post-Stage-4 exploratory sqrt-balanced DDPM
+
+The frozen natural-sampling DDPM and its formal outputs remain unchanged. A
+separate exploratory path can reduce class imbalance more gently: a train row
+in class c receives weight 1 / sqrt(n_c), then
+WeightedRandomSampler(replacement=True, num_samples=len(train)) draws an
+epoch. This is not fully class-balanced.
+
+The natural strategy is the default and keeps the historical shuffled
+DataLoader. sqrt_balanced must be selected explicitly and requires isolated
+checkpoint, snapshot, preview, and metadata paths. Resume rejects a different
+sampler strategy. The standalone metadata and checkpoint record the strategy,
+train class counts, row weights, expected proportions, seed, fixed config,
+train-only source, Git commit, and output paths.
+
+All exploratory Drive artifacts live under:
+
+~~~text
+outputs/exploratory_balanced_ddpm/<version>/
+~~~
+
+See COLAB_BALANCED_DDPM.md for the tiny smoke, resume checks, 100-epoch run,
+and versioned candidate-generation commands. That runbook intentionally stops
+before downstream classification; the separately approved comparison is
+reported below.
+
+### Exploratory downstream comparison (completed)
+
+The versioned sqrt-balanced candidate was evaluated as an isolated C4@585
+condition with the same fixed split, classifier configuration, and seeds 0–2
+used by the frozen matched-585 comparison. Each run used 20 epochs; model
+selection remained based on validation df F1. Test results are mean +/-
+population standard deviation across three seeds.
+
+| Condition | df F1 (primary) | macro-F1 | df recall |
+|---|---:|---:|---:|
+| C4@585, sqrt-balanced DDPM candidate | 0.682 +/- 0.047 | 0.655 +/- 0.047 | 0.604 +/- 0.059 |
+| C4@585, frozen natural-DDPM data | 0.612 +/- 0.042 | 0.645 +/- 0.010 | 0.521 +/- 0.029 |
+| C1@585, duplicated real df | 0.660 +/- 0.042 | 0.651 +/- 0.021 | 0.604 +/- 0.029 |
+
+The exploratory mean df F1 difference was +0.0706 versus natural C4@585 and
++0.0223 versus C1@585. This is descriptive evidence only: the test split has
+16 df cases, the split is fixed, only three seeds were run, and no statistical
+significance test was performed. It does not establish a validated, clinical,
+or medical-effectiveness claim, and it does not automatically replace the
+deployed C1 checkpoint.
+
 ## Stage 4 deployment MVP
 
 The service provides `/health`, `/api/predict`, `/api/gallery`, OpenAPI docs,

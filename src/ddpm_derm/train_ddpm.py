@@ -25,16 +25,18 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import torch
 
-from . import config, manifests
+from . import config, ddpm_sampler, manifests
 from .dataset import build_ddpm_dataloader
 from .ddpm.diffusion import GaussianDiffusion, to_uint8_images
 from .ddpm.unet import build_unet
@@ -42,8 +44,143 @@ from .ddpm.unet import build_unet
 from .train_classifier import _get_rng_state, _set_rng_state, set_seed
 
 
+def _git_commit(require_clean: bool) -> str:
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=config.PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=config.PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        if require_clean:
+            raise RuntimeError(
+                "sqrt_balanced runs require a Git checkout so run metadata can "
+                "record the exact commit"
+            ) from exc
+        return "unavailable"
+    if require_clean and dirty:
+        raise RuntimeError(
+            "sqrt_balanced runs require a clean Git checkout; commit or discard "
+            "the listed changes before spending GPU time"
+        )
+    return commit
+
+
+def _require_under(path: Path, root: Path, arg_name: str) -> None:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"{arg_name} must be under the exploratory root {root}, got {path}"
+        ) from exc
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _build_run_metadata(
+    args, train_frame, ckpt_dir: Path, snapshot_dir: Path | None,
+    preview_dir: Path, metadata_path: Path | None,
+) -> dict:
+    summary = ddpm_sampler.sampler_summary(
+        train_frame["label_idx"].tolist(),
+        args.sampler_strategy,
+        config.IDX_TO_CLASS,
+    )
+    return {
+        "sampler_strategy": args.sampler_strategy,
+        "sampler_replacement": (
+            args.sampler_strategy == ddpm_sampler.SQRT_BALANCED
+        ),
+        "sampler_num_samples": len(train_frame),
+        "shuffle": (
+            args.sampler_strategy == ddpm_sampler.NATURAL
+        ),
+        "class_counts": {
+            name: values["count"] for name, values in summary.items()
+        },
+        "per_class_sample_weight": {
+            name: values["per_sample_weight"] for name, values in summary.items()
+        },
+        "expected_sampling_proportion": {
+            name: values["expected_sampling_proportion"]
+            for name, values in summary.items()
+        },
+        "expected_samples_per_epoch": {
+            name: values["expected_samples_per_epoch"]
+            for name, values in summary.items()
+        },
+        "seed": args.seed,
+        "fixed_config": {
+            "epochs": args.epochs,
+            "img_size": args.img_size,
+            "batch_size": args.batch_size,
+            "optimizer": "AdamW",
+            "learning_rate": args.lr,
+            "ema_decay": args.ema_decay,
+            "diffusion_timesteps": args.timesteps,
+            "beta_schedule": "linear",
+            "beta_start": args.beta_start,
+            "beta_end": args.beta_end,
+            "tiny": args.tiny,
+            "limit": args.limit,
+            "num_workers": args.num_workers,
+        },
+        "source_split": "train",
+        "git_commit": _git_commit(
+            require_clean=args.sampler_strategy == ddpm_sampler.SQRT_BALANCED
+        ),
+        "output_path": {
+            "local_checkpoint_dir": str(ckpt_dir),
+            "snapshot_dir": None if snapshot_dir is None else str(snapshot_dir),
+            "preview_dir": str(preview_dir),
+            "run_metadata": (
+                None if metadata_path is None else str(metadata_path)
+            ),
+        },
+    }
+
+
+def _write_run_metadata(path: Path, metadata: dict, resume: bool) -> dict:
+    if path.exists():
+        if not resume:
+            raise FileExistsError(
+                f"fresh run would overwrite existing run metadata: {path}"
+            )
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("sampler_strategy", "class_counts", "seed", "source_split"):
+            if existing.get(key) != metadata.get(key):
+                raise ValueError(
+                    f"run metadata mismatch for {key}: "
+                    f"saved={existing.get(key)!r} current={metadata.get(key)!r}"
+                )
+        print(f"[metadata] existing run metadata verified -> {path}")
+        return existing
+    if not path.parent.is_dir():
+        raise FileNotFoundError(
+            f"run metadata parent does not exist: {path.parent}"
+        )
+    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"[metadata] wrote -> {path}")
+    return metadata
+
+
 def save_checkpoint(path: Path, model, ema_model, optimizer, epoch, history,
-                    args, diffusion) -> None:
+                    args, diffusion, sampler_generator, run_metadata) -> None:
     """Overwrite one checkpoint on local runtime storage with full train state."""
     payload = {
         "model_state_dict": model.state_dict(),
@@ -56,6 +193,11 @@ def save_checkpoint(path: Path, model, ema_model, optimizer, epoch, history,
         "img_size": args.img_size,
         "tiny": args.tiny,
         "ema_decay": args.ema_decay,
+        "sampler_strategy": args.sampler_strategy,
+        "sampler_generator_state": (
+            None if sampler_generator is None else sampler_generator.get_state()
+        ),
+        "run_metadata": run_metadata,
         "diffusion": {
             "timesteps": diffusion.timesteps,
             "beta_start": args.beta_start,
@@ -154,6 +296,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--tiny", action="store_true",
                    help="Use the small smoke-test UNet instead of the full one.")
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument(
+        "--sampler-strategy",
+        choices=ddpm_sampler.SAMPLER_STRATEGIES,
+        default=ddpm_sampler.DEFAULT_SAMPLER_STRATEGY,
+        help="natural keeps the historical shuffled loader; sqrt_balanced uses "
+             "replacement sampling with per-row weight 1/sqrt(class_count).",
+    )
     p.add_argument("--preview-every", type=int, default=0,
                    help="If >0, sample a df preview grid every N epochs.")
     p.add_argument("--preview-steps", type=int, default=50,
@@ -165,6 +314,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Existing Drive directory for immutable per-epoch snapshots.")
     p.add_argument("--snapshot-every", type=int, default=10,
                    help="Write a unique Drive snapshot every N epochs and at the target epoch.")
+    p.add_argument(
+        "--preview-dir",
+        default=None,
+        help="Preview directory. Required under outputs/exploratory_balanced_ddpm "
+             "for sqrt_balanced runs.",
+    )
+    p.add_argument(
+        "--run-metadata-path",
+        default=None,
+        help="Standalone run metadata JSON. Required under the exploratory root "
+             "for sqrt_balanced runs.",
+    )
     p.add_argument("--resume", action="store_true",
                    help="Require and resume from this seed's checkpoint.")
     p.add_argument("--device", default=None)
@@ -186,6 +347,21 @@ def main(argv=None) -> None:
 
     set_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if args.sampler_strategy == ddpm_sampler.SQRT_BALANCED:
+        missing = [
+            name for name, value in (
+                ("--output-dir", args.output_dir),
+                ("--snapshot-dir", args.snapshot_dir),
+                ("--preview-dir", args.preview_dir),
+                ("--run-metadata-path", args.run_metadata_path),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "sqrt_balanced requires explicit isolated output paths: "
+                + ", ".join(missing)
+            )
     ckpt_dir = Path(
         args.output_dir
         or os.environ.get("DDPM_DERM_LOCAL_CKPT_DIR", "/content/ddpm_ckpt")
@@ -205,6 +381,29 @@ def main(argv=None) -> None:
         raise FileNotFoundError(
             f"snapshot directory does not exist: {snapshot_dir}; create it in Drive first"
         )
+    preview_dir = (
+        Path(args.preview_dir) if args.preview_dir else config.DDPM_SAMPLES_DIR
+    )
+    metadata_path = (
+        Path(args.run_metadata_path) if args.run_metadata_path else None
+    )
+    if args.sampler_strategy == ddpm_sampler.SQRT_BALANCED:
+        exploratory_root = config.EXPLORATORY_BALANCED_DDPM_DIR
+        _require_under(snapshot_dir, exploratory_root, "--snapshot-dir")
+        _require_under(preview_dir, exploratory_root, "--preview-dir")
+        _require_under(metadata_path, exploratory_root, "--run-metadata-path")
+        if (
+            ckpt_dir.resolve() == Path("/content/ddpm_ckpt").resolve()
+            or _is_under(ckpt_dir, config.DDPM_CKPT_DIR)
+        ):
+            raise ValueError(
+                "--output-dir for sqrt_balanced must not use the formal DDPM "
+                f"checkpoint location: {ckpt_dir}"
+            )
+        if not preview_dir.is_dir():
+            raise FileNotFoundError(
+                f"preview directory does not exist: {preview_dir}"
+            )
     last_path = ckpt_dir / f"run_seed{args.seed}_last.pt"
     if args.resume and not last_path.is_file():
         snapshot = latest_snapshot(snapshot_dir, args.seed) if snapshot_dir else None
@@ -223,20 +422,35 @@ def main(argv=None) -> None:
         )
     print(f"[run] ddpm seed={args.seed} epochs={args.epochs} img={args.img_size} "
           f"bs={args.batch_size} lr={args.lr} T={args.timesteps} "
-          f"tiny={args.tiny} device={device}")
+          f"tiny={args.tiny} sampler={args.sampler_strategy} device={device}")
 
-    train_frame = manifests.load_split("train")
-    if args.limit is not None:
-        train_frame = train_frame.sample(
-            n=min(args.limit, len(train_frame)), random_state=args.seed
-        ).reset_index(drop=True)
+    train_frame = manifests.load_ddpm_train_frame(args.limit, args.seed)
     print(f"[data] train={len(train_frame)} (all 7 classes, train split only)")
     print(f"[data] train class counts: {manifests.class_counts(train_frame)}")
+    sampler_summary = ddpm_sampler.sampler_summary(
+        train_frame["label_idx"].tolist(),
+        args.sampler_strategy,
+        config.IDX_TO_CLASS,
+    )
+    print(f"[data] sampler summary: {sampler_summary}")
 
+    sampler_generator = None
+    if args.sampler_strategy == ddpm_sampler.SQRT_BALANCED:
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(args.seed)
     loader = build_ddpm_dataloader(
         train_frame, img_size=args.img_size, batch_size=args.batch_size,
         train=True, num_workers=args.num_workers,
+        sampler_strategy=args.sampler_strategy,
+        sampler_generator=sampler_generator,
     )
+    run_metadata = _build_run_metadata(
+        args, train_frame, ckpt_dir, snapshot_dir, preview_dir, metadata_path
+    )
+    if metadata_path is not None:
+        run_metadata = _write_run_metadata(
+            metadata_path, run_metadata, resume=args.resume
+        )
     diffusion = GaussianDiffusion(
         timesteps=args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end,
     )
@@ -253,6 +467,9 @@ def main(argv=None) -> None:
         # an untrusted weights-only artifact. PyTorch 2.6 defaults to
         # weights_only=True, which cannot deserialize the saved NumPy RNG state.
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
+        ddpm_sampler.require_matching_checkpoint_strategy(
+            ckpt, args.sampler_strategy
+        )
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "ema_state_dict" in ckpt:
@@ -273,8 +490,17 @@ def main(argv=None) -> None:
         rng = ckpt.get("rng_state")
         if rng is not None:
             _set_rng_state(rng)
+        if sampler_generator is not None:
+            sampler_rng = ckpt.get("sampler_generator_state")
+            if sampler_rng is None:
+                raise ValueError(
+                    "sqrt_balanced checkpoint is missing sampler_generator_state"
+                )
+            sampler_generator.set_state(sampler_rng.cpu())
         print(f"[resume] found {last_path.name} (epoch {ckpt['epoch']}) -> continuing from "
-              f"epoch {start_epoch}{'' if rng is None else ' (RNG restored)'}")
+              f"epoch {start_epoch}{'' if rng is None else ' (global RNG restored)'}")
+        if sampler_generator is not None:
+            print("[resume] sqrt_balanced sampler generator state restored")
         del ckpt
     else:
         print("[start] fresh run (no --resume) from epoch 1")
@@ -290,7 +516,8 @@ def main(argv=None) -> None:
         )
         history.append({"epoch": epoch, "train_loss": loss})
         save_checkpoint(
-            last_path, model, ema_model, optimizer, epoch, history, args, diffusion
+            last_path, model, ema_model, optimizer, epoch, history, args,
+            diffusion, sampler_generator, run_metadata
         )
         if snapshot_dir is not None and (
             epoch % args.snapshot_every == 0 or epoch == args.epochs
@@ -306,7 +533,7 @@ def main(argv=None) -> None:
                 num_steps=args.preview_steps, device=device,
             )
             _save_grid(to_uint8_images(samples),
-                       config.DDPM_SAMPLES_DIR / f"preview_seed{args.seed}_epoch{epoch:03d}.png")
+                       preview_dir / f"preview_seed{args.seed}_epoch{epoch:03d}.png")
             msg += "  <- saved df preview"
         print(msg)
 

@@ -64,6 +64,9 @@ CLASSIFIER_RESULTS_DIR = CLASSIFIER_DIR / "results"        # results_*.json
 DDPM_CKPT_DIR = OUTPUTS_DIR / "ddpm" / "checkpoints"       # stage 2
 DDPM_SAMPLES_DIR = OUTPUTS_DIR / "ddpm" / "samples"        # stage 2
 SYNTHETIC_DF_DIR = OUTPUTS_DIR / "synthetic_df"            # stage 2: images that feed C4
+EXPLORATORY_BALANCED_DDPM_DIR = (
+    OUTPUTS_DIR / "exploratory_balanced_ddpm"
+)                                                           # post-stage-4 experiment
 FIGURES_DIR = OUTPUTS_DIR / "figures"                      # plots for the report
 
 
