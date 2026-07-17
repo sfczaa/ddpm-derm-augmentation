@@ -23,7 +23,7 @@ except ImportError:
     print("SKIP: torch not installed (this smoke test is meant to run on Colab).")
     sys.exit(0)
 
-from ddpm_derm import config, manifests  # noqa: E402
+from ddpm_derm import config, ddpm_sampler, manifests  # noqa: E402
 from ddpm_derm.dataset import build_ddpm_dataloader  # noqa: E402
 from ddpm_derm.ddpm.diffusion import GaussianDiffusion, to_uint8_images  # noqa: E402
 from ddpm_derm.ddpm.unet import build_unet  # noqa: E402
@@ -41,9 +41,44 @@ def main() -> None:
         checks.append((name, bool(ok)))
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
 
+    # The full sampler can be exercised without opening images.
+    full_frame = manifests.load_ddpm_train_frame()
+    generator_a = torch.Generator().manual_seed(0)
+    generator_b = torch.Generator().manual_seed(0)
+    sampler_loader_a = build_ddpm_dataloader(
+        full_frame, img_size=IMG, batch_size=4, train=True, num_workers=0,
+        sampler_strategy=ddpm_sampler.SQRT_BALANCED,
+        sampler_generator=generator_a,
+    )
+    sampler_loader_b = build_ddpm_dataloader(
+        full_frame, img_size=IMG, batch_size=4, train=True, num_workers=0,
+        sampler_strategy=ddpm_sampler.SQRT_BALANCED,
+        sampler_generator=generator_b,
+    )
+    indices_a = list(iter(sampler_loader_a.sampler))
+    indices_b = list(iter(sampler_loader_b.sampler))
+    sampled_labels = full_frame.iloc[indices_a]["label_idx"]
+    histogram = {
+        config.IDX_TO_CLASS[i]: int((sampled_labels == i).sum())
+        for i in range(config.NUM_CLASSES)
+    }
+    print("[sampler] seed-0 label histogram:", histogram)
+    check("sqrt sampler uses replacement=True",
+          sampler_loader_a.sampler.replacement is True)
+    check("sqrt sampler num_samples == train dataset length",
+          len(indices_a) == len(full_frame))
+    check("sqrt sampler fixed seed repeats the index sequence",
+          indices_a == indices_b)
+    check("sqrt sampler draws every class in the seed-0 epoch",
+          all(count > 0 for count in histogram.values()))
+
     # tiny data / model / schedule
-    frame = manifests.load_split("train").sample(n=N_SMOKE, random_state=0).reset_index(drop=True)
-    loader = build_ddpm_dataloader(frame, img_size=IMG, batch_size=4, train=True, num_workers=0)
+    frame = manifests.load_ddpm_train_frame(limit=N_SMOKE, seed=0)
+    loader = build_ddpm_dataloader(
+        frame, img_size=IMG, batch_size=4, train=True, num_workers=0,
+        sampler_strategy=ddpm_sampler.SQRT_BALANCED,
+        sampler_generator=torch.Generator().manual_seed(0),
+    )
     diffusion = GaussianDiffusion(timesteps=50)
     model = build_unet(img_size=IMG, tiny=True).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

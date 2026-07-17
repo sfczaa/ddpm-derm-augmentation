@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from . import config, manifests, metrics
+from . import classifier_run, config, manifests, metrics
 from .dataset import build_dataloader
 from .model import build_model
 
@@ -69,8 +71,29 @@ def _set_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
+def _load_trusted_checkpoint(path, device) -> dict:
+    """Load a checkpoint produced by this trainer, including its RNG state."""
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def _ensure_durable_directory(path) -> Path:
+    """Create one output directory and keep it non-empty on Drive FUSE."""
+    path = Path(path)
+    if not path.is_dir():
+        if not path.parent.is_dir():
+            raise FileNotFoundError(
+                f"output parent directory is missing; refusing recursive mkdir: "
+                f"{path.parent}"
+            )
+        path.mkdir()
+    marker = path / ".directory_ready"
+    if not marker.is_file():
+        marker.write_text("ready\n", encoding="utf-8")
+    return path
+
+
 def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
-                    val_metrics=None) -> None:
+                    run_identity, val_metrics=None) -> None:
     """Write a checkpoint atomically (tmp + replace) so a Colab disconnect
     mid-write cannot leave a corrupt file."""
     payload = {
@@ -82,12 +105,29 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
         "config": vars(args),
         "class_to_idx": config.CLASS_TO_IDX,
         "rng_state": _get_rng_state(),
+        "run_identity": run_identity,
     }
     if val_metrics is not None:
         payload["val_metrics"] = val_metrics
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp)
-    tmp.replace(path)
+    path = Path(path)
+    drive_tmp = path.with_suffix(path.suffix + ".tmp")
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{path.stem}_", suffix=path.suffix, delete=False
+    ) as handle:
+        local_tmp = Path(handle.name)
+    try:
+        torch.save(payload, local_tmp)
+        if not path.parent.is_dir():
+            if args.run_label:
+                raise FileNotFoundError(
+                    "prepared checkpoint directory disappeared; refusing "
+                    f"recursive mkdir: {path.parent}"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local_tmp, drive_tmp)
+        drive_tmp.replace(path)
+    finally:
+        local_tmp.unlink(missing_ok=True)
 
 
 @torch.no_grad()
@@ -144,6 +184,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--output-dir", default=None,
                    help="Base classifier dir; defaults to config.CLASSIFIER_DIR.")
+    p.add_argument("--run-label", default=None,
+                   help="Portable run identity for an isolated exploratory run.")
     p.add_argument("--resume", action="store_true",
                    help="Resume from last.pt in this run's checkpoint dir if present.")
     p.add_argument("--device", default=None)
@@ -151,6 +193,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.variant == "C4" and not args.generated_manifest:
         p.error("--variant C4 requires --generated-manifest "
                 "(no default synthetic dir is read)")
+    if args.run_label and not args.output_dir:
+        p.error("--run-label requires an explicit isolated --output-dir")
     return args
 
 
@@ -168,12 +212,45 @@ def main(argv=None) -> None:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     base_dir = Path(args.output_dir) if args.output_dir else config.CLASSIFIER_DIR
+    if args.run_label:
+        base_dir = classifier_run.require_isolated_output_dir(
+            base_dir, config.EXPLORATORY_BALANCED_DDPM_DIR
+        )
+    source_split = "train"
+    run_identity = classifier_run.build_run_identity(
+        run_label=args.run_label,
+        variant=args.variant,
+        seed=args.seed,
+        epochs=args.epochs,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        df_target_count=args.df_target_count,
+        pretrained=not args.no_pretrained,
+        limit=args.limit,
+        candidate_manifest=args.generated_manifest,
+        source_split=source_split,
+        source_manifest=config.MANIFESTS_DIR / f"{source_split}.csv",
+        source_git_commit=classifier_run.git_commit(config.PROJECT_ROOT),
+    )
     ckpt_dir = base_dir / "checkpoints" / f"{args.variant}_seed{args.seed}"
     results_dir = base_dir / "results"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    if args.run_label:
+        base_dir = _ensure_durable_directory(base_dir)
+        checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
+        ckpt_dir = _ensure_durable_directory(
+            checkpoint_root / f"{args.variant}_seed{args.seed}"
+        )
+        results_dir = _ensure_durable_directory(base_dir / "results")
+    else:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
     print(f"[run] variant={args.variant} seed={args.seed} epochs={args.epochs} "
           f"img={args.img_size} bs={args.batch_size} lr={args.lr} device={device}")
+    print(f"[identity] run_label={args.run_label!r} "
+          f"candidate_sha256={run_identity['candidate_manifest_sha256']} "
+          f"source_split={source_split} git_commit={run_identity['git_commit']}")
 
     train_frame = manifests.build_classifier_frame(
         args.variant, split="train", df_target_count=args.df_target_count,
@@ -206,7 +283,21 @@ def main(argv=None) -> None:
 
     last_path = ckpt_dir / "last.pt"
     if args.resume and last_path.exists():
-        ckpt = torch.load(last_path, map_location=device)
+        ckpt = _load_trusted_checkpoint(last_path, device)
+        saved_identity = ckpt.get("run_identity")
+        if saved_identity is None:
+            if args.run_label or args.variant == "C4":
+                raise ValueError(
+                    "checkpoint predates strict classifier run identity; "
+                    "refusing unverifiable exploratory/C4 resume"
+                )
+            classifier_run.require_matching_legacy_config(
+                ckpt.get("config", {}), vars(args)
+            )
+        else:
+            classifier_run.require_matching_resume_identity(
+                saved_identity, run_identity
+            )
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
@@ -240,22 +331,37 @@ def main(argv=None) -> None:
             best_val_f1 = val_metrics["target_f1"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, epoch,
-                            best_val_f1, history, args, val_metrics=val_metrics)
+                            best_val_f1, history, args, run_identity,
+                            val_metrics=val_metrics)
             marker = "  <- new best, saved best.pt"
         # refresh last.pt every epoch so a Colab disconnect can --resume
         save_checkpoint(last_path, model, optimizer, epoch,
-                        best_val_f1, history, args)
+                        best_val_f1, history, args, run_identity)
         print(f"[epoch {epoch:02d}/{args.epochs}] loss={train_loss:.4f} "
               f"val_df_f1={val_metrics['target_f1']:.4f} "
               f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-              f"({time.time()-t0:.0f}s){marker}")
+              f"elapsed={time.time()-t0:.0f}s checkpoint_saved=last.pt{marker}")
 
     if best_state is not None:
         model.load_state_dict(best_state)
     elif (ckpt_dir / "best.pt").exists():
         # e.g. resumed a run that had already finished all epochs
-        model.load_state_dict(
-            torch.load(ckpt_dir / "best.pt", map_location=device)["model_state_dict"])
+        best_ckpt = _load_trusted_checkpoint(ckpt_dir / "best.pt", device)
+        best_identity = best_ckpt.get("run_identity")
+        if best_identity is None:
+            if args.run_label or args.variant == "C4":
+                raise ValueError(
+                    "best.pt predates strict classifier run identity; "
+                    "refusing unverifiable exploratory/C4 evaluation"
+                )
+            classifier_run.require_matching_legacy_config(
+                best_ckpt.get("config", {}), vars(args)
+            )
+        else:
+            classifier_run.require_matching_resume_identity(
+                best_identity, run_identity
+            )
+        model.load_state_dict(best_ckpt["model_state_dict"])
     test_metrics = evaluate(model, test_loader, device)
     print(f"[test] variant={args.variant} seed={args.seed} "
           f"df_f1={test_metrics['target_f1']:.4f} "
@@ -271,8 +377,21 @@ def main(argv=None) -> None:
         "best_val_df_f1": best_val_f1,
         "history": history,
         "test_metrics": test_metrics,
+        "run_identity": run_identity,
+        "data_counts": {
+            "train": len(train_frame),
+            "val": len(val_frame),
+            "test": len(test_frame),
+        },
     }
     out_path = results_dir / f"results_{args.variant}_seed{args.seed}.json"
+    if not out_path.parent.is_dir():
+        if args.run_label:
+            raise FileNotFoundError(
+                "prepared results directory disappeared; refusing recursive "
+                f"mkdir: {out_path.parent}"
+            )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"[done] results -> {out_path}")
     print(f"[done] best.pt (val df_f1={best_val_f1:.4f}, for eval/deploy) + "

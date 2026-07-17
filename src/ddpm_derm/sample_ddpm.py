@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from . import config, manifests
+from . import config, ddpm_sampler, manifests
 from .ddpm.diffusion import GaussianDiffusion, to_uint8_images
 from .ddpm.unet import build_unet
 from .train_classifier import set_seed
@@ -67,7 +67,15 @@ def load_model(ckpt_path: Path, device):
         beta_start=float(d.get("beta_start", 1e-4)),
         beta_end=float(d.get("beta_end", 2e-2)),
     )
-    return model, diffusion, img_size, int(ckpt.get("epoch", -1)), state_key
+    sampler_strategy = ddpm_sampler.checkpoint_sampler_strategy(ckpt)
+    return (
+        model,
+        diffusion,
+        img_size,
+        int(ckpt.get("epoch", -1)),
+        state_key,
+        sampler_strategy,
+    )
 
 
 @torch.no_grad()
@@ -152,6 +160,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Formal runs: fail unless the checkpoint's epoch equals this.")
     p.add_argument("--require-ema", action="store_true",
                    help="Formal runs: fail unless EMA weights are present and used.")
+    p.add_argument(
+        "--require-sampler-strategy",
+        choices=ddpm_sampler.SAMPLER_STRATEGIES,
+        default=None,
+        help="Fail unless the checkpoint records this sampler strategy.",
+    )
     p.add_argument("--nn-size", type=int, default=32, help="Resolution for the NN distance.")
     p.add_argument("--nn-montage", type=int, default=8, help="Rows in the NN montage.")
     p.add_argument("--seed", type=int, default=0)
@@ -171,7 +185,14 @@ def main(argv=None) -> None:
     ckpt_path = Path(args.ckpt) if args.ckpt else _default_ckpt()
     if not ckpt_path.exists():
         raise FileNotFoundError(f"no checkpoint at {ckpt_path}; train with train_ddpm first")
-    model, diffusion, img_size, epoch, state_key = load_model(ckpt_path, device)
+    (
+        model,
+        diffusion,
+        img_size,
+        epoch,
+        state_key,
+        sampler_strategy,
+    ) = load_model(ckpt_path, device)
     if args.require_epoch is not None and epoch != args.require_epoch:
         raise RuntimeError(
             f"checkpoint epoch {epoch} != required {args.require_epoch} "
@@ -179,6 +200,14 @@ def main(argv=None) -> None:
     if args.require_ema and state_key != "ema_state_dict":
         raise RuntimeError(
             f"EMA weights required but checkpoint provides {state_key} ({ckpt_path})")
+    if (
+        args.require_sampler_strategy is not None
+        and sampler_strategy != args.require_sampler_strategy
+    ):
+        raise RuntimeError(
+            f"checkpoint sampler {sampler_strategy!r} != required "
+            f"{args.require_sampler_strategy!r} ({ckpt_path})"
+        )
     class_idx = config.CLASS_TO_IDX[args.class_name]
 
     # refuse a used output dir BEFORE the (slow) sampling: an earlier synthetic
@@ -189,7 +218,8 @@ def main(argv=None) -> None:
         raise FileExistsError(
             f"--out-dir {out_dir} already exists and is not empty; refusing to "
             f"overwrite an existing synthetic set. Pass a fresh directory.")
-    print(f"[load] {ckpt_path} (epoch {epoch}, img={img_size}, weights={state_key}) "
+    print(f"[load] {ckpt_path} (epoch {epoch}, img={img_size}, weights={state_key}, "
+          f"sampler={sampler_strategy}) "
           f"-> sampling "
           f"{args.n}x '{args.class_name}' with {args.num_steps} DDIM steps on {device}")
 
@@ -239,6 +269,7 @@ def main(argv=None) -> None:
         "checkpoint": ckpt_path.name,
         "epoch": epoch,
         "weights": state_key,
+        "sampler_strategy": sampler_strategy,
         "class_name": args.class_name,
         "class_idx": class_idx,
         "n": args.n,

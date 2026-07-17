@@ -16,6 +16,12 @@ outputs/
   ddpm/
     checkpoints/   DDPM/U-Net weights
     samples/       preview grids during training
+  exploratory_balanced_ddpm/
+    <version>/
+      checkpoints/       immutable exploratory snapshots
+      previews/          exploratory preview grids
+      run_metadata.json  sampler/config/source/commit/output provenance
+      candidate_synthetic_df/epoch0100_seed0/  optional post-training candidate
   synthetic_df/
     epoch0100_seed0/       published 500-image gallery; _READY.json required
   deploy/                  derived deployment-only artifacts; never overwrite source runs
@@ -48,6 +54,16 @@ outputs/
   `_READY.json`; do not fall back to an unversioned manifest.
   `scripts/package_gallery_for_deploy.py` creates the transport ZIP only after
   validating the complete versioned gallery.
+
+- **Exploratory balanced-DDPM artifacts** → use only a fresh version under
+  outputs/exploratory_balanced_ddpm/. Never put its snapshots, previews,
+  metadata, or candidate images into the frozen outputs/ddpm/ or
+  outputs/synthetic_df/epoch0100_seed0/ paths.
+- **Exploratory downstream classifier archive** → keep the curated metadata,
+  result JSON, and executed notebooks under the same version's
+  `downstream_classifier/` directory. `archive_manifest.json` records the
+  source ZIP hash and verification status. Keep the complete ZIP and `.pt`
+  weights outside Git; `outputs/**` remains ignored.
 
 ## Checkpoint contents
 
