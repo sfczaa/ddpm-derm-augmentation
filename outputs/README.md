@@ -59,6 +59,11 @@ outputs/
   outputs/exploratory_balanced_ddpm/. Never put its snapshots, previews,
   metadata, or candidate images into the frozen outputs/ddpm/ or
   outputs/synthetic_df/epoch0100_seed0/ paths.
+- **Exploratory downstream classifier archive** → keep the curated metadata,
+  result JSON, and executed notebooks under the same version's
+  `downstream_classifier/` directory. `archive_manifest.json` records the
+  source ZIP hash and verification status. Keep the complete ZIP and `.pt`
+  weights outside Git; `outputs/**` remains ignored.
 
 ## Checkpoint contents
 
