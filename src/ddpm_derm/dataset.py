@@ -73,8 +73,11 @@ def build_dataloader(
     batch_size: int = 32,
     train: bool = True,
     num_workers: int = 2,
+    transform=None,
 ) -> DataLoader:
-    dataset = HAMDataset(frame, transform=build_transforms(img_size, train=train))
+    if transform is None:
+        transform = build_transforms(img_size, train=train)
+    dataset = HAMDataset(frame, transform=transform)
     return DataLoader(
         dataset,
         batch_size=batch_size,

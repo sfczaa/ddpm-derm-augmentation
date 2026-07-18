@@ -21,13 +21,41 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from ddpm_derm import config  # noqa: E402
+from ddpm_derm import coca_run  # noqa: E402
 
 
-def load_results(results_dir: Path) -> dict[str, list[dict]]:
+def _model_signature(data: dict) -> str:
+    identity = data.get("run_identity", {}).get("model_identity")
+    if identity is None:
+        return json.dumps({"arch": "resnet18", "legacy": True}, sort_keys=True)
+    keys = (
+        "arch", "model_name", "pretrained_tag", "freeze_mode",
+        "preprocessing_identity", "input_resolution", "open_clip_torch_version",
+    )
+    signature = {key: identity.get(key) for key in keys}
+    signature["checkpoint_format"] = data.get("run_identity", {}).get(
+        "checkpoint_format"
+    )
+    return json.dumps(signature, sort_keys=True)
+
+
+def load_results(
+    results_dir: Path, expected_arch: str | None = None
+) -> dict[str, list[dict]]:
     by_variant: dict[str, list[dict]] = defaultdict(list)
+    signatures = set()
     for path in sorted(results_dir.glob("results_*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
+        identity = data.get("run_identity", {}).get("model_identity", {})
+        arch = identity.get("arch", "resnet18")
+        if expected_arch is not None and arch != expected_arch:
+            raise ValueError(
+                f"{path} has arch={arch!r}, expected {expected_arch!r}"
+            )
+        signatures.add(_model_signature(data))
         by_variant[data["variant"]].append(data)
+    if len(signatures) > 1:
+        raise ValueError("refusing to aggregate mixed model/tag/freeze/preprocessing")
     return by_variant
 
 
@@ -39,10 +67,11 @@ def _mean_std(values: list[float]) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results-dir", default=str(config.CLASSIFIER_RESULTS_DIR))
+    ap.add_argument("--arch", default="resnet18")
     args = ap.parse_args()
     results_dir = Path(args.results_dir)
 
-    by_variant = load_results(results_dir)
+    by_variant = load_results(results_dir, expected_arch=args.arch)
     if not by_variant:
         print(f"No results_*.json found in {results_dir}. Run train_classifier first.")
         sys.exit(1)
@@ -59,6 +88,16 @@ def main():
         print(f"{variant:<8}{len(runs):<7}{_mean_std(df_f1):<18}"
               f"{_mean_std(macro):<18}{_mean_std(df_rec):<18}")
     print("\nPrimary metric = df F1. Fixed split + small df -> results are suggestive.")
+    if args.arch == coca_run.ARCH and set(by_variant) == {"C1", "C4"}:
+        aggregate = coca_run.aggregate_results(
+            [run for runs in by_variant.values() for run in runs]
+        )
+        paired = aggregate["paired_c4_minus_c1"]
+        print("Paired C4-C1 df F1:", paired["seed_differences"])
+        print(
+            "Paired mean +/- population std: "
+            f"{paired['mean']:.3f} +/- {paired['population_std']:.3f}"
+        )
 
 
 if __name__ == "__main__":
