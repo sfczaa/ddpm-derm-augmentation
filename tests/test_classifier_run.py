@@ -50,6 +50,23 @@ class ClassifierRunTests(unittest.TestCase):
             "source_split": "train",
             "source_manifest": self.source,
             "source_git_commit": "5274433",
+            "model_identity": {
+                "arch": "coca_vit_b32",
+                "model_name": "coca_ViT-B-32",
+                "pretrained_tag": "laion2b_s13b_b90k",
+                "freeze_mode": "frozen_image_encoder_linear_head",
+                "preprocessing_identity": {"train": "native", "eval": "native"},
+                "input_resolution": [224, 224],
+                "total_parameter_count": 100,
+                "trainable_parameter_count": 35,
+                "open_clip_torch_version": "3.3.0",
+                "torch_version": "test",
+            },
+            "fixed_split_identity": "fixed-lesion-split",
+            "shared_root_uuid": "shared-root",
+            "formal_output_identity": "coca-v1-formal",
+            "run_version": "v1",
+            "class_mapping": {"df": 3},
         }
         values.update(overrides)
         return classifier_run.build_run_identity(**values)
@@ -105,6 +122,45 @@ class ClassifierRunTests(unittest.TestCase):
                 current[key] = value
                 with self.assertRaisesRegex(ValueError, key):
                     classifier_run.require_matching_resume_identity(saved, current)
+
+    def test_coca_model_and_shared_root_mismatches_are_rejected(self):
+        saved = self.identity()
+        changes = (
+            ("arch", "resnet18"),
+            ("pretrained_tag", "other"),
+            ("freeze_mode", "trainable"),
+            ("preprocessing_identity", {"train": "other", "eval": "other"}),
+        )
+        for key, value in changes:
+            with self.subTest(key=key):
+                current = copy.deepcopy(saved)
+                current["model_identity"][key] = value
+                with self.assertRaisesRegex(ValueError, "model_identity"):
+                    classifier_run.require_matching_resume_identity(saved, current)
+        current = copy.deepcopy(saved)
+        current["shared_root_uuid"] = "other"
+        with self.assertRaisesRegex(ValueError, "shared_root_uuid"):
+            classifier_run.require_matching_resume_identity(saved, current)
+
+    def test_operational_metadata_does_not_affect_resume(self):
+        saved = self.identity()
+        current = copy.deepcopy(saved)
+        saved["account_label"] = "A"
+        saved["hostname"] = "host-a"
+        current["account_label"] = "B"
+        current["hostname"] = "host-b"
+        classifier_run.require_matching_resume_identity(saved, current)
+
+    def test_checkpoint_format_is_identity_and_mismatch_is_rejected(self):
+        saved = self.identity()
+        self.assertEqual(
+            saved["checkpoint_format"],
+            classifier_run.FROZEN_COCA_CHECKPOINT_FORMAT,
+        )
+        current = copy.deepcopy(saved)
+        current["checkpoint_format"] = classifier_run.FULL_MODEL_CHECKPOINT_FORMAT
+        with self.assertRaisesRegex(ValueError, "checkpoint_format"):
+            classifier_run.require_matching_resume_identity(saved, current)
 
     def test_training_identity_is_train_only(self):
         with self.assertRaisesRegex(ValueError, "source_split"):

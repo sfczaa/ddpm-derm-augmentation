@@ -34,9 +34,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from . import classifier_run, config, manifests, metrics
+from . import classifier_run, coca_run, config, manifests, metrics
 from .dataset import build_dataloader
-from .model import build_model
+from .model import (
+    COCA_ARCH,
+    COCA_PRETRAINED,
+    build_model,
+    model_identity as build_model_identity,
+    trainable_parameters,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -76,6 +82,80 @@ def _load_trusted_checkpoint(path, device) -> dict:
     return torch.load(path, map_location=device, weights_only=False)
 
 
+def _checkpoint_format(run_identity: dict) -> str:
+    value = run_identity.get("checkpoint_format")
+    if not isinstance(value, str):
+        raise ValueError("run identity is missing checkpoint_format")
+    return value
+
+
+def validate_checkpoint_payload(checkpoint, model, run_identity, arch: str) -> None:
+    """Validate the architecture-specific payload before loading any state."""
+    expected_format = _checkpoint_format(run_identity)
+    if checkpoint.get("checkpoint_format") != expected_format:
+        raise ValueError(
+            "unsupported checkpoint format: "
+            f"saved={checkpoint.get('checkpoint_format')!r} "
+            f"expected={expected_format!r}"
+        )
+    if arch != COCA_ARCH:
+        if "model_state_dict" not in checkpoint:
+            raise ValueError("full-model checkpoint is missing model_state_dict")
+        return
+    if expected_format != classifier_run.FROZEN_COCA_CHECKPOINT_FORMAT:
+        raise ValueError(f"unsupported frozen CoCa checkpoint format: {expected_format!r}")
+    allowed = {
+        "checkpoint_schema_version", "checkpoint_format", "head_state_dict",
+        "optimizer_state_dict", "epoch", "best_val_df_f1", "history",
+        "config", "class_to_idx", "rng_state", "run_identity", "val_metrics",
+    }
+    unexpected_fields = sorted(set(checkpoint) - allowed)
+    if unexpected_fields:
+        raise ValueError(f"unexpected frozen CoCa checkpoint fields: {unexpected_fields}")
+    required = allowed - {"val_metrics"}
+    missing_fields = sorted(required - set(checkpoint))
+    if missing_fields:
+        raise ValueError(f"frozen CoCa checkpoint fields missing: {missing_fields}")
+    saved_head = checkpoint["head_state_dict"]
+    expected_keys = set(model.head.state_dict())
+    saved_keys = set(saved_head)
+    missing_keys = sorted(expected_keys - saved_keys)
+    unexpected_keys = sorted(saved_keys - expected_keys)
+    if missing_keys or unexpected_keys:
+        raise ValueError(
+            f"head state keys mismatch: missing={missing_keys}, "
+            f"unexpected={unexpected_keys}"
+        )
+    optimizer_params = [
+        item
+        for group in checkpoint["optimizer_state_dict"].get("param_groups", [])
+        for item in group.get("params", [])
+    ]
+    if len(optimizer_params) != len(list(model.head.parameters())):
+        raise ValueError("checkpoint optimizer does not contain exactly the linear head")
+
+
+def restore_checkpoint_state(checkpoint, model, optimizer, run_identity, arch: str):
+    """Restore model/optimizer state after the caller has checked run identity."""
+    if arch == COCA_ARCH:
+        validate_checkpoint_payload(checkpoint, model, run_identity, arch)
+        model.head.load_state_dict(checkpoint["head_state_dict"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for parameter in model.encoder.parameters():
+            parameter.requires_grad = False
+        model.encoder.eval()
+    else:
+        if checkpoint.get("checkpoint_format") is not None:
+            validate_checkpoint_payload(checkpoint, model, run_identity, arch)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return (
+        checkpoint["epoch"] + 1,
+        checkpoint.get("best_val_df_f1", -1.0),
+        checkpoint.get("history", []),
+    )
+
+
 def _ensure_durable_directory(path) -> Path:
     """Create one output directory and keep it non-empty on Drive FUSE."""
     path = Path(path)
@@ -96,8 +176,10 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
                     run_identity, val_metrics=None) -> None:
     """Write a checkpoint atomically (tmp + replace) so a Colab disconnect
     mid-write cannot leave a corrupt file."""
+    checkpoint_format = _checkpoint_format(run_identity)
     payload = {
-        "model_state_dict": model.state_dict(),
+        "checkpoint_schema_version": 1,
+        "checkpoint_format": checkpoint_format,
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "best_val_df_f1": best_val_f1,
@@ -107,6 +189,10 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
         "rng_state": _get_rng_state(),
         "run_identity": run_identity,
     }
+    if checkpoint_format == classifier_run.FROZEN_COCA_CHECKPOINT_FORMAT:
+        payload["head_state_dict"] = model.head.state_dict()
+    else:
+        payload["model_state_dict"] = model.state_dict()
     if val_metrics is not None:
         payload["val_metrics"] = val_metrics
     path = Path(path)
@@ -126,6 +212,16 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_f1, history, args,
             path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_tmp, drive_tmp)
         drive_tmp.replace(path)
+        saved = _load_trusted_checkpoint(path, torch.device("cpu"))
+        if saved.get("epoch") != epoch:
+            raise ValueError(f"checkpoint epoch verification failed: {path}")
+        if len(saved.get("history", [])) != len(history):
+            raise ValueError(f"checkpoint history verification failed: {path}")
+        if saved.get("run_identity") != run_identity:
+            raise ValueError(f"checkpoint run identity verification failed: {path}")
+        arch = run_identity.get("model_identity", {}).get("arch", "resnet18")
+        validate_checkpoint_payload(saved, model, run_identity, arch)
+        coca_run.checkpoint_size(path, arch=arch)
     finally:
         local_tmp.unlink(missing_ok=True)
 
@@ -159,6 +255,30 @@ def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     return running / max(n, 1)
 
 
+def build_optimizer(model, learning_rate: float, weight_decay: float):
+    parameters = trainable_parameters(model)
+    if not parameters:
+        raise ValueError("classifier has no trainable parameters")
+    return torch.optim.AdamW(
+        parameters,
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+
+def classifier_output_paths(base_dir, arch: str, variant: str, seed: int):
+    base_dir = Path(base_dir)
+    checkpoint_root = base_dir / "checkpoints"
+    results_dir = base_dir / "results"
+    if arch != "resnet18":
+        checkpoint_root = checkpoint_root / arch
+        results_dir = results_dir / arch
+    return (
+        checkpoint_root / f"{variant}_seed{seed}",
+        results_dir,
+    )
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a downstream HAM10000 classifier.")
     p.add_argument("--variant", default="C0", choices=["C0", "C1", "C4"])
@@ -181,6 +301,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None,
                    help="Cap the train frame size for a quick smoke run.")
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--arch", default="resnet18")
+    p.add_argument("--freeze-backbone", action="store_true")
+    p.add_argument("--coca-pretrained", default=COCA_PRETRAINED)
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--output-dir", default=None,
                    help="Base classifier dir; defaults to config.CLASSIFIER_DIR.")
@@ -189,12 +312,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true",
                    help="Resume from last.pt in this run's checkpoint dir if present.")
     p.add_argument("--device", default=None)
+    p.add_argument("--run-version", default=None)
+    p.add_argument("--shared-root-uuid", default=None)
+    p.add_argument("--formal-output-identity", default=None)
+    p.add_argument("--fixed-split-identity", default=None)
+    p.add_argument("--candidate-sha256", default=None)
     args = p.parse_args(argv)
     if args.variant == "C4" and not args.generated_manifest:
         p.error("--variant C4 requires --generated-manifest "
                 "(no default synthetic dir is read)")
     if args.run_label and not args.output_dir:
         p.error("--run-label requires an explicit isolated --output-dir")
+    if args.arch not in {"resnet18", COCA_ARCH}:
+        p.error(f"unsupported classifier architecture: {args.arch}")
+    if args.arch == COCA_ARCH and not args.freeze_backbone:
+        p.error("--arch coca_vit_b32 requires --freeze-backbone")
+    if args.arch != COCA_ARCH and args.freeze_backbone:
+        p.error("--freeze-backbone is only supported for coca_vit_b32")
     return args
 
 
@@ -212,11 +346,66 @@ def main(argv=None) -> None:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     base_dir = Path(args.output_dir) if args.output_dir else config.CLASSIFIER_DIR
-    if args.run_label:
+    if args.run_label and args.arch == "resnet18":
         base_dir = classifier_run.require_isolated_output_dir(
             base_dir, config.EXPLORATORY_BALANCED_DDPM_DIR
         )
     source_split = "train"
+    ckpt_dir, results_dir = classifier_output_paths(
+        base_dir, args.arch, args.variant, args.seed
+    )
+    if args.run_label:
+        base_dir = _ensure_durable_directory(base_dir)
+        checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
+        results_root = _ensure_durable_directory(base_dir / "results")
+        if args.arch != "resnet18":
+            checkpoint_root = _ensure_durable_directory(checkpoint_root / args.arch)
+            results_root = _ensure_durable_directory(results_root / args.arch)
+        ckpt_dir = _ensure_durable_directory(
+            checkpoint_root / f"{args.variant}_seed{args.seed}"
+        )
+        results_dir = results_root
+    else:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+    train_frame = manifests.build_classifier_frame(
+        args.variant, split="train", df_target_count=args.df_target_count,
+        seed=args.seed, limit=args.limit,
+        generated_manifest=args.generated_manifest,
+        generated_root=args.generated_root,
+    )
+    val_frame = manifests.load_split("val")
+    test_frame = manifests.load_split("test")
+    print(f"[data] variant={args.variant} train={len(train_frame)} "
+          f"val={len(val_frame)} test={len(test_frame)}")
+    print(f"[data] train class counts: {manifests.class_counts(train_frame)}")
+
+    model = build_model(
+        arch=args.arch,
+        pretrained=not args.no_pretrained,
+        coca_pretrained=args.coca_pretrained,
+        freeze_backbone=args.freeze_backbone,
+    ).to(device)
+    if args.arch == COCA_ARCH:
+        train_transform = model.train_preprocess
+        eval_transform = model.eval_preprocess
+    else:
+        train_transform = eval_transform = None
+
+    train_loader = build_dataloader(train_frame, args.img_size, args.batch_size,
+                                    train=True, num_workers=args.num_workers,
+                                    transform=train_transform)
+    val_loader = build_dataloader(val_frame, args.img_size, args.batch_size,
+                                  train=False, num_workers=args.num_workers,
+                                  transform=eval_transform)
+    test_loader = build_dataloader(test_frame, args.img_size, args.batch_size,
+                                   train=False, num_workers=args.num_workers,
+                                   transform=eval_transform)
+
+    model_details = build_model_identity(
+        model, args.arch, args.img_size, pretrained=not args.no_pretrained
+    )
     run_identity = classifier_run.build_run_identity(
         run_label=args.run_label,
         variant=args.variant,
@@ -233,48 +422,22 @@ def main(argv=None) -> None:
         source_split=source_split,
         source_manifest=config.MANIFESTS_DIR / f"{source_split}.csv",
         source_git_commit=classifier_run.git_commit(config.PROJECT_ROOT),
+        model_identity=model_details,
+        fixed_split_identity=args.fixed_split_identity,
+        shared_root_uuid=args.shared_root_uuid,
+        formal_output_identity=args.formal_output_identity,
+        run_version=args.run_version,
+        class_mapping=config.CLASS_TO_IDX,
+        experiment_candidate_sha256=args.candidate_sha256,
     )
-    ckpt_dir = base_dir / "checkpoints" / f"{args.variant}_seed{args.seed}"
-    results_dir = base_dir / "results"
-    if args.run_label:
-        base_dir = _ensure_durable_directory(base_dir)
-        checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
-        ckpt_dir = _ensure_durable_directory(
-            checkpoint_root / f"{args.variant}_seed{args.seed}"
-        )
-        results_dir = _ensure_durable_directory(base_dir / "results")
-    else:
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        results_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[run] variant={args.variant} seed={args.seed} epochs={args.epochs} "
-          f"img={args.img_size} bs={args.batch_size} lr={args.lr} device={device}")
+    print(f"[run] arch={args.arch} variant={args.variant} seed={args.seed} "
+          f"epochs={args.epochs} bs={args.batch_size} lr={args.lr} device={device}")
     print(f"[identity] run_label={args.run_label!r} "
           f"candidate_sha256={run_identity['candidate_manifest_sha256']} "
           f"source_split={source_split} git_commit={run_identity['git_commit']}")
-
-    train_frame = manifests.build_classifier_frame(
-        args.variant, split="train", df_target_count=args.df_target_count,
-        seed=args.seed, limit=args.limit,
-        generated_manifest=args.generated_manifest,
-        generated_root=args.generated_root,
-    )
-    val_frame = manifests.load_split("val")
-    test_frame = manifests.load_split("test")
-    print(f"[data] variant={args.variant} train={len(train_frame)} "
-          f"val={len(val_frame)} test={len(test_frame)}")
-    print(f"[data] train class counts: {manifests.class_counts(train_frame)}")
-
-    train_loader = build_dataloader(train_frame, args.img_size, args.batch_size,
-                                    train=True, num_workers=args.num_workers)
-    val_loader = build_dataloader(val_frame, args.img_size, args.batch_size,
-                                  train=False, num_workers=args.num_workers)
-    test_loader = build_dataloader(test_frame, args.img_size, args.batch_size,
-                                   train=False, num_workers=args.num_workers)
-
-    model = build_model(pretrained=not args.no_pretrained).to(device)
+    print(f"[model] {json.dumps(model_details, sort_keys=True)}")
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
 
     start_epoch = 1
     best_val_f1 = -1.0
@@ -298,11 +461,9 @@ def main(argv=None) -> None:
             classifier_run.require_matching_resume_identity(
                 saved_identity, run_identity
             )
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val_f1 = ckpt.get("best_val_df_f1", -1.0)
-        history = ckpt.get("history", [])
+        start_epoch, best_val_f1, history = restore_checkpoint_state(
+            ckpt, model, optimizer, run_identity, args.arch
+        )
         rng = ckpt.get("rng_state")
         if rng is not None:
             _set_rng_state(rng)
@@ -329,7 +490,8 @@ def main(argv=None) -> None:
         marker = ""
         if improved:
             best_val_f1 = val_metrics["target_f1"]
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            state = model.head.state_dict() if args.arch == COCA_ARCH else model.state_dict()
+            best_state = {k: v.detach().cpu().clone() for k, v in state.items()}
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, epoch,
                             best_val_f1, history, args, run_identity,
                             val_metrics=val_metrics)
@@ -343,7 +505,8 @@ def main(argv=None) -> None:
               f"elapsed={time.time()-t0:.0f}s checkpoint_saved=last.pt{marker}")
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        target = model.head if args.arch == COCA_ARCH else model
+        target.load_state_dict(best_state, strict=True)
     elif (ckpt_dir / "best.pt").exists():
         # e.g. resumed a run that had already finished all epochs
         best_ckpt = _load_trusted_checkpoint(ckpt_dir / "best.pt", device)
@@ -361,7 +524,9 @@ def main(argv=None) -> None:
             classifier_run.require_matching_resume_identity(
                 best_identity, run_identity
             )
-        model.load_state_dict(best_ckpt["model_state_dict"])
+        restore_checkpoint_state(
+            best_ckpt, model, optimizer, run_identity, args.arch
+        )
     test_metrics = evaluate(model, test_loader, device)
     print(f"[test] variant={args.variant} seed={args.seed} "
           f"df_f1={test_metrics['target_f1']:.4f} "
@@ -378,6 +543,14 @@ def main(argv=None) -> None:
         "history": history,
         "test_metrics": test_metrics,
         "run_identity": run_identity,
+        "checkpoint_format": run_identity["checkpoint_format"],
+        "checkpoint_sizes": {
+            "best_pt_bytes": coca_run.checkpoint_size(
+                ckpt_dir / "best.pt", arch=args.arch
+            ),
+            "last_pt_bytes": coca_run.checkpoint_size(last_path, arch=args.arch),
+        },
+        "encoder_weights_stored": False if args.arch == COCA_ARCH else None,
         "data_counts": {
             "train": len(train_frame),
             "val": len(val_frame),
