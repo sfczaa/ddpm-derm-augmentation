@@ -64,6 +64,11 @@ outputs/
   `downstream_classifier/` directory. `archive_manifest.json` records the
   source ZIP hash and verification status. Keep the complete ZIP and `.pt`
   weights outside Git; `outputs/**` remains ignored.
+- **Frozen CoCa robustness archive** → keep its curated validation records,
+  six formal result JSON files, aggregate/training records, completion marker,
+  and executed training notebook under the same version's
+  `coca_classifier/v1/` directory. Keep the complete ZIP and all `.pt`
+  checkpoints outside Git; `archive_manifest.json` records the local audit.
 
 ## Checkpoint contents
 
