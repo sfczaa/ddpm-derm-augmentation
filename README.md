@@ -175,6 +175,27 @@ significance test was performed. It does not establish a validated, clinical,
 or medical-effectiveness claim, and it does not automatically replace the
 deployed C1 checkpoint.
 
+### Independent frozen CoCa robustness check (completed)
+
+A second classifier tested whether the sqrt-balanced C4 direction transferred
+to a different image representation. It used the OpenCLIP
+`coca_ViT-B-32` image encoder with `laion2b_s13b_b90k` weights, native 224px
+preprocessing, a frozen encoder, and a trainable seven-class linear head. C1
+and C4 used the same matched-585 data counts, seeds 0-2, 20 epochs, and
+validation-df-F1 checkpoint selection rule.
+
+| CoCa condition | df F1 (primary) | macro-F1 | df recall |
+|---|---:|---:|---:|
+| C1@585, duplicated real df | 0.000 +/- 0.000 | 0.114 +/- 0.000 | 0.000 +/- 0.000 |
+| C4@585, sqrt-balanced DDPM candidate | 0.000 +/- 0.000 | 0.114 +/- 0.000 | 0.000 +/- 0.000 |
+
+The paired C4-C1 df F1 difference was 0.000. Validation df F1 stayed at zero
+for every epoch in all six runs, so each best checkpoint remained the first
+epoch and predicted only the majority `nv` class on the test set. This does
+not reproduce the ResNet-18 direction. It is a floor-collapse result, not
+evidence that C1 and C4 are equivalent or that synthetic data is generally
+ineffective. The existing C1 seed-2 deployment remains unchanged.
+
 ## Stage 4 deployment MVP
 
 The service provides `/health`, `/api/predict`, `/api/gallery`, OpenAPI docs,
