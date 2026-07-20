@@ -12,6 +12,7 @@ NAMES = (
     "colab_coca_v2_weighted_validation.ipynb",
     "colab_coca_v2_weighted_classifier.ipynb",
 )
+IMPLEMENTATION_COMMIT = "f14b041d691c9a6fa9dc7e407e574b69c753ada1"
 
 
 def load(name):
@@ -25,12 +26,16 @@ def load(name):
 
 
 class CoCaV2NotebookTests(unittest.TestCase):
-    def test_json_code_cells_outputs_and_placeholder_guard(self):
+    def test_json_code_cells_outputs_and_commit_pin(self):
         for name in NAMES:
             notebook, code = load(name)
             self.assertEqual(notebook["cells"][0]["cell_type"], "code")
             first = "".join(notebook["cells"][0]["source"])
-            self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+            self.assertIn(
+                f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first
+            )
+            self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+            self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
             self.assertIn("Pin the reviewed pushed commit", first)
             for index, cell in enumerate(notebook["cells"]):
                 self.assertFalse(cell.get("outputs"))
