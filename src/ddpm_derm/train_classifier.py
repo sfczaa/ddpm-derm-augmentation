@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from . import classifier_run, coca_run, config, manifests, metrics
+from . import classifier_objective, classifier_run, coca_run, config, manifests, metrics
 from .dataset import build_dataloader
 from .model import (
     COCA_ARCH,
@@ -239,6 +239,16 @@ def evaluate(model, loader, device) -> dict:
     return metrics.classification_summary(y_true, y_pred)
 
 
+def evaluate_test_scope(evaluation_scope, model, loader, device):
+    if evaluation_scope == "validation_only":
+        return None
+    if evaluation_scope != "full":
+        raise ValueError(f"unsupported evaluation scope: {evaluation_scope!r}")
+    if loader is None:
+        raise ValueError("full evaluation requires a test loader")
+    return evaluate(model, loader, device)
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     model.train()
     running = 0.0
@@ -264,6 +274,23 @@ def build_optimizer(model, learning_rate: float, weight_decay: float):
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+
+
+def build_criterion(class_weighting: str, class_weights, device):
+    if class_weighting == classifier_objective.CLASS_WEIGHTING_NONE:
+        if class_weights is not None:
+            raise ValueError("unweighted cross entropy cannot receive class weights")
+        return nn.CrossEntropyLoss()
+    if class_weighting != classifier_objective.CLASS_WEIGHTING_INVERSE_SQRT:
+        raise ValueError(f"unsupported class weighting mode: {class_weighting!r}")
+    if class_weights is None:
+        raise ValueError("inverse_sqrt requires an ordered class-weight vector")
+    weights = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
+    if tuple(weights.shape) != (config.NUM_CLASSES,):
+        raise ValueError(
+            f"class weight tensor must have shape ({config.NUM_CLASSES},)"
+        )
+    return nn.CrossEntropyLoss(weight=weights)
 
 
 def classifier_output_paths(base_dir, arch: str, variant: str, seed: int):
@@ -317,6 +344,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--formal-output-identity", default=None)
     p.add_argument("--fixed-split-identity", default=None)
     p.add_argument("--candidate-sha256", default=None)
+    p.add_argument(
+        "--class-weighting", default="none", choices=["none", "inverse_sqrt"]
+    )
+    p.add_argument(
+        "--evaluation-scope", default="full",
+        choices=["full", "validation_only"],
+    )
     args = p.parse_args(argv)
     if args.variant == "C4" and not args.generated_manifest:
         p.error("--variant C4 requires --generated-manifest "
@@ -369,17 +403,34 @@ def main(argv=None) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
 
-    train_frame = manifests.build_classifier_frame(
+    full_train_frame = manifests.build_classifier_frame(
         args.variant, split="train", df_target_count=args.df_target_count,
-        seed=args.seed, limit=args.limit,
+        seed=args.seed, limit=None,
         generated_manifest=args.generated_manifest,
         generated_root=args.generated_root,
     )
+    training_objective, class_weights = (
+        classifier_objective.build_training_objective(
+            args.class_weighting, full_train_frame
+        )
+    )
+    train_frame = full_train_frame
+    if args.limit is not None:
+        train_frame = train_frame.sample(
+            n=min(args.limit, len(train_frame)), random_state=args.seed
+        ).reset_index(drop=True)
     val_frame = manifests.load_split("val")
-    test_frame = manifests.load_split("test")
+    test_frame = (
+        manifests.load_split("test") if args.evaluation_scope == "full" else None
+    )
     print(f"[data] variant={args.variant} train={len(train_frame)} "
-          f"val={len(val_frame)} test={len(test_frame)}")
+          f"val={len(val_frame)} "
+          f"test={len(test_frame) if test_frame is not None else 'not_loaded'}")
     print(f"[data] train class counts: {manifests.class_counts(train_frame)}")
+    if training_objective is None:
+        print("[objective] class_weighting=none")
+    else:
+        print("[objective] " + json.dumps(training_objective, sort_keys=True))
 
     model = build_model(
         arch=args.arch,
@@ -399,9 +450,12 @@ def main(argv=None) -> None:
     val_loader = build_dataloader(val_frame, args.img_size, args.batch_size,
                                   train=False, num_workers=args.num_workers,
                                   transform=eval_transform)
-    test_loader = build_dataloader(test_frame, args.img_size, args.batch_size,
-                                   train=False, num_workers=args.num_workers,
-                                   transform=eval_transform)
+    test_loader = None
+    if test_frame is not None:
+        test_loader = build_dataloader(
+            test_frame, args.img_size, args.batch_size, train=False,
+            num_workers=args.num_workers, transform=eval_transform,
+        )
 
     model_details = build_model_identity(
         model, args.arch, args.img_size, pretrained=not args.no_pretrained
@@ -429,6 +483,8 @@ def main(argv=None) -> None:
         run_version=args.run_version,
         class_mapping=config.CLASS_TO_IDX,
         experiment_candidate_sha256=args.candidate_sha256,
+        training_objective=training_objective,
+        evaluation_scope=args.evaluation_scope,
     )
     print(f"[run] arch={args.arch} variant={args.variant} seed={args.seed} "
           f"epochs={args.epochs} bs={args.batch_size} lr={args.lr} device={device}")
@@ -436,7 +492,7 @@ def main(argv=None) -> None:
           f"candidate_sha256={run_identity['candidate_manifest_sha256']} "
           f"source_split={source_split} git_commit={run_identity['git_commit']}")
     print(f"[model] {json.dumps(model_details, sort_keys=True)}")
-    criterion = nn.CrossEntropyLoss()
+    criterion = build_criterion(args.class_weighting, class_weights, device)
     optimizer = build_optimizer(model, args.lr, args.weight_decay)
 
     start_epoch = 1
@@ -477,7 +533,7 @@ def main(argv=None) -> None:
     print(f"[ckpt] saving to {ckpt_dir}  (last.pt refreshed every epoch, "
           f"best.pt on val df_f1 improvement)")
     if start_epoch > args.epochs:
-        print(f"[skip] already trained all {args.epochs} epochs -> straight to test")
+        print(f"[skip] already trained all {args.epochs} epochs -> evaluation")
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
@@ -527,13 +583,38 @@ def main(argv=None) -> None:
         restore_checkpoint_state(
             best_ckpt, model, optimizer, run_identity, args.arch
         )
-    test_metrics = evaluate(model, test_loader, device)
-    print(f"[test] variant={args.variant} seed={args.seed} "
-          f"df_f1={test_metrics['target_f1']:.4f} "
-          f"macro_f1={test_metrics['macro_f1']:.4f} "
-          f"acc={test_metrics['accuracy']:.4f}")
-    recalls = {k: round(v, 3) for k, v in test_metrics["per_class_recall"].items()}
-    print(f"[test] per-class recall: {recalls}")
+    test_metrics = evaluate_test_scope(
+        args.evaluation_scope, model, test_loader, device
+    )
+    validation_metrics = None
+    if args.evaluation_scope == "full":
+        print(f"[test] variant={args.variant} seed={args.seed} "
+              f"df_f1={test_metrics['target_f1']:.4f} "
+              f"macro_f1={test_metrics['macro_f1']:.4f} "
+              f"acc={test_metrics['accuracy']:.4f}")
+        recalls = {
+            k: round(v, 3)
+            for k, v in test_metrics["per_class_recall"].items()
+        }
+        print(f"[test] per-class recall: {recalls}")
+    else:
+        best_checkpoint = _load_trusted_checkpoint(ckpt_dir / "best.pt", device)
+        classifier_run.require_matching_resume_identity(
+            best_checkpoint["run_identity"], run_identity
+        )
+        validation_metrics = best_checkpoint.get("val_metrics")
+        if validation_metrics is None:
+            raise ValueError("best checkpoint is missing validation metrics")
+        predicted = np.asarray(validation_metrics["confusion_matrix"]).sum(axis=0)
+        predicted_counts = {
+            config.CLASS_NAMES[index]: int(value)
+            for index, value in enumerate(predicted)
+        }
+        print(
+            "[validation-only] "
+            f"best_df_f1={best_val_f1:.4f} "
+            f"predicted_counts={predicted_counts}"
+        )
 
     result = {
         "variant": args.variant,
@@ -542,6 +623,9 @@ def main(argv=None) -> None:
         "best_val_df_f1": best_val_f1,
         "history": history,
         "test_metrics": test_metrics,
+        "validation_metrics": validation_metrics,
+        "evaluation_scope": args.evaluation_scope,
+        "training_objective": training_objective,
         "run_identity": run_identity,
         "checkpoint_format": run_identity["checkpoint_format"],
         "checkpoint_sizes": {
@@ -554,7 +638,7 @@ def main(argv=None) -> None:
         "data_counts": {
             "train": len(train_frame),
             "val": len(val_frame),
-            "test": len(test_frame),
+            "test": len(test_frame) if test_frame is not None else None,
         },
     }
     out_path = results_dir / f"results_{args.variant}_seed{args.seed}.json"

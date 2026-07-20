@@ -33,6 +33,8 @@ IMMUTABLE_IDENTITY_KEYS = (
     "formal_output_identity",
     "model_identity",
     "checkpoint_format",
+    "training_objective",
+    "evaluation_scope",
 )
 
 
@@ -223,6 +225,17 @@ def aggregate_results(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     found = {(run.get("variant"), run.get("seed")) for run in runs}
     if found != expected or len(runs) != 6:
         raise ValueError(f"expected exactly six C1/C4 seed runs, found {sorted(found)}")
+    scopes = {run.get("evaluation_scope", "full") for run in runs}
+    if scopes != {"full"} or any(run.get("test_metrics") is None for run in runs):
+        raise ValueError("formal aggregation requires full evaluation results")
+    for run in runs:
+        identity = run["run_identity"]
+        if identity.get("training_objective") is not None and identity.get(
+            "evaluation_scope"
+        ) != run.get("evaluation_scope", "full"):
+            raise ValueError(
+                "weighted result evaluation scope does not match its run identity"
+            )
     model_identities = [run["run_identity"]["model_identity"] for run in runs]
     first = model_identities[0]
     if first.get("arch") != ARCH or any(identity != first for identity in model_identities[1:]):
@@ -230,6 +243,15 @@ def aggregate_results(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     formats = {run["run_identity"].get("checkpoint_format") for run in runs}
     if formats != {CHECKPOINT_FORMAT}:
         raise ValueError(f"refusing to aggregate mixed checkpoint formats: {formats}")
+    run_versions = {run["run_identity"].get("run_version") for run in runs}
+    if len(run_versions) != 1:
+        raise ValueError(f"refusing to aggregate mixed run versions: {run_versions}")
+    objectives = {
+        json.dumps(run["run_identity"].get("training_objective"), sort_keys=True)
+        for run in runs
+    }
+    if len(objectives) != 1:
+        raise ValueError("refusing to aggregate mixed training objectives")
     output: dict[str, Any] = {"ddof": 0, "variants": {}, "paired_c4_minus_c1": {}}
     metric_keys = {
         "df_f1": "target_f1",

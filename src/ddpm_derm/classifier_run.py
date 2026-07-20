@@ -59,6 +59,8 @@ def build_run_identity(
     class_mapping: Mapping[str, int] | None = None,
     experiment_candidate_sha256: str | None = None,
     checkpoint_format: str | None = None,
+    training_objective: Mapping[str, Any] | None = None,
+    evaluation_scope: str = "full",
 ) -> dict[str, Any]:
     """Build a portable identity for checkpoint compatibility checks."""
     if source_split != "train":
@@ -104,7 +106,7 @@ def build_run_identity(
             if model_identity.get("arch") == "coca_vit_b32"
             else FULL_MODEL_CHECKPOINT_FORMAT
         )
-    return {
+    identity = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
         "run_label": run_label,
         "variant": variant,
@@ -132,6 +134,11 @@ def build_run_identity(
         "class_mapping": None if class_mapping is None else dict(class_mapping),
         "checkpoint_format": checkpoint_format,
     }
+    if training_objective is not None:
+        identity["training_objective"] = dict(training_objective)
+    if training_objective is not None or evaluation_scope != "full":
+        identity["evaluation_scope"] = evaluation_scope
+    return identity
 
 
 def require_matching_resume_identity(
@@ -185,6 +192,12 @@ def require_matching_resume_identity(
         for key in required
         if saved[key] != current.get(key)
     ]
+    for key in ("training_objective", "evaluation_scope"):
+        if key in saved or key in current:
+            if saved.get(key) != current.get(key):
+                mismatches.append(
+                    f"{key}: saved={saved.get(key)!r} current={current.get(key)!r}"
+                )
     if mismatches:
         raise ValueError("classifier resume identity mismatch: " + "; ".join(mismatches))
 
