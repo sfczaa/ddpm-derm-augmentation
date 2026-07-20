@@ -36,6 +36,13 @@ def _model_signature(data: dict) -> str:
     signature["checkpoint_format"] = data.get("run_identity", {}).get(
         "checkpoint_format"
     )
+    signature["run_version"] = data.get("run_identity", {}).get("run_version")
+    signature["training_objective"] = data.get("run_identity", {}).get(
+        "training_objective"
+    )
+    signature["evaluation_scope"] = data.get("run_identity", {}).get(
+        "evaluation_scope"
+    )
     return json.dumps(signature, sort_keys=True)
 
 
@@ -46,6 +53,15 @@ def load_results(
     signatures = set()
     for path in sorted(results_dir.glob("results_*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("evaluation_scope", "full") != "full" or data.get(
+            "test_metrics"
+        ) is None:
+            raise ValueError(f"{path} is not a full-evaluation result")
+        run_identity = data.get("run_identity", {})
+        if run_identity.get("training_objective") is not None and run_identity.get(
+            "evaluation_scope"
+        ) != data.get("evaluation_scope", "full"):
+            raise ValueError(f"{path} has inconsistent weighted evaluation scope")
         identity = data.get("run_identity", {}).get("model_identity", {})
         arch = identity.get("arch", "resnet18")
         if expected_arch is not None and arch != expected_arch:
