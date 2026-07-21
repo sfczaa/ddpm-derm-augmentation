@@ -44,13 +44,13 @@ def load(name):
 
 
 class CoCaV3NotebookTests(unittest.TestCase):
-    def test_json_cells_placeholder_pin_and_token_safety(self):
+    def test_json_cells_pin_and_token_safety(self):
         for name in NAMES:
             notebook, code = load(name)
             self.assertEqual(notebook["cells"][0]["cell_type"], "code")
             first = "".join(notebook["cells"][0]["source"])
-            # not pinned yet: the guard must fail loud on the placeholder
-            self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+            # The release notebook pins one reviewed implementation commit.
+            self.assertRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
             self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
             self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
             self.assertIn("Pin the reviewed pushed commit", first)
