@@ -281,10 +281,13 @@ def build_criterion(class_weighting: str, class_weights, device):
         if class_weights is not None:
             raise ValueError("unweighted cross entropy cannot receive class weights")
         return nn.CrossEntropyLoss()
-    if class_weighting != classifier_objective.CLASS_WEIGHTING_INVERSE_SQRT:
+    if class_weighting not in (
+        classifier_objective.CLASS_WEIGHTING_INVERSE_SQRT,
+        classifier_objective.CLASS_WEIGHTING_INVERSE_FREQUENCY,
+    ):
         raise ValueError(f"unsupported class weighting mode: {class_weighting!r}")
     if class_weights is None:
-        raise ValueError("inverse_sqrt requires an ordered class-weight vector")
+        raise ValueError(f"{class_weighting} requires an ordered class-weight vector")
     weights = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
     if tuple(weights.shape) != (config.NUM_CLASSES,):
         raise ValueError(
@@ -345,7 +348,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--fixed-split-identity", default=None)
     p.add_argument("--candidate-sha256", default=None)
     p.add_argument(
-        "--class-weighting", default="none", choices=["none", "inverse_sqrt"]
+        "--class-weighting", default="none",
+        choices=["none", "inverse_sqrt", "inverse_frequency"],
     )
     p.add_argument(
         "--evaluation-scope", default="full",
