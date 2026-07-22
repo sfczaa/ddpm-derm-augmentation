@@ -276,7 +276,54 @@ def build_optimizer(model, learning_rate: float, weight_decay: float):
     )
 
 
-def build_criterion(class_weighting: str, class_weights, device):
+class FocalCrossEntropyLoss(nn.Module):
+    """Inverse-frequency focal loss with CrossEntropyLoss-compatible reduction."""
+
+    def __init__(self, class_weights, gamma: float, device):
+        super().__init__()
+        weights = torch.as_tensor(
+            class_weights, dtype=torch.float32, device=device
+        )
+        if tuple(weights.shape) != (config.NUM_CLASSES,):
+            raise ValueError(
+                f"class weight tensor must have shape ({config.NUM_CLASSES},)"
+            )
+        if not torch.isfinite(weights).all() or not torch.all(weights > 0):
+            raise ValueError("focal class weights must be finite and positive")
+        gamma = float(gamma)
+        if not np.isfinite(gamma) or gamma < 0:
+            raise ValueError("focal_gamma must be finite and >= 0")
+        self.register_buffer("weight", weights)
+        self.gamma = gamma
+
+    def forward(self, logits, target):
+        alpha = self.weight.to(device=logits.device, dtype=logits.dtype)
+        alpha_t = alpha[target]
+        denominator = alpha_t.sum()
+        if not torch.isfinite(denominator) or not denominator > 0:
+            raise ValueError("focal loss denominator must be finite and > 0")
+        if self.gamma == 0:
+            return nn.functional.cross_entropy(
+                logits, target, weight=alpha, reduction="mean"
+            )
+        log_probs = torch.log_softmax(logits, dim=1)
+        log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+        numerator = (-alpha_t * (1 - pt).pow(self.gamma) * log_pt).sum()
+        return numerator / denominator
+
+
+def build_criterion(
+    class_weighting: str,
+    class_weights,
+    device,
+    *,
+    loss_name: str = classifier_objective.LOSS_CROSS_ENTROPY,
+    focal_gamma: float | None = None,
+):
+    gamma = classifier_objective.validate_loss_configuration(
+        class_weighting, loss_name=loss_name, focal_gamma=focal_gamma
+    )
     if class_weighting == classifier_objective.CLASS_WEIGHTING_NONE:
         if class_weights is not None:
             raise ValueError("unweighted cross entropy cannot receive class weights")
@@ -293,6 +340,8 @@ def build_criterion(class_weighting: str, class_weights, device):
         raise ValueError(
             f"class weight tensor must have shape ({config.NUM_CLASSES},)"
         )
+    if loss_name == classifier_objective.LOSS_FOCAL_CROSS_ENTROPY:
+        return FocalCrossEntropyLoss(weights, gamma, device)
     return nn.CrossEntropyLoss(weight=weights)
 
 
@@ -352,6 +401,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=["none", "inverse_sqrt", "inverse_frequency"],
     )
     p.add_argument(
+        "--loss-name", default="cross_entropy",
+        choices=["cross_entropy", "focal_cross_entropy"],
+    )
+    p.add_argument("--focal-gamma", type=float, default=None)
+    p.add_argument(
         "--evaluation-scope", default="full",
         choices=["full", "validation_only"],
     )
@@ -367,6 +421,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--arch coca_vit_b32 requires --freeze-backbone")
     if args.arch != COCA_ARCH and args.freeze_backbone:
         p.error("--freeze-backbone is only supported for coca_vit_b32")
+    try:
+        classifier_objective.validate_loss_configuration(
+            args.class_weighting,
+            loss_name=args.loss_name,
+            focal_gamma=args.focal_gamma,
+        )
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 
@@ -415,7 +477,10 @@ def main(argv=None) -> None:
     )
     training_objective, class_weights = (
         classifier_objective.build_training_objective(
-            args.class_weighting, full_train_frame
+            args.class_weighting,
+            full_train_frame,
+            loss_name=args.loss_name,
+            focal_gamma=args.focal_gamma,
         )
     )
     train_frame = full_train_frame
@@ -496,7 +561,13 @@ def main(argv=None) -> None:
           f"candidate_sha256={run_identity['candidate_manifest_sha256']} "
           f"source_split={source_split} git_commit={run_identity['git_commit']}")
     print(f"[model] {json.dumps(model_details, sort_keys=True)}")
-    criterion = build_criterion(args.class_weighting, class_weights, device)
+    criterion = build_criterion(
+        args.class_weighting,
+        class_weights,
+        device,
+        loss_name=args.loss_name,
+        focal_gamma=args.focal_gamma,
+    )
     optimizer = build_optimizer(model, args.lr, args.weight_decay)
 
     start_epoch = 1
