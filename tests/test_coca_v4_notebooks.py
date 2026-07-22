@@ -24,6 +24,7 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = (
     "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 )
+PINNED_GIT_COMMIT = "61cd4dc1b2113218621613ebd23ab08a12ad53fb"
 HEAD_MATCH_NOTEBOOKS = (
     "colab_coca_validation.ipynb",
     "colab_coca_classifier.ipynb",
@@ -45,12 +46,15 @@ def load(name):
 
 
 class CoCaV4NotebookTests(unittest.TestCase):
-    def test_json_code_cells_are_unexecuted_and_placeholder_fails_loud(self):
+    def test_json_code_cells_are_unexecuted_and_pinned(self):
         for name in NAMES:
             notebook, code = load(name)
             first = "".join(notebook["cells"][0]["source"])
             self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-            self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+            self.assertIn(
+                f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', first
+            )
+            self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
             self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
             self.assertIn("Pin the reviewed pushed commit", first)
             for index, cell in enumerate(notebook["cells"]):
