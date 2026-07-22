@@ -9,7 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_synthetic_mixture_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "5b076b990ba17b804e483cdd2a02456a28bb28cf"
 
 
 class SyntheticMixtureNotebookTests(unittest.TestCase):
@@ -22,9 +21,8 @@ class SyntheticMixtureNotebookTests(unittest.TestCase):
             if cell["cell_type"] == "code"
         )
 
-    def test_unexecuted_and_pinned_fail_loud(self):
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', self.code)
-        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
+    def test_unexecuted_and_unpinned_fail_loud(self):
+        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', self.code)
         for cell in self.notebook["cells"]:
             if cell["cell_type"] == "code":
@@ -54,6 +52,12 @@ class SyntheticMixtureNotebookTests(unittest.TestCase):
         self.assertIn('embedding["diagnostic_status"] == "COMPLETED"', self.code)
         self.assertIn("guard_after == guard_before", self.code)
         self.assertIn('"interpretation_scope": "descriptive_not_candidate_selection"', self.code)
+
+    def test_candidate_guard_allows_shared_synthetic_lesion_marker(self):
+        self.assertIn(
+            'assert not candidate["image_id"].duplicated().any()', self.code
+        )
+        self.assertNotIn("not candidate[field].duplicated().any()", self.code)
 
 
 if __name__ == "__main__":

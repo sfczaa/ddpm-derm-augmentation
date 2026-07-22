@@ -40,7 +40,7 @@ def synthetic_frame() -> pd.DataFrame:
         "image_path": f"synthetic/{index}.png",
         "label_idx": config.TARGET_CLASS_IDX,
         "dx": config.TARGET_CLASS,
-        "lesion_id": f"synthetic-lesion-{index}",
+        "lesion_id": "synthetic",
         "image_id": f"synthetic-{index:03d}",
         "source": "synthetic",
     } for index in range(500)])
@@ -101,6 +101,13 @@ class SyntheticMixtureDiagnosticTests(unittest.TestCase):
         second_ids = set(second_frame.loc[second_frame["source"] == "synthetic", "image_id"])
         self.assertEqual(first_ids, second_ids)
         self.assertEqual(first_identity, second_identity)
+
+    def test_shared_synthetic_lesion_marker_is_allowed_for_train_only_rows(self):
+        candidate = synthetic_frame()
+        self.assertEqual(candidate["lesion_id"].nunique(), 1)
+        frame, identity = self.build(125, candidate)
+        self.assertEqual(int((frame["source"] == "synthetic").sum()), 125)
+        self.assertEqual(identity["selected_synthetic_count"], 125)
 
     def test_invalid_counts_and_image_ids_fail_loud(self):
         with self.assertRaisesRegex(ValueError, "exceeds candidate size"):
