@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_post_failure_embedding_diagnostic.ipynb"
+PINNED_GIT_COMMIT = "1a6cc0bf46e7ae6b37b42afedcdc017ca4f6d340"
 
 
 class CoCaEmbeddingNotebookTests(unittest.TestCase):
@@ -25,9 +26,10 @@ class CoCaEmbeddingNotebookTests(unittest.TestCase):
             "".join(cell.get("source", [])) for cell in cls.notebook["cells"]
         )
 
-    def test_notebook_is_unexecuted_valid_and_fails_loud_until_pinned(self):
+    def test_notebook_is_unexecuted_valid_and_pinned(self):
         first = "".join(self.notebook["cells"][0]["source"])
-        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', first)
+        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
         for index, cell in enumerate(self.notebook["cells"]):
             self.assertFalse(cell.get("outputs"))
