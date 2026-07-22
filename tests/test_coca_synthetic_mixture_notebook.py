@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_synthetic_mixture_diagnostic.ipynb"
+PINNED_GIT_COMMIT = "5b076b990ba17b804e483cdd2a02456a28bb28cf"
 
 
 class SyntheticMixtureNotebookTests(unittest.TestCase):
@@ -22,7 +23,8 @@ class SyntheticMixtureNotebookTests(unittest.TestCase):
         )
 
     def test_unexecuted_and_pinned_fail_loud(self):
-        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', self.code)
+        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', self.code)
         for cell in self.notebook["cells"]:
             if cell["cell_type"] == "code":
