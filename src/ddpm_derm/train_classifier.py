@@ -377,6 +377,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--generated-root", default=None,
                    help="C4 only: root for the manifest's relative image paths "
                         "(default: the manifest's own directory).")
+    p.add_argument(
+        "--mixture-synthetic-count", type=int, default=None,
+        help="Exploratory C4 validation-only diagnostic: use a stable nested "
+             "synthetic prefix and fill remaining df slots with real duplicates.",
+    )
     p.add_argument("--limit", type=int, default=None,
                    help="Cap the train frame size for a quick smoke run.")
     p.add_argument("--num-workers", type=int, default=2)
@@ -415,6 +420,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                 "(no default synthetic dir is read)")
     if args.run_label and not args.output_dir:
         p.error("--run-label requires an explicit isolated --output-dir")
+    if args.mixture_synthetic_count is not None:
+        if args.variant != "C4":
+            p.error("--mixture-synthetic-count is only valid with --variant C4")
+        if args.mixture_synthetic_count < 0:
+            p.error("--mixture-synthetic-count must be non-negative")
+        if args.evaluation_scope != "validation_only":
+            p.error("--mixture-synthetic-count requires --evaluation-scope validation_only")
+        if not args.run_label or not args.output_dir:
+            p.error("--mixture-synthetic-count requires isolated --run-label and --output-dir")
     if args.arch not in {"resnet18", COCA_ARCH}:
         p.error(f"unsupported classifier architecture: {args.arch}")
     if args.arch == COCA_ARCH and not args.freeze_backbone:
@@ -469,12 +483,24 @@ def main(argv=None) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
 
-    full_train_frame = manifests.build_classifier_frame(
-        args.variant, split="train", df_target_count=args.df_target_count,
-        seed=args.seed, limit=None,
-        generated_manifest=args.generated_manifest,
-        generated_root=args.generated_root,
-    )
+    data_intervention = None
+    if args.mixture_synthetic_count is None:
+        full_train_frame = manifests.build_classifier_frame(
+            args.variant, split="train", df_target_count=args.df_target_count,
+            seed=args.seed, limit=None,
+            generated_manifest=args.generated_manifest,
+            generated_root=args.generated_root,
+        )
+    else:
+        full_train_frame, data_intervention = (
+            manifests.build_classifier_mixture_frame(
+                df_target_count=args.df_target_count,
+                synthetic_count=args.mixture_synthetic_count,
+                seed=args.seed,
+                generated_manifest=args.generated_manifest,
+                generated_root=args.generated_root,
+            )
+        )
     training_objective, class_weights = (
         classifier_objective.build_training_objective(
             args.class_weighting,
@@ -554,6 +580,7 @@ def main(argv=None) -> None:
         experiment_candidate_sha256=args.candidate_sha256,
         training_objective=training_objective,
         evaluation_scope=args.evaluation_scope,
+        data_intervention=data_intervention,
     )
     print(f"[run] arch={args.arch} variant={args.variant} seed={args.seed} "
           f"epochs={args.epochs} bs={args.batch_size} lr={args.lr} device={device}")
@@ -701,6 +728,7 @@ def main(argv=None) -> None:
         "validation_metrics": validation_metrics,
         "evaluation_scope": args.evaluation_scope,
         "training_objective": training_objective,
+        "data_intervention": data_intervention,
         "run_identity": run_identity,
         "checkpoint_format": run_identity["checkpoint_format"],
         "checkpoint_sizes": {

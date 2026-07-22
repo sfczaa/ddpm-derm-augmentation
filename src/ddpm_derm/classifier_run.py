@@ -61,6 +61,7 @@ def build_run_identity(
     checkpoint_format: str | None = None,
     training_objective: Mapping[str, Any] | None = None,
     evaluation_scope: str = "full",
+    data_intervention: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a portable identity for checkpoint compatibility checks."""
     if source_split != "train":
@@ -138,6 +139,8 @@ def build_run_identity(
         identity["training_objective"] = dict(training_objective)
     if training_objective is not None or evaluation_scope != "full":
         identity["evaluation_scope"] = evaluation_scope
+    if data_intervention is not None:
+        identity["data_intervention"] = dict(data_intervention)
     return identity
 
 
@@ -192,7 +195,7 @@ def require_matching_resume_identity(
         for key in required
         if saved[key] != current.get(key)
     ]
-    for key in ("training_objective", "evaluation_scope"):
+    for key in ("training_objective", "evaluation_scope", "data_intervention"):
         if key in saved or key in current:
             if saved.get(key) != current.get(key):
                 mismatches.append(

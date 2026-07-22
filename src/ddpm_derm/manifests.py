@@ -11,6 +11,8 @@ manifest (``load_generated_manifest``); val/test are never augmented.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import numpy as np
@@ -24,6 +26,8 @@ VALID_SPLITS = ("train", "val", "test")
 # Schema sample_ddpm.py writes for generated rows; ``source`` marks provenance.
 GENERATED_REQUIRED_COLUMNS = REQUIRED_COLUMNS + ["source"]
 GENERATED_SOURCE = "synthetic"
+MIXTURE_SELECTION_ALGORITHM = "sha256_image_id_prefix_v1"
+MIXTURE_REAL_DUPLICATION_ALGORITHM = "sha256_real_image_id_cycle_prefix_v1"
 
 
 def load_split(split: str) -> pd.DataFrame:
@@ -165,6 +169,101 @@ def load_generated_manifest(
     out = gen.copy()
     out["image_path"] = [str(p) for p in resolved]
     return out
+
+
+def build_classifier_mixture_frame(
+    *,
+    df_target_count: int,
+    synthetic_count: int,
+    seed: int,
+    generated_manifest: str | Path,
+    generated_root: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Build a validation-only C4 dose-response frame with fixed df support.
+
+    The synthetic rows are a stable, nested prefix of the candidate after
+    ordering by the SHA-256 of ``image_id``.  Any remaining df slots are filled
+    by deterministic duplication of real train-df rows.  This keeps the total
+    df count fixed while changing only the synthetic dose.
+    """
+    if synthetic_count < 0:
+        raise ValueError("synthetic_count must be non-negative")
+    frame = load_split("train")
+    gen = load_generated_manifest(generated_manifest, root=generated_root)
+    if gen["image_id"].isna().any() or (gen["image_id"].astype(str).str.len() == 0).any():
+        raise ValueError("generated manifest image_id must be non-null and non-empty")
+    if gen["image_id"].duplicated().any():
+        raise ValueError("generated manifest image_id values must be unique")
+
+    n_real = int((frame["label_idx"] == config.TARGET_CLASS_IDX).sum())
+    if n_real == 0:
+        raise ValueError("fixed train split has no real df rows")
+    max_synthetic = df_target_count - n_real
+    if max_synthetic <= 0:
+        raise ValueError(
+            f"df_target_count={df_target_count} must exceed the {n_real} real train df rows"
+        )
+    if len(gen) != max_synthetic:
+        raise ValueError(
+            f"mixture candidate must contain exactly {max_synthetic} synthetic df rows "
+            f"but {generated_manifest} provides {len(gen)}"
+        )
+    if synthetic_count > max_synthetic:
+        raise ValueError(
+            f"synthetic_count={synthetic_count} exceeds candidate size {max_synthetic}"
+        )
+
+    ordered = gen.copy()
+    ordered["_mixture_order_key"] = ordered["image_id"].astype(str).map(
+        lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    )
+    ordered = ordered.sort_values(
+        ["_mixture_order_key", "image_id"], kind="mergesort"
+    ).reset_index(drop=True)
+    selected = ordered.iloc[:synthetic_count].drop(
+        columns=["_mixture_order_key"]
+    )
+
+    real_target_count = df_target_count - synthetic_count
+    real_df = frame[frame["label_idx"] == config.TARGET_CLASS_IDX].copy()
+    real_df["_mixture_order_key"] = real_df["image_id"].astype(str).map(
+        lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    )
+    real_df = real_df.sort_values(
+        ["_mixture_order_key", "image_id"], kind="mergesort"
+    ).drop(columns=["_mixture_order_key"]).reset_index(drop=True)
+    duplicated_real_count = real_target_count - n_real
+    duplicate_indices = np.arange(duplicated_real_count) % n_real
+    duplicated_real = real_df.iloc[duplicate_indices].copy()
+    real = pd.concat([frame, duplicated_real], ignore_index=True)
+    real["source"] = "real"
+    out = pd.concat([real, selected], ignore_index=True)
+    out = out.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    ordered_ids = ordered["image_id"].astype(str).tolist()
+    selected_ids = ordered_ids[:synthetic_count]
+    duplicated_real_ids = duplicated_real["image_id"].astype(str).tolist()
+
+    def identity_hash(values: list[str]) -> str:
+        payload = json.dumps(
+            values, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    intervention = {
+        "name": "synthetic_mixture_dose_response",
+        "selection_algorithm": MIXTURE_SELECTION_ALGORITHM,
+        "candidate_count": len(ordered_ids),
+        "candidate_order_sha256": identity_hash(ordered_ids),
+        "selected_synthetic_count": synthetic_count,
+        "selected_synthetic_image_ids_sha256": identity_hash(selected_ids),
+        "real_duplication_algorithm": MIXTURE_REAL_DUPLICATION_ALGORITHM,
+        "original_real_df_count": n_real,
+        "duplicated_real_df_count": duplicated_real_count,
+        "duplicated_real_image_ids_sha256": identity_hash(duplicated_real_ids),
+        "total_df_count": df_target_count,
+    }
+    return out, intervention
 
 
 def build_classifier_frame(
