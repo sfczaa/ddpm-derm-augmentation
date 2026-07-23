@@ -9,7 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_synthetic_mixture_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "4158d652b9be7f5d735b5a6a7eee4ad2fa68f499"
 
 
 class SyntheticMixtureNotebookTests(unittest.TestCase):
@@ -22,9 +21,8 @@ class SyntheticMixtureNotebookTests(unittest.TestCase):
             if cell["cell_type"] == "code"
         )
 
-    def test_unexecuted_and_pinned_fail_loud(self):
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', self.code)
-        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
+    def test_unexecuted_and_unpinned_fail_loud(self):
+        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', self.code)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', self.code)
         for cell in self.notebook["cells"]:
             if cell["cell_type"] == "code":
@@ -60,6 +58,13 @@ class SyntheticMixtureNotebookTests(unittest.TestCase):
             'assert not candidate["image_id"].duplicated().any()', self.code
         )
         self.assertNotIn("not candidate[field].duplicated().any()", self.code)
+
+    def test_phase1_local_copy_reports_visible_progress_and_fails_loud(self):
+        self.assertIn("def copy_group(", self.code)
+        self.assertIn('f"START {group} copy: total={total}"', self.code)
+        self.assertIn("flush=True", self.code)
+        self.assertIn("copy failed at ", self.code)
+        self.assertIn(") from exc", self.code)
 
 
 if __name__ == "__main__":
