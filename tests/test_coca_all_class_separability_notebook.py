@@ -1,9 +1,9 @@
 """Static safety checks for the all-class separability Colab diagnostic.
 
-The implementation-stage notebook must keep the REPLACE_AFTER_PUSH pinning
-placeholder (so Run all fails loud until an independent reviewer pins the pushed
-commit), stay unexecuted and compilable, and never reach test data, synthetic
-images, formal training, or checkpoints.
+The notebook is pinned to the independently reviewed, pushed implementation
+commit (keeping the REPLACE_AFTER_PUSH fail-loud guard), stays unexecuted and
+compilable, and never reaches test data, synthetic images, formal training, or
+checkpoints.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_all_class_separability_diagnostic.ipynb"
+PINNED_GIT_COMMIT = "e687d253f2824d6815d41cc43bdb2ab3443be188"
 
 
 class AllClassSeparabilityNotebookTests(unittest.TestCase):
@@ -31,13 +32,15 @@ class AllClassSeparabilityNotebookTests(unittest.TestCase):
             "".join(cell.get("source", [])) for cell in cls.notebook["cells"]
         )
 
-    def test_placeholder_pinning_and_unexecuted_compilable(self):
+    def test_pinned_commit_and_unexecuted_compilable(self):
         first = "".join(self.notebook["cells"][0]["source"])
-        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        # pinned to the pushed implementation commit; the assignment is no longer
+        # the placeholder, but the != REPLACE_AFTER_PUSH fail-loud guard is kept.
+        self.assertRegex(PINNED_GIT_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PINNED_GIT_COMMIT}"', first)
+        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
-        # the reviewer pins the real commit later; no 40-hex SHA may be present yet
-        self.assertNotRegex(json.dumps(self.notebook), r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
         for index, cell in enumerate(self.notebook["cells"]):
             self.assertFalse(cell.get("outputs"))
             if cell["cell_type"] == "code":
