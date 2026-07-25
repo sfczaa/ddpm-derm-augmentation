@@ -17,6 +17,13 @@ open_clip_torch==3.3.0
 # --- frozen-CoCa representation diagnostic: fixed logistic-regression probe only ---
 scikit-learn==1.8.0
 
+# --- PanDerm-Base C1 full fine-tuning (Colab; weights are NOT redistributable) ---
+# timm is pinned to the version required by the upstream PanDerm checkout, which
+# supplies both the model definition and the training preprocessing. gdown fetches
+# the official checkpoint; its SHA-256 is verified before any training runs.
+timm==0.9.16
+gdown>=5.1
+
 # --- stage 2: DDPM generator (Colab) ---
 diffusers>=0.27      # UNet2DModel (class-conditional noise predictor)
 
