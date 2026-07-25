@@ -23,6 +23,7 @@ NAMES = (VALIDATION, FORMAL)
 
 PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
+IMPLEMENTATION_COMMIT = "6bfdcd0304820efc8125f440c937b284fd097f9d"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -99,11 +100,15 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_keeps_replace_after_push_fail_loud(self):
+    def test_first_cell_is_pinned_and_keeps_fail_loud_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(
+            f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first
+        )
+        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
         self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
