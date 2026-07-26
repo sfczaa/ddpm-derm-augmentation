@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
@@ -298,15 +299,29 @@ def stage_validation_data(
         if not required.is_file():
             raise FileNotFoundError(f"required validation data file missing: {required}")
 
+    staging_started = time.perf_counter()
+    print(
+        "[Phase 1] START validation staging: "
+        f"source={shared_data_root} destination={local_data_root}",
+        flush=True,
+    )
     relative_paths: list[str] = []
     destination_keys: set[str] = set()
     sources: dict[str, Path] = {}
     for split, manifest_path in manifest_paths.items():
+        scan_started = time.perf_counter()
+        last_scan_progress = scan_started
+        split_rows = 0
+        print(
+            f"[Phase 1] scan {split}: START manifest={manifest_path}",
+            flush=True,
+        )
         with manifest_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             if reader.fieldnames is None or "image_path" not in reader.fieldnames:
                 raise ValueError(f"{manifest_path} is missing image_path")
             for row_number, row in enumerate(reader, start=2):
+                split_rows += 1
                 relative = _canonical_manifest_image_path(row.get("image_path"))
                 destination_key = relative.casefold()
                 if destination_key in destination_keys:
@@ -330,16 +345,60 @@ def stage_validation_data(
                     )
                 relative_paths.append(relative)
                 sources[relative] = source
+                now = time.perf_counter()
+                if split_rows % 1000 == 0 or now - last_scan_progress >= 30:
+                    print(
+                        f"[Phase 1] scan {split}: rows={split_rows} "
+                        f"last={relative} elapsed={now - scan_started:.1f}s",
+                        flush=True,
+                    )
+                    last_scan_progress = now
+        print(
+            f"[Phase 1] scan {split}: DONE rows={split_rows} "
+            f"elapsed={time.perf_counter() - scan_started:.1f}s",
+            flush=True,
+        )
 
     local_manifests = local_data_root / "manifests"
     local_manifests.mkdir(parents=True)
     for split, manifest_path in manifest_paths.items():
         shutil.copy2(manifest_path, local_manifests / f"{split}.csv")
     shutil.copy2(class_mapping, local_manifests / class_mapping.name)
-    for relative in relative_paths:
+    total_images = len(relative_paths)
+    copy_started = time.perf_counter()
+    last_progress = copy_started
+    print(f"[Phase 1] copy images: START total={total_images}", flush=True)
+    for index, relative in enumerate(relative_paths, start=1):
         destination = local_data_root / Path(*relative.split("/"))
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(sources[relative], destination)
+        try:
+            shutil.copy2(sources[relative], destination)
+        except Exception as error:
+            raise RuntimeError(
+                f"validation image copy failed at {index}/{total_images} "
+                f"for relative path {relative!r}: {error}"
+            ) from error
+        now = time.perf_counter()
+        if index % 250 == 0 or index == total_images or now - last_progress >= 30:
+            elapsed = now - copy_started
+            rate = index / elapsed if elapsed > 0 else float("inf")
+            eta = (total_images - index) / rate if rate > 0 else float("inf")
+            print(
+                f"[Phase 1] copy images: {index}/{total_images} "
+                f"last={relative} elapsed={elapsed:.1f}s "
+                f"rate={rate:.1f} images/s eta={eta:.1f}s",
+                flush=True,
+            )
+            last_progress = now
+    copy_elapsed = time.perf_counter() - copy_started
+    average_rate = (
+        total_images / copy_elapsed if copy_elapsed > 0 else float("inf")
+    )
+    print(
+        f"[Phase 1] copy images: DONE total={total_images} "
+        f"elapsed={copy_elapsed:.1f}s avg={average_rate:.1f} images/s",
+        flush=True,
+    )
 
     allowed_manifests = {"train.csv", "val.csv", "class_to_idx.json"}
     copied_manifests = {
@@ -351,11 +410,31 @@ def stage_validation_data(
         )
     if (local_manifests / "test.csv").exists():
         raise ValueError("validation staging unexpectedly contains test.csv")
-    copied_images = {
-        path.relative_to(local_data_root).as_posix()
-        for path in local_data_root.rglob("*")
-        if path.is_file() and local_manifests not in path.parents
-    }
+    verify_started = time.perf_counter()
+    print(
+        f"[Phase 1] verify images: START expected={total_images}",
+        flush=True,
+    )
+    copied_images: set[str] = set()
+    last_verify_progress = verify_started
+    for path in local_data_root.rglob("*"):
+        if not path.is_file() or local_manifests in path.parents:
+            continue
+        copied_images.add(path.relative_to(local_data_root).as_posix())
+        now = time.perf_counter()
+        copied_count = len(copied_images)
+        if (
+            copied_count % 1000 == 0
+            or copied_count == total_images
+            or now - last_verify_progress >= 30
+        ):
+            print(
+                f"[Phase 1] verify images: {copied_count}/{total_images} "
+                f"last={path.relative_to(local_data_root).as_posix()} "
+                f"elapsed={now - verify_started:.1f}s",
+                flush=True,
+            )
+            last_verify_progress = now
     expected_images = set(relative_paths)
     if copied_images != expected_images:
         raise ValueError(
@@ -363,6 +442,16 @@ def stage_validation_data(
             f"missing={sorted(expected_images - copied_images)[:10]} "
             f"extra={sorted(copied_images - expected_images)[:10]}"
         )
+    print(
+        f"[Phase 1] verify images: DONE actual={len(copied_images)} "
+        f"elapsed={time.perf_counter() - verify_started:.1f}s",
+        flush=True,
+    )
+    print(
+        f"[Phase 1] DONE validation staging: copied={len(copied_images)} "
+        f"elapsed={time.perf_counter() - staging_started:.1f}s",
+        flush=True,
+    )
     return {
         "manifest_files_copied": 2,
         "class_mapping_files_copied": 1,
