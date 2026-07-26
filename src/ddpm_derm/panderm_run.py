@@ -54,12 +54,13 @@ CHECKPOINT_SOURCE_URL = (
     "https://github.com/SiyuanYan1/PanDerm"
 )
 
-# Upstream publishes no digest for any checkpoint, so the first download is
-# trust-on-first-use against the Drive file id in the pinned README. The
-# placeholder makes that unavoidable and loud: nothing downstream of
-# require_checkpoint_sha256 can run until a human reviews and pins the digest.
+# Upstream publishes no digest for any checkpoint, so this is the reviewed
+# trust-on-first-use digest from the Drive file id in the pinned README. Keep
+# the placeholder for fail-loud regression tests and future unreviewed weights.
 CHECKPOINT_SHA256_PLACEHOLDER = "REPLACE_AFTER_FIRST_DOWNLOAD"
-EXPECTED_CHECKPOINT_SHA256 = CHECKPOINT_SHA256_PLACEHOLDER
+EXPECTED_CHECKPOINT_SHA256 = (
+    "be1e0fb108b3bc58721cb5195f136c948160799438f222ac1ffd142230ac1ff1"
+)
 CHECKPOINT_SHA256_PROVENANCE = "trust_on_first_use_no_upstream_published_hash"
 
 PAPER_DOI = "https://doi.org/10.1038/s41591-025-03747-y"

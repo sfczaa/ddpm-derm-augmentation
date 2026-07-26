@@ -24,6 +24,9 @@ from ddpm_derm import panderm, panderm_run  # noqa: E402
 
 MOCK_DEPTH = 4
 MOCK_DIM = 16
+REVIEWED_CHECKPOINT_SHA256 = (
+    "be1e0fb108b3bc58721cb5195f136c948160799438f222ac1ffd142230ac1ff1"
+)
 
 
 class MockBlock(nn.Module):
@@ -655,15 +658,22 @@ class IdentityTests(unittest.TestCase):
 
 
 class ProvenanceGateTests(unittest.TestCase):
-    def test_placeholder_hash_blocks_validation(self):
+    def test_reviewed_checkpoint_hash_is_pinned(self):
         self.assertEqual(
+            panderm_run.EXPECTED_CHECKPOINT_SHA256,
+            REVIEWED_CHECKPOINT_SHA256,
+        )
+        self.assertNotEqual(
             panderm_run.EXPECTED_CHECKPOINT_SHA256,
             panderm_run.CHECKPOINT_SHA256_PLACEHOLDER,
         )
+
+    def test_placeholder_hash_blocks_validation(self):
         with self.assertRaisesRegex(ValueError, "not pinned"):
             panderm_run.require_provenance_clearance(
                 upstream_commit=panderm_run.UPSTREAM_COMMIT,
                 checkpoint_sha256="a" * 64,
+                expected_checkpoint_sha256=panderm_run.CHECKPOINT_SHA256_PLACEHOLDER,
             )
 
     def test_formal_and_test_access_are_unconditionally_prohibited(self):
@@ -804,7 +814,9 @@ class ProvenanceGateTests(unittest.TestCase):
             path = Path(tmp) / "weights.pth"
             path.write_bytes(b"not the real checkpoint")
             with self.assertRaises(ValueError) as caught:
-                panderm_run.require_checkpoint_sha256(path)
+                panderm_run.require_checkpoint_sha256(
+                    path, panderm_run.CHECKPOINT_SHA256_PLACEHOLDER
+                )
             message = str(caught.exception)
             self.assertIn("not pinned", message)
             self.assertIn("observed:", message)
