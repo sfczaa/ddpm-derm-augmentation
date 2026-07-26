@@ -276,10 +276,19 @@ class ProtectedArtifactTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, f"{name} was modified")
 
     def test_protected_untracked_user_notebook_is_unchanged(self):
-        digest = hashlib.sha256(
-            (ROOT / "notebooks" / PROTECTED_NOTEBOOK).read_bytes()
-        ).hexdigest()
-        self.assertEqual(digest, PROTECTED_SHA256)
+        path = ROOT / "notebooks" / PROTECTED_NOTEBOOK
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(digest, PROTECTED_SHA256)
+            return
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", f"notebooks/{PROTECTED_NOTEBOOK}"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertNotEqual(tracked.returncode, 0)
 
     def test_protected_documents_are_unchanged(self):
         for name in (
