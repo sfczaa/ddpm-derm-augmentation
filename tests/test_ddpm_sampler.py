@@ -6,6 +6,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -73,15 +74,19 @@ class DDPMSamplerTests(unittest.TestCase):
         )
 
     def test_ddpm_frame_is_train_only_and_seeded_limit_repeats(self):
-        train = manifests.load_split("train")
-        val = manifests.load_split("val")
-        test = manifests.load_split("test")
-        frame_a = manifests.load_ddpm_train_frame(limit=64, seed=7)
-        frame_b = manifests.load_ddpm_train_frame(limit=64, seed=7)
+        with mock.patch.object(
+            manifests,
+            "load_split",
+            wraps=manifests.load_split,
+        ) as load_split:
+            frame_a = manifests.load_ddpm_train_frame(limit=64, seed=7)
+            frame_b = manifests.load_ddpm_train_frame(limit=64, seed=7)
+
+        self.assertEqual(
+            load_split.call_args_list,
+            [mock.call("train"), mock.call("train")],
+        )
         self.assertEqual(frame_a["image_id"].tolist(), frame_b["image_id"].tolist())
-        self.assertTrue(set(frame_a["image_id"]) <= set(train["image_id"]))
-        self.assertFalse(set(frame_a["image_id"]) & set(val["image_id"]))
-        self.assertFalse(set(frame_a["image_id"]) & set(test["image_id"]))
 
     def test_checkpoint_strategy_guard_rejects_mismatch(self):
         self.assertEqual(
