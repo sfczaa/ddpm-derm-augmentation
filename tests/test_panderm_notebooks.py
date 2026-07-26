@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,22 +173,82 @@ class ValidationNotebookTests(unittest.TestCase):
             self.assertIn(required, code)
         self.assertNotIn("weights_only=False", code)
 
-    def test_validation_runs_targeted_full_and_smoke_checks(self):
+    def test_validation_runs_targeted_full_and_runner_smoke_checks(self):
         _, code = load(VALIDATION)
         for required in (
             "tests.test_panderm_blockers",
             "tests.test_panderm_base_c1_finetune",
             "tests.test_panderm_notebooks",
             '"unittest", "discover", "-s", "tests"',
-            "scripts/smoke_test.py",
+            "tests.test_panderm_blockers.PanDermRunnerMockSmokeTests",
+            '"runner_smoke_ok": "OK" in runner_smoke_output',
             '["--evaluation-scope", "full"]',
             '["--drop-path", "0.3"]',
             '["--no-amp"]',
         ):
             self.assertIn(required, code)
+        self.assertNotIn("scripts/smoke_test.py", code)
 
     def test_local_tests_package_prevents_colab_package_shadowing(self):
         self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
+
+    def test_ddpm_train_only_test_runs_without_real_test_manifest(self):
+        fieldnames = [
+            "image_path",
+            "label_idx",
+            "dx",
+            "lesion_id",
+            "image_id",
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary)
+            manifests_root = data_root / "manifests"
+            manifests_root.mkdir()
+            (manifests_root / "class_to_idx.json").write_text(
+                '{"akiec": 0}\n', encoding="utf-8"
+            )
+            for split in ("train", "val"):
+                with (manifests_root / f"{split}.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    if split == "train":
+                        for index in range(3):
+                            writer.writerow(
+                                {
+                                    "image_path": f"train_{index}.jpg",
+                                    "label_idx": 3,
+                                    "dx": "df",
+                                    "lesion_id": f"train_lesion_{index}",
+                                    "image_id": f"train_image_{index}",
+                                }
+                            )
+
+            env = os.environ.copy()
+            env["DDPM_DERM_DATA_DIR"] = str(data_root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "unittest",
+                    "-v",
+                    "tests.test_ddpm_sampler.DDPMSamplerTests."
+                    "test_ddpm_frame_is_train_only_and_seeded_limit_repeats",
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertFalse((manifests_root / "test.csv").exists())
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr,
+            )
 
     def test_failure_and_success_records_keep_prohibition_flags(self):
         _, code = load(VALIDATION)
