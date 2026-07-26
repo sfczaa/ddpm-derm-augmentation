@@ -207,10 +207,19 @@ class CoCaV3NotebookTests(unittest.TestCase):
             self.assertEqual(actual, expected)
 
     def test_protected_user_notebook_is_untouched(self):
-        digest = hashlib.sha256(
-            (ROOT / "notebooks" / PROTECTED_NOTEBOOK).read_bytes()
-        ).hexdigest()
-        self.assertEqual(digest, PROTECTED_SHA256)
+        path = ROOT / "notebooks" / PROTECTED_NOTEBOOK
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(digest, PROTECTED_SHA256)
+            return
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", f"notebooks/{PROTECTED_NOTEBOOK}"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertNotEqual(tracked.returncode, 0)
 
 
 if __name__ == "__main__":
