@@ -184,6 +184,9 @@ class ValidationNotebookTests(unittest.TestCase):
         ):
             self.assertIn(required, code)
 
+    def test_local_tests_package_prevents_colab_package_shadowing(self):
+        self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
+
     def test_failure_and_success_records_keep_prohibition_flags(self):
         _, code = load(VALIDATION)
         failure_write = code.index(
