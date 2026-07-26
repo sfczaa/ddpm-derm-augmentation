@@ -25,7 +25,7 @@ from ddpm_derm import panderm, panderm_run  # noqa: E402
 MOCK_DEPTH = 4
 MOCK_DIM = 16
 REVIEWED_CHECKPOINT_SHA256 = (
-    "be1e0fb108b3bc58721cb5195f136c948160799438f222ac1ffd142230ac1ff1"
+    "be1e0fb108b3bc58721cb5195f136c948160799438f222acf1fd142230ac1ff1"
 )
 
 

@@ -59,7 +59,7 @@ CHECKPOINT_SOURCE_URL = (
 # the placeholder for fail-loud regression tests and future unreviewed weights.
 CHECKPOINT_SHA256_PLACEHOLDER = "REPLACE_AFTER_FIRST_DOWNLOAD"
 EXPECTED_CHECKPOINT_SHA256 = (
-    "be1e0fb108b3bc58721cb5195f136c948160799438f222ac1ffd142230ac1ff1"
+    "be1e0fb108b3bc58721cb5195f136c948160799438f222acf1fd142230ac1ff1"
 )
 CHECKPOINT_SHA256_PROVENANCE = "trust_on_first_use_no_upstream_published_hash"
 
