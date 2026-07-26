@@ -223,6 +223,72 @@ class ValidationDataStagingTests(unittest.TestCase):
                 {"raw/mixed/train_a.jpg", "raw/mixed/val_a.jpg"},
             )
 
+    def test_staging_reports_live_progress_and_time_based_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = self._fixture(root)
+            local = root / "local_data"
+            clock = [0.0]
+            real_copy2 = panderm_run.shutil.copy2
+            real_canonical_path = panderm_run._canonical_manifest_image_path
+
+            def slow_canonical_path(raw):
+                result = real_canonical_path(raw)
+                clock[0] += 31.0
+                return result
+
+            def slow_copy(source, destination):
+                result = real_copy2(source, destination)
+                clock[0] += 31.0
+                return result
+
+            with (
+                mock.patch.object(
+                    panderm_run.shutil, "copy2", side_effect=slow_copy
+                ),
+                mock.patch.object(
+                    panderm_run.time,
+                    "perf_counter",
+                    side_effect=lambda: clock[0],
+                ),
+                mock.patch.object(
+                    panderm_run,
+                    "_canonical_manifest_image_path",
+                    side_effect=slow_canonical_path,
+                ),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                report = panderm_run.stage_validation_data(shared, local)
+
+            self.assertEqual(report["images_copied"], 2)
+            messages = "\n".join(
+                str(call.args[0]) for call in print_mock.call_args_list
+            )
+            for required in (
+                "[Phase 1] START validation staging:",
+                "[Phase 1] scan train: START",
+                "[Phase 1] scan train: rows=1",
+                "[Phase 1] scan train: DONE rows=1",
+                "[Phase 1] scan val: START",
+                "[Phase 1] scan val: rows=1",
+                "[Phase 1] scan val: DONE rows=1",
+                "[Phase 1] copy images: START total=2",
+                "[Phase 1] copy images: 1/2",
+                "[Phase 1] copy images: 2/2",
+                "[Phase 1] copy images: DONE total=2",
+                "[Phase 1] verify images: START expected=2",
+                "[Phase 1] verify images: 2/2",
+                "[Phase 1] verify images: DONE actual=2",
+                "[Phase 1] DONE validation staging: copied=2",
+            ):
+                self.assertIn(required, messages)
+            self.assertTrue(
+                all(
+                    call.kwargs.get("flush") is True
+                    for call in print_mock.call_args_list
+                )
+            )
+
     def test_staging_rejects_unsafe_or_ambiguous_manifest_paths(self):
         cases = {
             "absolute": ["C:/outside.jpg"],
