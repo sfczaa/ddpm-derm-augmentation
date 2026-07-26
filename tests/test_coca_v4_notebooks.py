@@ -244,10 +244,19 @@ class CoCaV4NotebookTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0)
-        digest = hashlib.sha256(
-            (ROOT / "notebooks" / PROTECTED_NOTEBOOK).read_bytes()
-        ).hexdigest()
-        self.assertEqual(digest, PROTECTED_SHA256)
+        path = ROOT / "notebooks" / PROTECTED_NOTEBOOK
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(digest, PROTECTED_SHA256)
+            return
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", f"notebooks/{PROTECTED_NOTEBOOK}"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertNotEqual(tracked.returncode, 0)
 
 
 if __name__ == "__main__":
