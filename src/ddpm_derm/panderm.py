@@ -55,6 +55,33 @@ TRAIN_RE_COUNT = 1
 
 PRETRAINED_STATE_PREFIX = "encoder."
 DROPPED_STATE_PREFIXES = ("decoder.", "teacher.")
+# The only top-level components a wrapped pretraining checkpoint may contain:
+# the encoder we load, plus the two companions we knowingly ignore. Anything
+# else (optimizer state, metadata, an unrecognised tower) is refused rather than
+# quietly skipped, so "it had an encoder." is never sufficient on its own.
+WRAPPED_ALLOWED_PREFIXES = (PRETRAINED_STATE_PREFIX,) + DROPPED_STATE_PREFIXES
+
+# Supported pretrained checkpoint layouts. They are named (rather than implied)
+# so "which layout did we actually load" is printable and testable.
+LAYOUT_ENCODER_WRAPPED = "encoder_wrapped_v1"
+LAYOUT_DIRECT_BACKBONE = "direct_backbone_v1"
+
+# The published PanDerm-Base weights are a plain backbone state dict: no wrapper,
+# no ``encoder.`` prefix and no classifier head. Only these keys may appear; a
+# ``head.`` entry is tolerated so it can be dropped, never loaded.
+DIRECT_ALLOWED_EXACT = frozenset({"cls_token", "pos_embed"})
+DIRECT_ALLOWED_PREFIXES = ("patch_embed.", "blocks.", "norm.", "head.")
+# Sentinels: enough of the ViT to prove this really is a PanDerm backbone, not
+# some other OrderedDict that merely happens to hold tensors.
+DIRECT_SENTINEL_KEYS = (
+    "cls_token",
+    "pos_embed",
+    "patch_embed.proj.weight",
+    "patch_embed.proj.bias",
+    "norm.weight",
+    "norm.bias",
+)
+DIRECT_SENTINEL_PREFIX = "blocks.0."
 
 
 # --- upstream model loading --------------------------------------------------
@@ -63,6 +90,39 @@ UPSTREAM_MODULE_NAME = "panderm_upstream_modeling_finetune"
 
 def upstream_module_path(upstream_dir: str | Path) -> Path:
     return Path(upstream_dir) / panderm_run.UPSTREAM_MODEL_MODULE
+
+
+def _upstream_factory_from_module(
+    module: Any, module_path: Path
+) -> Callable[..., nn.Module]:
+    """Return the pinned factory from ``module``, or refuse the module.
+
+    Used both for a freshly executed module and for one already in
+    ``sys.modules``, so a reused module is held to exactly the same standard as a
+    newly imported one.
+    """
+    origin = getattr(module, "__file__", None)
+    if origin is None or Path(origin).resolve() != Path(module_path).resolve():
+        raise ImportError(
+            f"module '{UPSTREAM_MODULE_NAME}' is already loaded from {origin!r}, "
+            f"not from the pinned upstream checkout {module_path}; refusing to "
+            "reuse it"
+        )
+    factory = getattr(module, panderm_run.UPSTREAM_MODEL_FACTORY, None)
+    if factory is None:
+        raise ImportError(
+            f"upstream module has no {panderm_run.UPSTREAM_MODEL_FACTORY}: "
+            f"{module_path}"
+        )
+    if (
+        not callable(factory)
+        or getattr(factory, "__module__", None) != UPSTREAM_MODULE_NAME
+    ):
+        raise ImportError(
+            f"{panderm_run.UPSTREAM_MODEL_FACTORY} is not defined by the pinned "
+            f"upstream module {module_path}: {factory!r}"
+        )
+    return factory
 
 
 def load_upstream_model_factory(upstream_dir: str | Path) -> Callable[..., nn.Module]:
@@ -75,6 +135,13 @@ def load_upstream_model_factory(upstream_dir: str | Path) -> Callable[..., nn.Mo
     early is only safe if it is also transactional: any failure restores
     ``sys.modules`` exactly as it was, so a half-initialised module can never be
     picked up by a later import.
+
+    The import is also idempotent. Re-executing the module would re-run every
+    ``@register_model`` over names timm has already registered, which overwrites
+    its registry and warns once per factory, so an already-loaded module is
+    reused instead -- but only after proving it is this exact pinned file with a
+    usable factory. A same-named module from anywhere else is refused loudly
+    rather than silently reused.
     """
     module_path = upstream_module_path(upstream_dir)
     if not module_path.is_file():
@@ -82,60 +149,214 @@ def load_upstream_model_factory(upstream_dir: str | Path) -> Callable[..., nn.Mo
             "pinned PanDerm upstream checkout is missing "
             f"{panderm_run.UPSTREAM_MODEL_MODULE}: {module_path}"
         )
+    if UPSTREAM_MODULE_NAME in sys.modules:
+        return _upstream_factory_from_module(
+            sys.modules[UPSTREAM_MODULE_NAME], module_path
+        )
     spec = importlib.util.spec_from_file_location(UPSTREAM_MODULE_NAME, module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load upstream module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    had_previous = spec.name in sys.modules
-    previous = sys.modules.get(spec.name)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
-        factory = getattr(module, panderm_run.UPSTREAM_MODEL_FACTORY, None)
-        if factory is None:
-            raise ImportError(
-                f"upstream module has no {panderm_run.UPSTREAM_MODEL_FACTORY}: "
-                f"{module_path}"
-            )
-        if not callable(factory) or getattr(factory, "__module__", None) != spec.name:
-            raise ImportError(
-                f"{panderm_run.UPSTREAM_MODEL_FACTORY} is not defined by the pinned "
-                f"upstream module {module_path}: {factory!r}"
-            )
+        factory = _upstream_factory_from_module(module, module_path)
     except BaseException:
-        if had_previous:
-            sys.modules[spec.name] = previous
-        else:
-            sys.modules.pop(spec.name, None)
+        # The name was absent above, so removing it restores the exact prior state.
+        sys.modules.pop(spec.name, None)
         raise
     return factory
 
 
-def remap_pretrained_state_dict(raw_state: Mapping[str, Any]) -> dict[str, Any]:
-    """Apply upstream's documented pretrain->finetune key mapping.
+def _is_direct_backbone_key(key: Any) -> bool:
+    return isinstance(key, str) and (
+        key in DIRECT_ALLOWED_EXACT or key.startswith(DIRECT_ALLOWED_PREFIXES)
+    )
 
-    Keep ``encoder.*`` and strip the prefix, drop ``decoder.*``/``teacher.*``,
-    rename ``norm.`` to ``fc_norm.``, and drop any pretrained classifier head so
-    a fresh 7-class head is always trained from scratch.
+
+def detect_checkpoint_layout(raw_state: Mapping[str, Any]) -> str:
+    """Name the checkpoint layout, or refuse it.
+
+    Being a mapping of tensors is *not* enough to be accepted as PanDerm weights:
+    a layout this function cannot name is always an error, never a best-effort
+    partial load.
     """
-    encoder_keys = [key for key in raw_state if key.startswith(PRETRAINED_STATE_PREFIX)]
-    if not encoder_keys:
+    if not isinstance(raw_state, Mapping) or not raw_state:
         raise ValueError(
-            "PanDerm checkpoint has no 'encoder.' parameters; refusing an "
-            "unrecognised checkpoint layout"
+            "PanDerm checkpoint payload must be a non-empty mapping, got "
+            f"{type(raw_state)!r}"
         )
-    remapped: dict[str, Any] = {}
-    for key in encoder_keys:
-        remapped[key[len(PRETRAINED_STATE_PREFIX):]] = raw_state[key]
-    for key in list(remapped):
-        if key.startswith(DROPPED_STATE_PREFIXES):
-            remapped.pop(key)
-    for key in list(remapped):
+    encoder_keys = [
+        key
+        for key in raw_state
+        if isinstance(key, str) and key.startswith(PRETRAINED_STATE_PREFIX)
+    ]
+    direct_keys = [key for key in raw_state if _is_direct_backbone_key(key)]
+    if encoder_keys and direct_keys:
+        raise ValueError(
+            "PanDerm checkpoint mixes the wrapped 'encoder.' layout with a direct "
+            "backbone layout; refusing an ambiguous checkpoint: "
+            f"encoder={sorted(encoder_keys)[:3]} direct={sorted(direct_keys)[:3]}"
+        )
+    if encoder_keys:
+        unknown = sorted(
+            str(key)
+            for key in raw_state
+            if not (isinstance(key, str) and key.startswith(WRAPPED_ALLOWED_PREFIXES))
+        )
+        if unknown:
+            raise ValueError(
+                "wrapped PanDerm checkpoint has top-level keys outside the "
+                "registered pretraining components "
+                f"{list(WRAPPED_ALLOWED_PREFIXES)}: {unknown[:10]}"
+            )
+        return LAYOUT_ENCODER_WRAPPED
+    if direct_keys:
+        unknown = sorted(
+            str(key) for key in raw_state if not _is_direct_backbone_key(key)
+        )
+        if unknown:
+            raise ValueError(
+                "direct PanDerm backbone checkpoint has keys outside the backbone "
+                f"allowlist: {unknown[:10]}"
+            )
+        missing = [key for key in DIRECT_SENTINEL_KEYS if key not in raw_state]
+        if not any(
+            key.startswith(DIRECT_SENTINEL_PREFIX) for key in raw_state
+        ):
+            missing.append(DIRECT_SENTINEL_PREFIX + "*")
+        if missing:
+            raise ValueError(
+                "direct PanDerm backbone checkpoint is missing required backbone "
+                f"sentinels: {missing}"
+            )
+        return LAYOUT_DIRECT_BACKBONE
+    raise ValueError(
+        "unrecognised PanDerm checkpoint layout: no 'encoder.' parameters and no "
+        f"direct backbone keys; first keys: {sorted(str(key) for key in raw_state)[:10]}"
+    )
+
+
+def _require_tensor_values(state: Mapping[str, Any], layout: str) -> None:
+    non_tensor = sorted(
+        str(key)
+        for key, value in state.items()
+        if not isinstance(value, torch.Tensor)
+    )
+    if non_tensor:
+        raise ValueError(
+            f"{layout} PanDerm checkpoint has non-tensor values: {non_tensor[:10]}"
+        )
+
+
+def remap_pretrained_state_dict(
+    raw_state: Mapping[str, Any], *, layout: str | None = None
+) -> dict[str, Any]:
+    """Map a published checkpoint onto the fine-tuning model's parameter names.
+
+    Two layouts are supported and they converge on the same contract: ``norm.``
+    becomes ``fc_norm.`` and any pretrained classifier head is dropped so the
+    7-class head is always trained from scratch.
+
+    ``encoder_wrapped_v1`` keeps ``encoder.*`` and strips the prefix, ignoring the
+    ``decoder.*``/``teacher.*`` companions. ``direct_backbone_v1`` is the layout
+    the official ``panderm_bb_data6_checkpoint-499.pth`` actually ships: a plain
+    backbone state dict with no wrapper and no head.
+    """
+    layout = detect_checkpoint_layout(raw_state) if layout is None else layout
+    if layout == LAYOUT_ENCODER_WRAPPED:
+        selected = {
+            key[len(PRETRAINED_STATE_PREFIX):]: value
+            for key, value in raw_state.items()
+            if isinstance(key, str) and key.startswith(PRETRAINED_STATE_PREFIX)
+        }
+        for key in list(selected):
+            if key.startswith(DROPPED_STATE_PREFIXES):
+                selected.pop(key)
+    elif layout == LAYOUT_DIRECT_BACKBONE:
+        selected = dict(raw_state)
+    else:
+        raise ValueError(f"unsupported PanDerm checkpoint layout: {layout!r}")
+
+    _require_tensor_values(selected, layout)
+    for key in list(selected):
         if key.startswith("norm."):
-            remapped["fc_norm." + key[len("norm."):]] = remapped.pop(key)
+            selected["fc_norm." + key[len("norm."):]] = selected.pop(key)
     for key in ("head.weight", "head.bias"):
-        remapped.pop(key, None)
-    return remapped
+        selected.pop(key, None)
+    if not selected:
+        raise ValueError(
+            f"{layout} PanDerm checkpoint produced no backbone tensors"
+        )
+    return selected
+
+
+def plan_pretrained_load(
+    model: nn.Module, remapped: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate a remapped payload against a *fresh* model, mutating nothing.
+
+    This is deliberately a read-only pass: it never calls ``load_state_dict`` and
+    never writes a parameter or buffer, so a checkpoint that fails any check
+    leaves the model exactly as the factory built it. Doing the checks *after* a
+    ``strict=False`` load would already have copied the acceptable tensors in
+    before raising, leaving a half-loaded model behind.
+
+    Shapes and dtypes are compared exactly. ``load_state_dict`` silently casts a
+    mismatched dtype via ``copy_``, which would change the numerics of the very
+    checkpoint we are supposed to be reproducing, so a float64 tensor is refused
+    rather than quietly narrowed to the model's float32.
+    """
+    reference = model.state_dict()
+    expected = set(reference)
+    head_keys = {name for name in expected if name.startswith("head.")}
+    if not head_keys:
+        raise ValueError("PanDerm model has no classifier head to replace")
+
+    leaked = sorted(key for key in head_keys if key in remapped)
+    if leaked:
+        raise ValueError(
+            f"pretrained head leaked into the fresh classifier head: {leaked}"
+        )
+
+    unexpected = sorted(set(remapped) - expected)
+    if unexpected:
+        raise ValueError(
+            f"PanDerm checkpoint has keys the model cannot accept: {unexpected}"
+        )
+
+    missing = sorted(expected - head_keys - set(remapped))
+    if missing:
+        raise ValueError(
+            f"PanDerm checkpoint is missing backbone parameters: {missing}"
+        )
+
+    shape_mismatch: list[str] = []
+    dtype_mismatch: list[str] = []
+    for key in sorted(remapped):
+        target = reference[key]
+        value = remapped[key]
+        if tuple(value.shape) != tuple(target.shape):
+            shape_mismatch.append(
+                f"{key}: checkpoint {tuple(value.shape)} != model {tuple(target.shape)}"
+            )
+        elif value.dtype != target.dtype:
+            dtype_mismatch.append(
+                f"{key}: checkpoint {value.dtype} != model {target.dtype}"
+            )
+    if shape_mismatch:
+        raise ValueError(
+            f"PanDerm checkpoint tensor shape mismatch: {shape_mismatch[:10]}"
+        )
+    if dtype_mismatch:
+        raise ValueError(
+            f"PanDerm checkpoint tensor dtype mismatch: {dtype_mismatch[:10]}"
+        )
+    return {
+        "head_keys": sorted(head_keys),
+        "expected_non_head_keys": len(expected - head_keys),
+        "validated_tensors": len(remapped),
+    }
 
 
 def load_pretrained_state(path: str | Path) -> dict[str, Any]:
@@ -196,23 +417,22 @@ def build_panderm_classifier(
                 "state_dict; refusing to fine-tune randomly initialised weights"
             )
         state_dict = load_pretrained_state(checkpoint_path)
-    remapped = remap_pretrained_state_dict(state_dict)
+    state_layout = detect_checkpoint_layout(state_dict)
+    remapped = remap_pretrained_state_dict(state_dict, layout=state_layout)
 
-    head_keys = {name for name in model.state_dict() if name.startswith("head.")}
-    if not head_keys:
-        raise ValueError("PanDerm model has no classifier head to replace")
-    if any(key in remapped for key in head_keys):
-        raise ValueError("pretrained head leaked into the fresh 7-class head")
+    # Stage 1: read-only validation. Nothing below this point has touched the
+    # model, so any rejection leaves it exactly as the factory built it.
+    load_plan = plan_pretrained_load(model, remapped)
+    head_keys = set(load_plan["head_keys"])
+
+    # Stage 2: the payload is fully validated, so this is the single mutation.
     incompatible = model.load_state_dict(remapped, strict=False)
-    unexpected = sorted(incompatible.unexpected_keys)
-    if unexpected:
+    residual_unexpected = sorted(incompatible.unexpected_keys)
+    residual_missing = sorted(set(incompatible.missing_keys) - head_keys)
+    if residual_unexpected or residual_missing:
         raise ValueError(
-            f"PanDerm checkpoint has keys the model cannot accept: {unexpected}"
-        )
-    missing = sorted(set(incompatible.missing_keys) - head_keys)
-    if missing:
-        raise ValueError(
-            f"PanDerm checkpoint is missing backbone parameters: {missing}"
+            "PanDerm load contract diverged from validation: "
+            f"unexpected={residual_unexpected} missing={residual_missing}"
         )
 
     head = getattr(model, "head", None)
@@ -230,6 +450,7 @@ def build_panderm_classifier(
     model.freeze_mode = "full_finetune"
     model.input_resolution = (INPUT_RESOLUTION, INPUT_RESOLUTION)
     model.panderm_runtime_drop_path = float(drop_path)
+    model.pretrained_state_layout = state_layout
     model.loaded_backbone_keys = sorted(remapped)
     return model
 
