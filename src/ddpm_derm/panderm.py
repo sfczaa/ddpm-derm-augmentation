@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -57,31 +58,56 @@ DROPPED_STATE_PREFIXES = ("decoder.", "teacher.")
 
 
 # --- upstream model loading --------------------------------------------------
+UPSTREAM_MODULE_NAME = "panderm_upstream_modeling_finetune"
+
+
 def upstream_module_path(upstream_dir: str | Path) -> Path:
     return Path(upstream_dir) / panderm_run.UPSTREAM_MODEL_MODULE
 
 
 def load_upstream_model_factory(upstream_dir: str | Path) -> Callable[..., nn.Module]:
-    """Import ``panderm_base_patch16_224_finetune`` from the pinned checkout."""
+    """Import ``panderm_base_patch16_224_finetune`` from the pinned checkout.
+
+    ``modeling_finetune`` decorates its factories with ``timm``'s
+    ``register_model``, which resolves ``sys.modules[fn.__module__]`` *while the
+    module is still executing*, so the module must be published under
+    ``spec.name`` before ``exec_module`` rather than after it. Publishing it
+    early is only safe if it is also transactional: any failure restores
+    ``sys.modules`` exactly as it was, so a half-initialised module can never be
+    picked up by a later import.
+    """
     module_path = upstream_module_path(upstream_dir)
     if not module_path.is_file():
         raise FileNotFoundError(
             "pinned PanDerm upstream checkout is missing "
             f"{panderm_run.UPSTREAM_MODEL_MODULE}: {module_path}"
         )
-    spec = importlib.util.spec_from_file_location(
-        "panderm_upstream_modeling_finetune", module_path
-    )
+    spec = importlib.util.spec_from_file_location(UPSTREAM_MODULE_NAME, module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load upstream module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    factory = getattr(module, panderm_run.UPSTREAM_MODEL_FACTORY, None)
-    if factory is None:
-        raise ImportError(
-            f"upstream module has no {panderm_run.UPSTREAM_MODEL_FACTORY}: "
-            f"{module_path}"
-        )
+    had_previous = spec.name in sys.modules
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        factory = getattr(module, panderm_run.UPSTREAM_MODEL_FACTORY, None)
+        if factory is None:
+            raise ImportError(
+                f"upstream module has no {panderm_run.UPSTREAM_MODEL_FACTORY}: "
+                f"{module_path}"
+            )
+        if not callable(factory) or getattr(factory, "__module__", None) != spec.name:
+            raise ImportError(
+                f"{panderm_run.UPSTREAM_MODEL_FACTORY} is not defined by the pinned "
+                f"upstream module {module_path}: {factory!r}"
+            )
+    except BaseException:
+        if had_previous:
+            sys.modules[spec.name] = previous
+        else:
+            sys.modules.pop(spec.name, None)
+        raise
     return factory
 
 
