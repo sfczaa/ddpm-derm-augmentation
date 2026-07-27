@@ -106,6 +106,100 @@ def build_mock_model(num_classes=7):
     )
 
 
+class SharedRootSentinelIdentityTests(unittest.TestCase):
+    UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
+    ALIAS = "ddpm-derm-panderm-runs"
+
+    def sentinel(self, stored_path, **overrides):
+        value = {
+            "shared_root_uuid": self.UUID,
+            "shortcut_alias": self.ALIAS,
+            "resolved_path": str(stored_path),
+            "run_version": panderm_run.RUN_VERSION,
+        }
+        value.update(overrides)
+        return value
+
+    def test_same_physical_root_with_different_strings_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stored_root = Path(temporary) / "shared"
+            stored_root.mkdir()
+            current_root = stored_root / ".." / stored_root.name
+            self.assertNotEqual(str(stored_root), str(current_root))
+            self.assertTrue(stored_root.samefile(current_root))
+            sentinel = self.sentinel(stored_root)
+            before = copy.deepcopy(sentinel)
+
+            shared_root_uuid = (
+                panderm_run.require_shared_root_sentinel_identity(
+                    sentinel,
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=current_root,
+                )
+            )
+
+            self.assertEqual(shared_root_uuid, self.UUID)
+            self.assertEqual(sentinel, before)
+
+    def test_different_physical_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stored_root = Path(temporary) / "stored"
+            current_root = Path(temporary) / "current"
+            stored_root.mkdir()
+            current_root.mkdir()
+            with self.assertRaisesRegex(
+                ValueError, "different physical directory"
+            ):
+                panderm_run.require_shared_root_sentinel_identity(
+                    self.sentinel(stored_root),
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=current_root,
+                )
+
+    def test_missing_stored_root_fails_loud(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            current_root = Path(temporary) / "current"
+            current_root.mkdir()
+            with self.assertRaisesRegex(
+                ValueError, "physical identity could not be verified"
+            ):
+                panderm_run.require_shared_root_sentinel_identity(
+                    self.sentinel(Path(temporary) / "missing"),
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=current_root,
+                )
+
+    def test_wrong_shortcut_alias_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "shortcut alias mismatch"):
+                panderm_run.require_shared_root_sentinel_identity(
+                    self.sentinel(root, shortcut_alias="private-copy"),
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=root,
+                )
+
+    def test_wrong_run_version_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "run version mismatch"):
+                panderm_run.require_shared_root_sentinel_identity(
+                    self.sentinel(root, run_version="other-version"),
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=root,
+                )
+
+    def test_invalid_uuid_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "UUID is invalid"):
+                panderm_run.require_shared_root_sentinel_identity(
+                    self.sentinel(root, shared_root_uuid="not-a-uuid"),
+                    shortcut_alias=self.ALIAS,
+                    resolved_root=root,
+                )
+
+
 class LoaderAndArchitectureTests(unittest.TestCase):
     def test_injected_mock_loader_builds_without_network_or_weights(self):
         model = build_mock_model()

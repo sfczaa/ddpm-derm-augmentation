@@ -840,6 +840,58 @@ def require_completed_artifact_identities(
             raise ValueError(f"{label} identity does not equal result identity")
 
 
+def require_shared_root_sentinel_identity(
+    sentinel: Mapping[str, Any],
+    *,
+    shortcut_alias: str,
+    resolved_root: str | Path,
+    run_version: str = RUN_VERSION,
+) -> str:
+    """Require one shared root even when Drive shortcut strings differ."""
+    if not isinstance(sentinel, Mapping):
+        raise ValueError("shared-root sentinel must be a mapping")
+    required = ("shared_root_uuid", "shortcut_alias", "resolved_path", "run_version")
+    missing = [key for key in required if key not in sentinel]
+    if missing:
+        raise ValueError(f"shared-root sentinel is missing fields: {missing}")
+    if sentinel["shortcut_alias"] != shortcut_alias:
+        raise ValueError(
+            "shared-root sentinel shortcut alias mismatch: "
+            f"saved={sentinel['shortcut_alias']!r} expected={shortcut_alias!r}"
+        )
+    if sentinel["run_version"] != run_version:
+        raise ValueError(
+            "shared-root sentinel run version mismatch: "
+            f"saved={sentinel['run_version']!r} expected={run_version!r}"
+        )
+    shared_root_uuid = sentinel["shared_root_uuid"]
+    if not isinstance(shared_root_uuid, str):
+        raise ValueError("shared-root sentinel UUID must be a string")
+    try:
+        parsed_uuid = uuid.UUID(shared_root_uuid)
+    except ValueError as exc:
+        raise ValueError("shared-root sentinel UUID is invalid") from exc
+    if str(parsed_uuid) != shared_root_uuid:
+        raise ValueError("shared-root sentinel UUID is not canonical")
+    stored_path = sentinel["resolved_path"]
+    if not isinstance(stored_path, str) or not stored_path:
+        raise ValueError("shared-root sentinel resolved path must be a string")
+    current_root = require_existing_shared_root(resolved_root)
+    try:
+        same_root = Path(stored_path).samefile(current_root)
+    except OSError as exc:
+        raise ValueError(
+            "shared-root sentinel physical identity could not be verified: "
+            f"saved={stored_path!r} current={str(current_root)!r}"
+        ) from exc
+    if not same_root:
+        raise ValueError(
+            "shared-root sentinel points to a different physical directory: "
+            f"saved={stored_path!r} current={str(current_root)!r}"
+        )
+    return shared_root_uuid
+
+
 def probe_shared_drive(root: str | Path) -> dict[str, str]:
     """Verify read/write/delete, child-process and atomic replace on the root."""
     root = require_existing_shared_root(root)
