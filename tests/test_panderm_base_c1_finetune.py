@@ -7,9 +7,12 @@ downloaded and no network access is required.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import sys
 import tempfile
+import textwrap
+import types
 import unittest
 from pathlib import Path
 
@@ -164,6 +167,198 @@ class LoaderAndArchitectureTests(unittest.TestCase):
     def test_missing_upstream_checkout_is_reported_clearly(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(FileNotFoundError, "modeling_finetune"):
+                panderm.load_upstream_model_factory(tmp)
+
+
+# --- real upstream dynamic-import contract -----------------------------------
+# Everything above injects ``mock_factory``, so none of it exercises the actual
+# ``importlib`` path used on Colab. The fixture below is the smallest module that
+# reproduces the *real* upstream contract: upstream ``modeling_finetune`` wraps
+# every factory in timm's ``register_model``, which resolves the defining module
+# out of ``sys.modules`` at decoration time, i.e. while the module is still being
+# executed by ``exec_module``.
+TIMM_LIKE_REGISTRY = '''
+    import sys
+
+    IMPORT_TIME_OBSERVATIONS = []
+
+
+    def register_model(fn):
+        """Same import-time lookup as timm 0.9.16 ``models/_registry.py``.
+
+        The real decorator's first statement is ``mod = sys.modules[fn.__module__]``.
+        A loader that never publishes the module under ``spec.name`` therefore
+        raises ``KeyError`` here, long before the factory is ever called.
+        """
+        module = sys.modules[fn.__module__]
+        IMPORT_TIME_OBSERVATIONS.append(
+            {
+                "factory": fn.__name__,
+                "module_name": fn.__module__,
+                "module_file": module.__file__,
+            }
+        )
+        return fn
+    '''
+
+FACTORY_NAME = panderm_run.UPSTREAM_MODEL_FACTORY
+
+# Spelled out rather than read from ``panderm`` so these tests keep failing with
+# the *observed production* error -- ``KeyError: 'panderm_upstream_modeling_finetune'``
+# -- instead of quietly reshaping themselves around whatever the loader happens
+# to call the module. The two are pinned to each other below.
+UPSTREAM_MODULE_NAME = "panderm_upstream_modeling_finetune"
+
+# Imports cleanly and exposes the pinned factory.
+WORKING_UPSTREAM_BODY = f'''
+    @register_model
+    def {FACTORY_NAME}(pretrained=False, **kwargs):
+        return "built", pretrained, tuple(sorted(kwargs))
+    '''
+
+# Registers one factory (so the module really was published under spec.name),
+# binds a global, then dies part-way through: a half-initialised module.
+EXPLODING_UPSTREAM_BODY = f'''
+    @register_model
+    def {FACTORY_NAME}(pretrained=False, **kwargs):
+        return "built", pretrained, tuple(sorted(kwargs))
+
+    HALF_INITIALISED = True
+    raise RuntimeError("upstream import exploded")
+    '''
+
+# Executes fine but defines a different factory, as an upstream revision that
+# dropped or renamed the pinned entry point would.
+WRONG_FACTORY_UPSTREAM_BODY = '''
+    @register_model
+    def panderm_large_patch16_224(pretrained=False, **kwargs):
+        return "wrong-factory"
+    '''
+
+
+def write_upstream_checkout(root, body):
+    """Lay out a temporary ``classification/models/modeling_finetune.py``."""
+    module_path = panderm.upstream_module_path(root)
+    module_path.parent.mkdir(parents=True, exist_ok=True)
+    module_path.write_text(
+        textwrap.dedent(TIMM_LIKE_REGISTRY) + textwrap.dedent(body),
+        encoding="utf-8",
+    )
+    return module_path
+
+
+class UpstreamDynamicImportTests(unittest.TestCase):
+    """Pin the timm ``register_model`` import-time ``sys.modules`` contract.
+
+    Why this matters rather than "a callable comes back": on Colab the loader
+    imports the pinned upstream checkout by path, and upstream decorates its
+    factories with timm's ``register_model``. Because that decorator reads
+    ``sys.modules[fn.__module__]`` *during* module execution, a loader that calls
+    ``exec_module`` on a module it never registered under ``spec.name`` fails with
+    ``KeyError: 'panderm_upstream_modeling_finetune'`` before any model is built.
+    No injected-mock test can see that, so these tests own the contract.
+
+    Registering the module early is only safe if it is transactional, so the
+    rollback behaviour is pinned here too: a failed import must never leave a
+    half-initialised module for a later import to pick up.
+    """
+
+    def setUp(self):
+        self.module_name = UPSTREAM_MODULE_NAME
+        # Snapshot/restore so a successful load (which legitimately keeps the
+        # module in sys.modules, as timm's registry expects) cannot leak into
+        # any other test in the suite.
+        self.had_module = self.module_name in sys.modules
+        self.previous_module = sys.modules.get(self.module_name)
+        self.addCleanup(self._restore_sys_modules)
+        sys.modules.pop(self.module_name, None)
+
+    def _restore_sys_modules(self):
+        if self.had_module:
+            sys.modules[self.module_name] = self.previous_module
+        else:
+            sys.modules.pop(self.module_name, None)
+
+    def test_loader_publishes_the_name_from_the_observed_production_failure(self):
+        self.assertEqual(panderm.UPSTREAM_MODULE_NAME, UPSTREAM_MODULE_NAME)
+
+    def test_fixture_fails_the_way_an_unregistered_dynamic_import_does(self):
+        """The fixture is not vacuous: the pre-fix loader body still breaks on it.
+
+        This is the exact ``module_from_spec`` + ``exec_module`` pair the loader
+        used before the fix, run against the same file the loader is given below.
+        If this ever stops raising, the fixture has drifted away from the real
+        timm contract and the tests after it prove nothing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            module_path = write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            spec = importlib.util.spec_from_file_location(
+                self.module_name, module_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            with self.assertRaises(KeyError) as caught:
+                spec.loader.exec_module(module)
+            self.assertEqual(caught.exception.args[0], self.module_name)
+            self.assertNotIn(self.module_name, sys.modules)
+
+    def test_factory_is_imported_from_the_module_registered_before_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module_path = write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            factory = panderm.load_upstream_model_factory(tmp)
+
+            self.assertTrue(callable(factory))
+            self.assertEqual(factory.__name__, FACTORY_NAME)
+            self.assertEqual(factory.__module__, self.module_name)
+            self.assertEqual(
+                factory(pretrained=False, num_classes=7),
+                ("built", False, ("num_classes",)),
+            )
+
+            loaded = sys.modules[self.module_name]
+            self.assertIs(getattr(loaded, FACTORY_NAME), factory)
+            self.assertEqual(Path(loaded.__file__), module_path)
+
+            # Recorded by the timm-like decorator *while* the module executed, so
+            # it is evidence about import time, not about the state afterwards.
+            self.assertEqual(len(loaded.IMPORT_TIME_OBSERVATIONS), 1)
+            observed = loaded.IMPORT_TIME_OBSERVATIONS[0]
+            self.assertEqual(observed["factory"], FACTORY_NAME)
+            self.assertEqual(observed["module_name"], self.module_name)
+            self.assertEqual(Path(observed["module_file"]), module_path)
+
+    def test_failed_import_leaves_no_half_initialised_module(self):
+        cases = {
+            "exec_module raises": (EXPLODING_UPSTREAM_BODY, RuntimeError),
+            "pinned factory missing": (WRONG_FACTORY_UPSTREAM_BODY, ImportError),
+        }
+        for label, (body, error) in cases.items():
+            with self.subTest(failure=label), tempfile.TemporaryDirectory() as tmp:
+                write_upstream_checkout(Path(tmp), body)
+                self.assertNotIn(self.module_name, sys.modules)
+                with self.assertRaises(error):
+                    panderm.load_upstream_model_factory(tmp)
+                self.assertNotIn(self.module_name, sys.modules)
+
+    def test_failed_import_restores_a_pre_existing_module_object(self):
+        cases = {
+            "exec_module raises": (EXPLODING_UPSTREAM_BODY, RuntimeError),
+            "pinned factory missing": (WRONG_FACTORY_UPSTREAM_BODY, ImportError),
+        }
+        for label, (body, error) in cases.items():
+            with self.subTest(failure=label), tempfile.TemporaryDirectory() as tmp:
+                write_upstream_checkout(Path(tmp), body)
+                occupant = types.ModuleType(self.module_name)
+                occupant.pre_existing = True
+                sys.modules[self.module_name] = occupant
+                with self.assertRaises(error):
+                    panderm.load_upstream_model_factory(tmp)
+                self.assertIs(sys.modules[self.module_name], occupant)
+                sys.modules.pop(self.module_name, None)
+
+    def test_original_exception_is_not_swallowed_or_downgraded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_upstream_checkout(Path(tmp), EXPLODING_UPSTREAM_BODY)
+            with self.assertRaisesRegex(RuntimeError, "upstream import exploded"):
                 panderm.load_upstream_model_factory(tmp)
 
 
