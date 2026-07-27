@@ -27,10 +27,11 @@ NAMES = (VALIDATION, FORMAL)
 PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
-# The canonical notebook changed in this candidate, so its pin is deliberately
-# back at the placeholder: the reviewed implementation commit does not exist yet.
-# Re-pin only after the implementation commit is pushed.
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
+# The reviewed, pushed implementation commit the canonical notebook checks out.
+# This is the *implementation* commit, never the pinning commit that carries this
+# line: Colab must check out the code the notebook was validated against.
+IMPLEMENTATION_COMMIT = "7959e7a5e0ccae9e17b3e39e3503bc76af8076d1"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -107,30 +108,31 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_awaiting_a_pin_and_keeps_fail_loud_guard(self):
-        """The notebook changed, so it must be un-pinned and refuse to run.
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+        """The notebook must check out the commit it was validated against.
 
-        A stale 40-character SHA here would let Colab check out a commit that does
-        not contain this notebook's own preflight, so the placeholder is the
-        correct state until the implementation commit is pushed and reviewed.
+        The pin is the *implementation* commit, not the pinning commit that adds
+        this line: Colab clones the pinned SHA, so pinning the later commit would
+        be unresolvable at the moment it is written.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
-        self.assertNotRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
-        # Both halves of the guard must survive the un-pinning.
+        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first)
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        # Both halves of the fail-loud guard must survive the pinning.
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
-        self.assertNotEqual(len(PIN_PLACEHOLDER), 40)
 
-    def test_placeholder_pin_actually_stops_the_notebook(self):
-        """Executing cell 0 as-is must raise, not merely look wrong."""
+    def test_pinned_first_cell_passes_its_own_guard(self):
+        """Executing cell 0 as-is must now succeed, not merely look right."""
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
-        with self.assertRaises(AssertionError):
-            exec(compile(first, "cell-0", "exec"), {})
+        namespace = {}
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], IMPLEMENTATION_COMMIT)
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
