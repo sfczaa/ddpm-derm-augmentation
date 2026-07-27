@@ -26,7 +26,11 @@ NAMES = (VALIDATION, FORMAL)
 
 PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
-IMPLEMENTATION_COMMIT = "a76b27120b31afca4631236e8620f55ad011986e"
+
+# The canonical notebook changed in this candidate, so its pin is deliberately
+# back at the placeholder: the reviewed implementation commit does not exist yet.
+# Re-pin only after the implementation commit is pushed.
+PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -103,18 +107,30 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_and_keeps_fail_loud_guard(self):
+    def test_first_cell_is_awaiting_a_pin_and_keeps_fail_loud_guard(self):
+        """The notebook changed, so it must be un-pinned and refuse to run.
+
+        A stale 40-character SHA here would let Colab check out a commit that does
+        not contain this notebook's own preflight, so the placeholder is the
+        correct state until the implementation commit is pushed and reviewed.
+        """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
-        self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first
-        )
-        self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
-        self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertNotRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
+        # Both halves of the guard must survive the un-pinning.
+        self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
+        self.assertNotEqual(len(PIN_PLACEHOLDER), 40)
+
+    def test_placeholder_pin_actually_stops_the_notebook(self):
+        """Executing cell 0 as-is must raise, not merely look wrong."""
+        notebook, _ = load(VALIDATION)
+        first = "".join(notebook["cells"][0]["source"])
+        with self.assertRaises(AssertionError):
+            exec(compile(first, "cell-0", "exec"), {})
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
@@ -191,6 +207,151 @@ class ValidationNotebookTests(unittest.TestCase):
 
     def test_local_tests_package_prevents_colab_package_shadowing(self):
         self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
+
+    def test_checkpoint_preflight_runs_before_any_image_is_staged(self):
+        """Ordering is the whole point: fail on a bad checkpoint, not after 67 min.
+
+        The preflight must sit after the SHA-256 gate and before the cell that
+        copies the 8,505 train/val images, so an incompatible checkpoint costs
+        seconds rather than an hour of staging.
+        """
+        notebook, _ = load(VALIDATION)
+        sources = ["".join(cell["source"]) for cell in notebook["cells"]]
+        sha_gate = next(
+            index
+            for index, text in enumerate(sources)
+            if "panderm_run.require_checkpoint_sha256(" in text
+        )
+        preflight = next(
+            index
+            for index, text in enumerate(sources)
+            if "CHECKPOINT_PREFLIGHT_COMPLETE = True" in text
+        )
+        staging = next(
+            index
+            for index, text in enumerate(sources)
+            if "panderm_run.stage_validation_data" in text
+        )
+        self.assertLess(sha_gate, preflight)
+        self.assertLess(preflight, staging)
+
+    def test_checkpoint_preflight_really_reopens_remaps_and_loads(self):
+        _, code = load(VALIDATION)
+        for required in (
+            "panderm.load_pretrained_state(CHECKPOINT_PATH)",
+            "panderm.detect_checkpoint_layout(preflight_state)",
+            "panderm.remap_pretrained_state_dict(preflight_state, layout=preflight_layout)",
+            "panderm.build_panderm_classifier(checkpoint_path=CHECKPOINT_PATH",
+            "preflight_layout == panderm.LAYOUT_DIRECT_BACKBONE",
+            'assert "fc_norm.weight" in preflight_remapped',
+            'assert not any(key.startswith("head.") for key in preflight_remapped)',
+            "assert preflight_unexpected == []",
+            "assert preflight_missing == []",
+            "gc.collect()",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, code)
+        for printed in (
+            '"[preflight] checkpoint bytes:"',
+            '"[preflight] checkpoint sha256:"',
+            '"[preflight] detected layout:"',
+            '"[preflight] tensor entries:"',
+            '"[preflight] remapped keys:"',
+            '"[preflight] unexpected keys:"',
+            '"[preflight] missing non-head keys:"',
+            '"CHECKPOINT_PREFLIGHT_COMPLETE=True"',
+        ):
+            with self.subTest(printed=printed):
+                self.assertIn(printed, code)
+
+    def test_phase_one_keeps_its_live_copy_progress(self):
+        _, code = load(VALIDATION)
+        self.assertIn("panderm_run.stage_validation_data", code)
+        self.assertIn('staging_report["images_copied"] == 6995 + 1510', code)
+        staging = (
+            ROOT / "src" / "ddpm_derm" / "panderm_run.py"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "[Phase 1] START validation staging",
+            "[Phase 1] copy images:",
+            "[Phase 1] verify images:",
+            "images/s eta=",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, staging)
+
+    def test_phase_three_streams_real_progress_markers(self):
+        """Phase 3 must never go silent for minutes again."""
+        _, code = load(VALIDATION)
+        for marker in (
+            '"[Phase 3] START"',
+            "[Phase 3] loading upstream module",
+            "[Phase 3] building model and loading checkpoint on CPU",
+            "[Phase 3] checkpoint load/remap/load_state complete",
+            "[Phase 3] moving model to CUDA",
+            "[Phase 3] batch preparation ",
+            "[Phase 3] initial forward complete",
+            "[Phase 3] optimizer created",
+            "[Phase 3] accumulation micro-step ",
+            "[Phase 3] gradient validation complete",
+            "[Phase 3] optimizer step complete",
+            "[Phase 3] changed backbone tensors:",
+            "[Phase 3] COMPLETE elapsed=",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, code)
+        phase_three = next(
+            text
+            for text in (
+                "".join(cell["source"]) for cell in load(VALIDATION)[0]["cells"]
+            )
+            if "panderm.backbone_gradient_report" in text
+        )
+        # Every progress print must flush, or Colab buffers it into silence.
+        for line in phase_three.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("print(") and "[Phase 3]" in stripped:
+                with self.subTest(line=stripped[:60]):
+                    self.assertIn("flush=True", stripped)
+        self.assertIn("assert CHECKPOINT_PREFLIGHT_COMPLETE is True", phase_three)
+
+    def test_notebook_is_account_neutral_with_shared_root_prerequisites(self):
+        notebook, code = load(VALIDATION)
+        markdown = "\n".join(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "markdown"
+        )
+        for required in (
+            "/content/drive/MyDrive/ddpm-derm-augmentation",
+            "/content/drive/MyDrive/ddpm-derm-panderm-runs",
+            "Editor permission",
+            "GH_TOKEN",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, markdown)
+        self.assertIn("Never create a private folder of the", markdown)
+        # Account-neutral: no hard-coded identity anywhere in the notebook.
+        self.assertNotRegex(
+            json.dumps(notebook), r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+        )
+        self.assertNotIn("PANDERM_CHECKPOINT_DRIVE_ID = None", code)
+        for forbidden in ("MyDrive/ddpm-derm-panderm-runs-", "user_id", "account_email"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, code)
+        # Both shared roots are asserted, never created.
+        self.assertIn("assert SHARED_PROJECT_DIR.is_dir()", code)
+        self.assertIn("assert SHARED_RUN_ROOT.is_dir()", code)
+        self.assertIn("do not create a private replacement", code)
+        self.assertIn("panderm_run.require_existing_shared_root", code)
+        self.assertIn("panderm_run.create_or_validate_sentinel", code)
+        self.assertIn("panderm_run.probe_shared_drive", code)
+        # Pre-existing markers/records stop the run rather than being removed.
+        self.assertIn("a validation_record already exists", code)
+        self.assertIn("a prior gate already failed this version", code)
+        self.assertNotIn("shutil.rmtree", code)
+        self.assertNotIn("SHARED_RUN_ROOT.mkdir", code)
+        self.assertNotIn("SHARED_PROJECT_DIR.mkdir", code)
 
     def test_ddpm_train_only_test_runs_without_real_test_manifest(self):
         fieldnames = [

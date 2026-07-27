@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import types
 import unittest
+import warnings
 from pathlib import Path
 
 import torch
@@ -140,9 +141,11 @@ class LoaderAndArchitectureTests(unittest.TestCase):
         self.assertNotIn("head.weight", remapped)
         self.assertIn("blocks.0.attn.weight", remapped)
 
-    def test_checkpoint_without_encoder_prefix_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "no 'encoder.' parameters"):
-            panderm.remap_pretrained_state_dict({"blocks.0.attn.weight": torch.zeros(2)})
+    def test_payload_matching_no_known_layout_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "unrecognised PanDerm checkpoint layout"
+        ):
+            panderm.remap_pretrained_state_dict({"mystery.weight": torch.zeros(2)})
 
     def test_missing_backbone_parameters_are_rejected(self):
         state = mock_pretrained_state()
@@ -170,6 +173,376 @@ class LoaderAndArchitectureTests(unittest.TestCase):
                 panderm.load_upstream_model_factory(tmp)
 
 
+# --- published checkpoint layouts --------------------------------------------
+# The official panderm_bb_data6_checkpoint-499.pth is NOT the wrapped pretraining
+# layout the loader originally assumed. It is a plain OrderedDict of 186 tensors:
+# cls_token, pos_embed, patch_embed.*, blocks.* and norm.weight/norm.bias, with no
+# wrapper, no ``encoder.`` prefix and no classifier head. ``direct_backbone_state``
+# reproduces that shape (at mock scale) by taking the mock backbone and renaming
+# ``fc_norm.`` back to the published ``norm.``, so these tests exercise the real
+# layout rather than yet another encoder.* mock.
+def direct_backbone_state(*, include_head=False):
+    reference = MockPanDerm()
+    state = {}
+    for key, value in reference.state_dict().items():
+        if key.startswith("head."):
+            continue
+        if key.startswith("fc_norm."):
+            key = "norm." + key[len("fc_norm."):]
+        state[key] = value
+    if include_head:
+        # A pretrained head must be dropped, never loaded into the fresh one.
+        state["head.weight"] = torch.zeros(3, MOCK_DIM)
+        state["head.bias"] = torch.zeros(3)
+    return state
+
+
+class CheckpointLayoutTests(unittest.TestCase):
+    """Accept both published layouts; refuse everything that is merely dict-like.
+
+    Local scope note: these are schema regressions built from small deterministic
+    tensors. They never download or read the real 343 MB artifact.
+    """
+
+    def test_direct_fixture_matches_the_published_key_shape(self):
+        state = direct_backbone_state()
+        # Same sentinel set the real checkpoint exposes.
+        for key in panderm.DIRECT_SENTINEL_KEYS:
+            self.assertIn(key, state)
+        self.assertTrue(any(key.startswith("blocks.0.") for key in state))
+        self.assertFalse(any(key.startswith("encoder.") for key in state))
+        self.assertFalse(any(key.startswith("head.") for key in state))
+
+    def test_direct_complete_backbone_is_detected_and_accepted(self):
+        state = direct_backbone_state()
+        self.assertEqual(
+            panderm.detect_checkpoint_layout(state), panderm.LAYOUT_DIRECT_BACKBONE
+        )
+        model = panderm.build_panderm_classifier(
+            7, model_factory=mock_factory, state_dict=state
+        )
+        self.assertEqual(
+            model.pretrained_state_layout, panderm.LAYOUT_DIRECT_BACKBONE
+        )
+        self.assertIn("blocks.0.attn.weight", model.loaded_backbone_keys)
+
+    def test_direct_norm_is_remapped_onto_fc_norm(self):
+        remapped = panderm.remap_pretrained_state_dict(direct_backbone_state())
+        self.assertIn("fc_norm.weight", remapped)
+        self.assertIn("fc_norm.bias", remapped)
+        self.assertFalse(any(key.startswith("norm.") for key in remapped))
+
+    def test_direct_pretrained_head_never_reaches_the_fresh_head(self):
+        state = direct_backbone_state(include_head=True)
+        remapped = panderm.remap_pretrained_state_dict(state)
+        self.assertNotIn("head.weight", remapped)
+        self.assertNotIn("head.bias", remapped)
+        model = panderm.build_panderm_classifier(
+            7, model_factory=mock_factory, state_dict=state
+        )
+        self.assertEqual(model.head.out_features, 7)
+        self.assertFalse(
+            torch.equal(model.head.weight, torch.zeros_like(model.head.weight))
+        )
+
+    def test_direct_missing_sentinel_is_rejected_before_any_load(self):
+        state = direct_backbone_state()
+        state.pop("pos_embed")
+        with self.assertRaisesRegex(ValueError, "missing required backbone sentinels"):
+            panderm.detect_checkpoint_layout(state)
+
+    def test_direct_incomplete_backbone_fails_the_final_load_contract(self):
+        # Sentinels all present, but a real block parameter is gone: this must
+        # still fail loud, at the load contract rather than at detection.
+        state = direct_backbone_state()
+        state.pop("blocks.0.attn.weight")
+        self.assertEqual(
+            panderm.detect_checkpoint_layout(state), panderm.LAYOUT_DIRECT_BACKBONE
+        )
+        with self.assertRaisesRegex(ValueError, "missing backbone parameters"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=state
+            )
+
+    def test_direct_unexpected_model_key_is_rejected(self):
+        state = direct_backbone_state()
+        state["blocks.0.mystery.weight"] = torch.zeros(2)
+        with self.assertRaisesRegex(ValueError, "cannot accept"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=state
+            )
+
+    def test_direct_key_outside_the_backbone_allowlist_is_rejected(self):
+        for intruder in ("optimizer", "decoder.block.weight", "teacher.proj.weight"):
+            with self.subTest(intruder=intruder):
+                state = direct_backbone_state()
+                state[intruder] = torch.zeros(2)
+                with self.assertRaisesRegex(ValueError, "outside the backbone allowlist"):
+                    panderm.detect_checkpoint_layout(state)
+
+    def test_direct_non_tensor_value_is_rejected(self):
+        state = direct_backbone_state()
+        state["blocks.0.norm1.weight"] = {"not": "a tensor"}
+        with self.assertRaisesRegex(ValueError, "non-tensor values"):
+            panderm.remap_pretrained_state_dict(state)
+
+    def test_direct_mixed_with_encoder_layout_is_rejected(self):
+        state = direct_backbone_state()
+        state["encoder.blocks.0.attn.weight"] = torch.zeros(MOCK_DIM, MOCK_DIM)
+        with self.assertRaisesRegex(ValueError, "mixes the wrapped 'encoder.' layout"):
+            panderm.detect_checkpoint_layout(state)
+
+    def test_unknown_wrapper_and_unknown_payload_are_rejected(self):
+        for payload in (
+            {"model_ema": torch.zeros(2)},
+            {"epoch": torch.zeros(2), "args": torch.zeros(2)},
+        ):
+            with self.subTest(payload=sorted(payload)):
+                with self.assertRaisesRegex(
+                    ValueError, "unrecognised PanDerm checkpoint layout"
+                ):
+                    panderm.detect_checkpoint_layout(payload)
+        for payload in ({}, [], None):
+            with self.subTest(payload=repr(payload)):
+                with self.assertRaisesRegex(ValueError, "non-empty mapping"):
+                    panderm.detect_checkpoint_layout(payload)
+
+    def test_wrapped_encoder_layout_still_detected_and_accepted(self):
+        state = mock_pretrained_state()
+        self.assertEqual(
+            panderm.detect_checkpoint_layout(state), panderm.LAYOUT_ENCODER_WRAPPED
+        )
+        model = panderm.build_panderm_classifier(
+            7, model_factory=mock_factory, state_dict=state
+        )
+        self.assertEqual(
+            model.pretrained_state_layout, panderm.LAYOUT_ENCODER_WRAPPED
+        )
+
+    def test_wrapped_missing_and_unexpected_contract_is_preserved(self):
+        missing = mock_pretrained_state()
+        missing.pop("encoder.blocks.0.attn.weight")
+        with self.assertRaisesRegex(ValueError, "missing backbone parameters"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=missing
+            )
+        unexpected = mock_pretrained_state()
+        unexpected["encoder.mystery.weight"] = torch.zeros(2)
+        with self.assertRaisesRegex(ValueError, "cannot accept"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=unexpected
+            )
+
+    def test_layout_identities_are_the_two_named_values(self):
+        self.assertEqual(panderm.LAYOUT_DIRECT_BACKBONE, "direct_backbone_v1")
+        self.assertEqual(panderm.LAYOUT_ENCODER_WRAPPED, "encoder_wrapped_v1")
+
+    # --- wrapped layout: an encoder.* is not a licence to accept anything -----
+    def test_wrapped_unknown_top_level_component_is_rejected(self):
+        """One ``encoder.`` key must not make the rest of the payload acceptable.
+
+        ``load_state_dict`` would never see these keys, so without this check an
+        optimizer blob or an unrecognised tower rides along silently.
+        """
+        for intruder in ("optimizer.state", "mystery.foo", "epoch", "scaler"):
+            with self.subTest(intruder=intruder):
+                state = mock_pretrained_state()
+                state[intruder] = torch.zeros(2)
+                with self.assertRaisesRegex(
+                    ValueError, "outside the registered pretraining components"
+                ):
+                    panderm.detect_checkpoint_layout(state)
+
+    def test_wrapped_plus_direct_backbone_key_is_a_mixed_layout(self):
+        state = mock_pretrained_state()
+        state["cls_token"] = torch.zeros(1, 1, MOCK_DIM)
+        with self.assertRaisesRegex(ValueError, "mixes the wrapped 'encoder.' layout"):
+            panderm.detect_checkpoint_layout(state)
+
+    def test_wrapped_encoder_decoder_teacher_combination_still_accepted(self):
+        state = mock_pretrained_state(include_extras=True)
+        self.assertTrue(any(key.startswith("decoder.") for key in state))
+        self.assertTrue(any(key.startswith("teacher.") for key in state))
+        self.assertEqual(
+            panderm.detect_checkpoint_layout(state), panderm.LAYOUT_ENCODER_WRAPPED
+        )
+        remapped = panderm.remap_pretrained_state_dict(state)
+        self.assertFalse(
+            any(key.startswith(("decoder.", "teacher.")) for key in remapped)
+        )
+
+    def test_model_or_state_dict_wrapper_unwrapping_is_unchanged(self):
+        """``load_pretrained_state`` still unwraps, and the payload is then judged."""
+        inner = direct_backbone_state()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.pt"
+            torch.save({"model": inner}, path)
+            unwrapped = panderm.load_pretrained_state(path)
+            self.assertEqual(
+                panderm.detect_checkpoint_layout(unwrapped),
+                panderm.LAYOUT_DIRECT_BACKBONE,
+            )
+
+    # --- dtype must match exactly; no silent load_state_dict cast ------------
+    def test_direct_dtype_mismatch_is_rejected(self):
+        state = direct_backbone_state()
+        state["cls_token"] = state["cls_token"].to(torch.float64)
+        with self.assertRaisesRegex(ValueError, "tensor dtype mismatch"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=state
+            )
+
+    def test_wrapped_dtype_mismatch_is_rejected(self):
+        state = mock_pretrained_state()
+        state["encoder.blocks.0.attn.weight"] = state[
+            "encoder.blocks.0.attn.weight"
+        ].to(torch.float64)
+        with self.assertRaisesRegex(ValueError, "tensor dtype mismatch"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=state
+            )
+
+    def test_matching_dtypes_are_accepted_and_stay_float32(self):
+        for label, state in (
+            ("direct", direct_backbone_state()),
+            ("wrapped", mock_pretrained_state()),
+        ):
+            with self.subTest(layout=label):
+                model = panderm.build_panderm_classifier(
+                    7, model_factory=mock_factory, state_dict=state
+                )
+                dtypes = {value.dtype for value in model.state_dict().values()}
+                self.assertEqual(dtypes, {torch.float32})
+
+    def test_shape_mismatch_is_rejected(self):
+        state = direct_backbone_state()
+        state["cls_token"] = torch.zeros(1, 1, MOCK_DIM + 1)
+        with self.assertRaisesRegex(ValueError, "tensor shape mismatch"):
+            panderm.build_panderm_classifier(
+                7, model_factory=mock_factory, state_dict=state
+            )
+
+
+class RetainingFactory:
+    """Builds a mock model and keeps it, so post-rejection state is inspectable."""
+
+    def __init__(self):
+        self.model = None
+        self.snapshot = None
+
+    def __call__(self, **kwargs):
+        self.model = MockPanDerm(num_classes=kwargs["num_classes"])
+        # Parameters and buffers exactly as the factory produced them.
+        self.snapshot = {
+            name: value.detach().clone()
+            for name, value in self.model.state_dict().items()
+        }
+        return self.model
+
+
+class RejectionBeforeMutationTests(unittest.TestCase):
+    """A rejected checkpoint must not leave a partially loaded model behind.
+
+    ``load_state_dict(..., strict=False)`` copies every acceptable tensor in
+    *before* reporting what was missing or unexpected. Validating afterwards
+    therefore rejects a checkpoint that has already overwritten most of the
+    backbone, which on Colab would be a silently half-initialised model. Each
+    case below asserts the raise *and* that every parameter and buffer is
+    bit-identical to what the factory built.
+    """
+
+    def failing_payloads(self):
+        direct_incomplete = direct_backbone_state()
+        direct_incomplete.pop("blocks.0.attn.weight")
+
+        direct_unexpected = direct_backbone_state()
+        direct_unexpected["blocks.0.mystery.weight"] = torch.zeros(2)
+
+        direct_shape = direct_backbone_state()
+        direct_shape["cls_token"] = torch.zeros(1, 1, MOCK_DIM + 1)
+
+        direct_dtype = direct_backbone_state()
+        direct_dtype["cls_token"] = direct_dtype["cls_token"].to(torch.float64)
+
+        wrapped_missing = mock_pretrained_state()
+        wrapped_missing.pop("encoder.blocks.0.attn.weight")
+
+        wrapped_unexpected = mock_pretrained_state()
+        wrapped_unexpected["encoder.mystery.weight"] = torch.zeros(2)
+
+        wrapped_dtype = mock_pretrained_state()
+        wrapped_dtype["encoder.blocks.0.mlp.weight"] = wrapped_dtype[
+            "encoder.blocks.0.mlp.weight"
+        ].to(torch.float64)
+
+        return {
+            "direct incomplete": direct_incomplete,
+            "direct unexpected": direct_unexpected,
+            "direct shape mismatch": direct_shape,
+            "direct dtype mismatch": direct_dtype,
+            "wrapped missing": wrapped_missing,
+            "wrapped unexpected encoder key": wrapped_unexpected,
+            "wrapped dtype mismatch": wrapped_dtype,
+        }
+
+    def test_every_rejection_leaves_the_model_bit_identical(self):
+        for label, state in self.failing_payloads().items():
+            with self.subTest(case=label):
+                factory = RetainingFactory()
+                with self.assertRaises(ValueError):
+                    panderm.build_panderm_classifier(
+                        7, model_factory=factory, state_dict=state
+                    )
+                rejected_before_model_mutation = True
+                self.assertTrue(rejected_before_model_mutation)
+
+                self.assertIsNotNone(factory.model, "factory never built a model")
+                after = factory.model.state_dict()
+                self.assertEqual(sorted(after), sorted(factory.snapshot))
+                for name, before in factory.snapshot.items():
+                    value = after[name]
+                    self.assertEqual(value.shape, before.shape, name)
+                    self.assertEqual(value.dtype, before.dtype, name)
+                    self.assertTrue(torch.equal(value, before), f"{label}: {name} moved")
+
+    def test_a_valid_payload_does_change_the_model(self):
+        """Control: the comparison above is only meaningful if loading can move it."""
+        factory = RetainingFactory()
+        model = panderm.build_panderm_classifier(
+            7, model_factory=factory, state_dict=direct_backbone_state()
+        )
+        after = model.state_dict()
+        moved = [
+            name
+            for name, before in factory.snapshot.items()
+            if not name.startswith("head.")
+            and not torch.equal(after[name], before)
+        ]
+        self.assertGreater(len(moved), 0)
+
+    def test_head_is_never_touched_by_a_successful_load(self):
+        factory = RetainingFactory()
+        model = panderm.build_panderm_classifier(
+            7, model_factory=factory, state_dict=direct_backbone_state()
+        )
+        after = model.state_dict()
+        for name, before in factory.snapshot.items():
+            if name.startswith("head."):
+                self.assertTrue(torch.equal(after[name], before), name)
+
+    def test_validation_pass_alone_never_mutates(self):
+        """``plan_pretrained_load`` is read-only even on a payload that would load."""
+        factory = RetainingFactory()
+        model = factory(num_classes=7)
+        remapped = panderm.remap_pretrained_state_dict(direct_backbone_state())
+        plan = panderm.plan_pretrained_load(model, remapped)
+        self.assertEqual(plan["head_keys"], ["head.bias", "head.weight"])
+        self.assertEqual(plan["validated_tensors"], len(remapped))
+        after = model.state_dict()
+        for name, before in factory.snapshot.items():
+            self.assertTrue(torch.equal(after[name], before), name)
+
+
 # --- real upstream dynamic-import contract -----------------------------------
 # Everything above injects ``mock_factory``, so none of it exercises the actual
 # ``importlib`` path used on Colab. The fixture below is the smallest module that
@@ -178,19 +551,38 @@ class LoaderAndArchitectureTests(unittest.TestCase):
 # out of ``sys.modules`` at decoration time, i.e. while the module is still being
 # executed by ``exec_module``.
 TIMM_LIKE_REGISTRY = '''
+    import pathlib
     import sys
+    import warnings
 
+    # The registry lives in a file, not a module global, because timm's registry
+    # lives in the *timm* package and therefore survives re-executing this module.
+    # That is exactly what makes a second exec_module overwrite its entries.
+    REGISTRY_LOG = pathlib.Path(__REGISTRY_LOG__)
     IMPORT_TIME_OBSERVATIONS = []
 
 
     def register_model(fn):
-        """Same import-time lookup as timm 0.9.16 ``models/_registry.py``.
+        """Same import-time lookup and overwrite warning as timm 0.9.16.
 
-        The real decorator's first statement is ``mod = sys.modules[fn.__module__]``.
-        A loader that never publishes the module under ``spec.name`` therefore
-        raises ``KeyError`` here, long before the factory is ever called.
+        The real decorator's first statement is ``mod = sys.modules[fn.__module__]``,
+        so a loader that never publishes the module under ``spec.name`` raises
+        ``KeyError`` here, long before the factory is ever called. Registering the
+        same name twice is what produces timm's "Overwriting ... in registry"
+        warning, so re-executing this module is observable.
         """
         module = sys.modules[fn.__module__]
+        already = (
+            REGISTRY_LOG.read_text(encoding="utf-8").split()
+            if REGISTRY_LOG.exists()
+            else []
+        )
+        if fn.__name__ in already:
+            warnings.warn(
+                "Overwriting %s in registry" % fn.__name__, UserWarning
+            )
+        with REGISTRY_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(fn.__name__ + "\\n")
         IMPORT_TIME_OBSERVATIONS.append(
             {
                 "factory": fn.__name__,
@@ -236,15 +628,26 @@ WRONG_FACTORY_UPSTREAM_BODY = '''
     '''
 
 
+def registry_log_path(root):
+    """Where the fixture records every ``register_model`` call."""
+    return Path(root) / "timm_registry_log.txt"
+
+
 def write_upstream_checkout(root, body):
     """Lay out a temporary ``classification/models/modeling_finetune.py``."""
     module_path = panderm.upstream_module_path(root)
     module_path.parent.mkdir(parents=True, exist_ok=True)
-    module_path.write_text(
-        textwrap.dedent(TIMM_LIKE_REGISTRY) + textwrap.dedent(body),
-        encoding="utf-8",
-    )
+    source = textwrap.dedent(TIMM_LIKE_REGISTRY).replace(
+        "__REGISTRY_LOG__", repr(str(registry_log_path(root)))
+    ) + textwrap.dedent(body)
+    module_path.write_text(source, encoding="utf-8")
     return module_path
+
+
+def registrations(root):
+    """Factory names registered so far; one entry per module execution."""
+    log = registry_log_path(root)
+    return log.read_text(encoding="utf-8").split() if log.exists() else []
 
 
 class UpstreamDynamicImportTests(unittest.TestCase):
@@ -326,7 +729,94 @@ class UpstreamDynamicImportTests(unittest.TestCase):
             self.assertEqual(observed["module_name"], self.module_name)
             self.assertEqual(Path(observed["module_file"]), module_path)
 
-    def test_failed_import_leaves_no_half_initialised_module(self):
+    def test_first_load_executes_the_module_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            self.assertEqual(registrations(tmp), [])
+            panderm.load_upstream_model_factory(tmp)
+            self.assertEqual(registrations(tmp), [FACTORY_NAME])
+
+    def test_second_identical_load_reuses_the_module_without_re_executing(self):
+        """A second Phase 3 run in the same runtime must not re-register.
+
+        Re-executing would run every ``@register_model`` again over names timm has
+        already registered, which is what produced the four overwrite warnings.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            first = panderm.load_upstream_model_factory(tmp)
+            first_module = sys.modules[self.module_name]
+            second = panderm.load_upstream_model_factory(tmp)
+
+            self.assertIs(second, first)
+            self.assertIs(sys.modules[self.module_name], first_module)
+            # One execution, therefore exactly one registration.
+            self.assertEqual(registrations(tmp), [FACTORY_NAME])
+            self.assertEqual(len(first_module.IMPORT_TIME_OBSERVATIONS), 1)
+
+    def test_repeated_load_emits_no_registry_overwrite_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module_path = write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            panderm.load_upstream_model_factory(tmp)
+            with warnings.catch_warnings(record=True) as reused:
+                warnings.simplefilter("always")
+                panderm.load_upstream_model_factory(tmp)
+            self.assertEqual([str(item.message) for item in reused], [])
+
+            # Not vacuous: forcing a genuine re-exec of the same file does warn,
+            # which is the behaviour observed in the Colab runtime.
+            spec = importlib.util.spec_from_file_location(
+                self.module_name, module_path
+            )
+            reloaded = importlib.util.module_from_spec(spec)
+            sys.modules[self.module_name] = reloaded
+            with warnings.catch_warnings(record=True) as re_executed:
+                warnings.simplefilter("always")
+                spec.loader.exec_module(reloaded)
+            self.assertEqual(
+                [str(item.message) for item in re_executed],
+                [f"Overwriting {FACTORY_NAME} in registry"],
+            )
+            self.assertEqual(registrations(tmp), [FACTORY_NAME, FACTORY_NAME])
+
+    def test_cached_module_from_a_different_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            write_upstream_checkout(Path(tmp), WORKING_UPSTREAM_BODY)
+            impostor_path = write_upstream_checkout(Path(other), WORKING_UPSTREAM_BODY)
+            impostor = types.ModuleType(self.module_name)
+            impostor.__file__ = str(impostor_path)
+            setattr(impostor, FACTORY_NAME, lambda **kwargs: "impostor")
+            sys.modules[self.module_name] = impostor
+
+            with self.assertRaisesRegex(ImportError, "not from the pinned upstream"):
+                panderm.load_upstream_model_factory(tmp)
+            # Refused, never silently reused, and never silently replaced.
+            self.assertIs(sys.modules[self.module_name], impostor)
+            self.assertEqual(registrations(tmp), [])
+
+    def test_cached_module_with_an_unusable_factory_is_refused(self):
+        cases = {
+            "factory missing": None,
+            "factory not callable": "not-callable",
+            "factory from another module": types.SimpleNamespace,
+        }
+        for label, replacement in cases.items():
+            with self.subTest(cached=label), tempfile.TemporaryDirectory() as tmp:
+                module_path = write_upstream_checkout(
+                    Path(tmp), WORKING_UPSTREAM_BODY
+                )
+                cached = types.ModuleType(self.module_name)
+                cached.__file__ = str(module_path)
+                if replacement is not None:
+                    setattr(cached, FACTORY_NAME, replacement)
+                sys.modules[self.module_name] = cached
+
+                with self.assertRaises(ImportError):
+                    panderm.load_upstream_model_factory(tmp)
+                self.assertIs(sys.modules[self.module_name], cached)
+                sys.modules.pop(self.module_name, None)
+
+    def test_failed_import_rolls_back_when_the_module_was_absent(self):
         cases = {
             "exec_module raises": (EXPLODING_UPSTREAM_BODY, RuntimeError),
             "pinned factory missing": (WRONG_FACTORY_UPSTREAM_BODY, ImportError),
@@ -339,20 +829,20 @@ class UpstreamDynamicImportTests(unittest.TestCase):
                     panderm.load_upstream_model_factory(tmp)
                 self.assertNotIn(self.module_name, sys.modules)
 
-    def test_failed_import_restores_a_pre_existing_module_object(self):
-        cases = {
-            "exec_module raises": (EXPLODING_UPSTREAM_BODY, RuntimeError),
-            "pinned factory missing": (WRONG_FACTORY_UPSTREAM_BODY, ImportError),
-        }
-        for label, (body, error) in cases.items():
+    def test_failure_leaves_a_pre_existing_object_exactly_as_it_was(self):
+        for label, body in {
+            "exec_module raises": EXPLODING_UPSTREAM_BODY,
+            "pinned factory missing": WRONG_FACTORY_UPSTREAM_BODY,
+        }.items():
             with self.subTest(failure=label), tempfile.TemporaryDirectory() as tmp:
                 write_upstream_checkout(Path(tmp), body)
                 occupant = types.ModuleType(self.module_name)
                 occupant.pre_existing = True
                 sys.modules[self.module_name] = occupant
-                with self.assertRaises(error):
+                with self.assertRaises(ImportError):
                     panderm.load_upstream_model_factory(tmp)
                 self.assertIs(sys.modules[self.module_name], occupant)
+                self.assertTrue(sys.modules[self.module_name].pre_existing)
                 sys.modules.pop(self.module_name, None)
 
     def test_original_exception_is_not_swallowed_or_downgraded(self):
