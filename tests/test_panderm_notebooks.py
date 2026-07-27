@@ -28,6 +28,11 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
+# The reviewed, pushed implementation commit the canonical notebook checks out.
+# This is the *implementation* commit, never the pinning commit that carries this
+# line: Colab clones the pinned SHA, so pinning the later commit would be
+# unresolvable at the moment it is written.
+IMPLEMENTATION_COMMIT = "d8d562ce26f2e8b82a109dead7cf1390617d77b5"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -104,22 +109,25 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_fails_loud_until_the_new_implementation_is_pinned(self):
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first)
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        # Both halves of the fail-loud guard must survive the pinning.
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_unpinned_first_cell_triggers_its_own_guard(self):
+    def test_pinned_first_cell_passes_its_own_guard(self):
+        """Executing cell 0 as-is must now succeed, not merely look right."""
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        with self.assertRaises(AssertionError):
-            exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], IMPLEMENTATION_COMMIT)
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
