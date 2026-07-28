@@ -43,6 +43,10 @@ LAYER_SCALE_INIT_VALUE = 0.1
 ATTN_DROP_RATE = 0.0
 DROP_RATE = 0.0
 
+# Upstream constructs ``pos_embed`` as a fixed 2-D sin/cos table and detaches it
+# in ``forward_features``.  It is architectural state, not a learnable weight.
+EXPECTED_FIXED_PARAMETER_NAMES = frozenset({"pos_embed"})
+
 # ``--imagenet_default_mean_and_std``; upstream crop_pct is 224/256.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -381,7 +385,7 @@ def build_panderm_classifier(
     model_factory: Callable[..., nn.Module] | None = None,
     state_dict: Mapping[str, Any] | None = None,
 ) -> nn.Module:
-    """Build PanDerm-Base with a fresh head and every parameter trainable.
+    """Build PanDerm-Base with a fresh head and all learnable weights trainable.
 
     ``model_factory``/``state_dict`` exist so local tests can inject a mock and
     never touch the network or the real weights.
@@ -441,8 +445,15 @@ def build_panderm_classifier(
         raise ValueError(
             f"PanDerm head must be nn.Linear(..., {num_classes}), got {head!r}"
         )
-    for parameter in model.parameters():
-        parameter.requires_grad = True
+    model_parameter_names = {name for name, _ in model.named_parameters()}
+    missing_fixed = sorted(EXPECTED_FIXED_PARAMETER_NAMES - model_parameter_names)
+    if missing_fixed:
+        raise ValueError(
+            "PanDerm is missing its fixed sin/cos positional parameter: "
+            f"{missing_fixed}"
+        )
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = name not in EXPECTED_FIXED_PARAMETER_NAMES
 
     model.arch = ARCH
     model.pretrained_checkpoint = (
@@ -457,18 +468,27 @@ def build_panderm_classifier(
 
 
 def assert_full_trainability(model: nn.Module) -> int:
-    """Refuse to run unless every parameter is trainable (not a linear probe)."""
-    frozen = [
-        name for name, parameter in model.named_parameters() if not parameter.requires_grad
-    ]
-    if frozen:
+    """Require full fine-tuning except upstream's fixed sin/cos position table."""
+    named = dict(model.named_parameters())
+    missing_fixed = sorted(EXPECTED_FIXED_PARAMETER_NAMES - set(named))
+    if missing_fixed:
         raise ValueError(
-            "PanDerm full fine-tuning requires requires_grad=True everywhere; "
-            f"frozen parameters: {frozen[:10]}"
+            "PanDerm is missing its fixed sin/cos positional parameter: "
+            f"{missing_fixed}"
+        )
+    fixed = {name for name, parameter in named.items() if not parameter.requires_grad}
+    if fixed != EXPECTED_FIXED_PARAMETER_NAMES:
+        unexpectedly_frozen = sorted(fixed - EXPECTED_FIXED_PARAMETER_NAMES)
+        unexpectedly_trainable = sorted(EXPECTED_FIXED_PARAMETER_NAMES - fixed)
+        raise ValueError(
+            "PanDerm full fine-tuning requires every learnable parameter to have "
+            "requires_grad=True and only the fixed sin/cos position table frozen: "
+            f"unexpectedly_frozen={unexpectedly_frozen[:10]} "
+            f"unexpectedly_trainable={unexpectedly_trainable}"
         )
     backbone = [
         name
-        for name, _ in model.named_parameters()
+        for name in named
         if not name.startswith("head.")
     ]
     if not backbone:
@@ -784,7 +804,12 @@ def model_identity(
     eval_transform=None,
     checkpoint_sha256: str | None = None,
 ) -> dict[str, Any]:
+    assert_full_trainability(model)
     total, trainable = parameter_counts(model)
+    fixed_parameter_names = sorted(
+        name for name, parameter in model.named_parameters()
+        if not parameter.requires_grad
+    )
     return {
         "arch": ARCH,
         "model_name": panderm_run.UPSTREAM_MODEL_FACTORY,
@@ -810,31 +835,76 @@ def model_identity(
         "total_parameter_count": total,
         "trainable_parameter_count": trainable,
         "all_parameters_trainable": total == trainable,
+        "all_learnable_parameters_trainable": True,
+        "fixed_parameter_names": fixed_parameter_names,
+        "fixed_parameter_identity": {
+            "pos_embed": "upstream_fixed_2d_sincos_detached",
+        },
     }
 
 
 def backbone_gradient_report(model: nn.Module) -> dict[str, Any]:
     """Evidence that the backbone (not just the head) received gradients."""
-    named = [
+    assert_full_trainability(model)
+    backbone = [
         (name, parameter)
         for name, parameter in model.named_parameters()
         if not name.startswith("head.")
     ]
-    with_grad = [name for name, parameter in named if parameter.grad is not None]
-    finite = [
+    trainable = [
+        (name, parameter) for name, parameter in backbone
+        if parameter.requires_grad
+    ]
+    fixed = [
+        (name, parameter) for name, parameter in backbone
+        if not parameter.requires_grad
+    ]
+    with_grad = [
+        name for name, parameter in trainable if parameter.grad is not None
+    ]
+    missing_grad = [
+        name for name, parameter in trainable if parameter.grad is None
+    ]
+    nonfinite = [
         name
-        for name, parameter in named
-        if parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for name, parameter in trainable
+        if parameter.grad is not None
+        and not bool(torch.isfinite(parameter.grad).all().item())
+    ]
+    blocks_with_gradient = sorted({
+        int(name.split(".")[1])
+        for name in with_grad
+        if name.startswith("blocks.")
+        and len(name.split(".")) > 1
+        and name.split(".")[1].isdigit()
+    })
+    expected_blocks = list(range(len(getattr(model, "blocks", ()))))
+    head = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if name.startswith("head.") and parameter.requires_grad
     ]
     return {
-        "backbone_parameter_count": len(named),
+        "backbone_parameter_count": len(backbone),
+        "trainable_backbone_parameter_count": len(trainable),
+        "fixed_backbone_parameter_names": [name for name, _ in fixed],
         "backbone_parameters_with_gradient": len(with_grad),
-        "backbone_gradients_finite": len(finite) == len(with_grad),
-        "all_backbone_parameters_have_gradient": len(with_grad) == len(named),
-        "head_parameters_have_gradient": all(
+        "missing_trainable_backbone_gradient_names": missing_grad,
+        "nonfinite_backbone_gradient_names": nonfinite,
+        "backbone_gradients_finite": not nonfinite,
+        "all_trainable_backbone_parameters_have_gradient": not missing_grad,
+        "fixed_backbone_parameters_without_gradient": all(
+            parameter.grad is None for _, parameter in fixed
+        ),
+        "blocks_with_gradient": blocks_with_gradient,
+        "all_backbone_blocks_have_gradient": blocks_with_gradient == expected_blocks,
+        "head_parameters_have_gradient": bool(head) and all(
+            parameter.grad is not None for _, parameter in head
+        ),
+        "head_gradients_finite": bool(head) and all(
             parameter.grad is not None
-            for name, parameter in model.named_parameters()
-            if name.startswith("head.")
+            and bool(torch.isfinite(parameter.grad).all().item())
+            for _, parameter in head
         ),
     }
 

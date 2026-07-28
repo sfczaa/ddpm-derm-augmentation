@@ -50,7 +50,9 @@ class TinyPanDerm(nn.Module):
     def __init__(self, num_classes=7):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, 4))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 5, 4))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, 5, 4), requires_grad=False
+        )
         self.patch_embed = nn.Module()
         self.patch_embed.proj = nn.Conv2d(3, 4, kernel_size=2, stride=2)
         self.blocks = nn.ModuleList([nn.Linear(4, 4)])
@@ -62,7 +64,7 @@ class TinyPanDerm(nn.Module):
         tokens = torch.cat(
             [self.cls_token.expand(tokens.shape[0], -1, -1), tokens], dim=1
         )
-        tokens = tokens + self.pos_embed
+        tokens = tokens + self.pos_embed.clone().detach()
         for block in self.blocks:
             tokens = torch.relu(block(tokens))
         return self.head(self.fc_norm(tokens.mean(dim=1)))
@@ -208,9 +210,14 @@ assert tuple(logits.shape) == (2, 7)
 loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 3]))
 loss.backward()
 gradient_report = panderm.backbone_gradient_report(model)
-assert gradient_report["all_backbone_parameters_have_gradient"]
+assert gradient_report["all_trainable_backbone_parameters_have_gradient"]
 assert gradient_report["backbone_gradients_finite"]
+assert gradient_report["fixed_backbone_parameters_without_gradient"]
+assert gradient_report["fixed_backbone_parameter_names"] == ["pos_embed"]
+assert gradient_report["blocks_with_gradient"] == [0]
+assert gradient_report["all_backbone_blocks_have_gradient"]
 assert gradient_report["head_parameters_have_gradient"]
+assert gradient_report["head_gradients_finite"]
 optimizer.step()
 assert panderm.changed_parameter_count(before, model) > 0
 print("FRESH_RUNTIME_INTEGRATION_OK", flush=True)
