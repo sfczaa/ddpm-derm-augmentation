@@ -23,9 +23,10 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
-from . import config, panderm_run
+from . import panderm_run
 
 ARCH = panderm_run.ARCH
+NUM_CLASSES = len(panderm_run.EXPECTED_C1_CLASS_COUNTS)
 
 # ViT-B/16, matching upstream ``panderm_base_patch16_224_finetune``.
 EMBED_DIM = 768
@@ -372,7 +373,7 @@ def load_pretrained_state(path: str | Path) -> dict[str, Any]:
 
 
 def build_panderm_classifier(
-    num_classes: int = config.NUM_CLASSES,
+    num_classes: int = NUM_CLASSES,
     *,
     checkpoint_path: str | Path | None = None,
     upstream_dir: str | Path | None = None,

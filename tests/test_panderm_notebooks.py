@@ -28,11 +28,6 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-# The reviewed, pushed implementation commit the canonical notebook checks out.
-# This is the *implementation* commit, never the pinning commit that carries this
-# line: Colab clones the pinned SHA, so pinning the later commit would be
-# unresolvable at the moment it is written.
-IMPLEMENTATION_COMMIT = "d8d562ce26f2e8b82a109dead7cf1390617d77b5"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -109,25 +104,26 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_is_an_unpinned_fail_loud_implementation_candidate(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first)
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
-        # Both halves of the fail-loud guard must survive the pinning.
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertNotRegex(
+            first,
+            r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"',
+        )
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
-        """Executing cell 0 as-is must now succeed, not merely look right."""
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], IMPLEMENTATION_COMMIT)
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
@@ -192,6 +188,7 @@ class ValidationNotebookTests(unittest.TestCase):
             "tests.test_panderm_blockers",
             "tests.test_panderm_base_c1_finetune",
             "tests.test_panderm_notebooks",
+            "tests.test_panderm_fresh_runtime",
             '"unittest", "discover", "-s", "tests"',
             "tests.test_panderm_blockers.PanDermRunnerMockSmokeTests",
             '"runner_smoke_ok": "OK" in runner_smoke_output',
@@ -201,6 +198,56 @@ class ValidationNotebookTests(unittest.TestCase):
         ):
             self.assertIn(required, code)
         self.assertNotIn("scripts/smoke_test.py", code)
+
+    def test_preflight_and_staging_enforce_fresh_config_binding(self):
+        notebook, code = load(VALIDATION)
+        sources = ["".join(cell["source"]) for cell in notebook["cells"]]
+        preflight = next(
+            text for text in sources if "CHECKPOINT_PREFLIGHT_COMPLETE = True" in text
+        )
+        staging = next(
+            text for text in sources if "panderm_run.stage_validation_data" in text
+        )
+        self.assertIn('"DDPM_DERM_DATA_DIR" not in os.environ', preflight)
+        self.assertGreaterEqual(preflight.count('"ddpm_derm.config" not in sys.modules'), 2)
+        self.assertGreaterEqual(
+            preflight.count('"ddpm_derm.manifests" not in sys.modules'), 2
+        )
+        self.assertLess(
+            staging.index("panderm_run.stage_validation_data"),
+            staging.index('os.environ["DDPM_DERM_DATA_DIR"] = str(LOCAL_DATA_DIR)'),
+        )
+        self.assertLess(
+            staging.index('os.environ["DDPM_DERM_DATA_DIR"] = str(LOCAL_DATA_DIR)'),
+            staging.index("from ddpm_derm import config, manifests"),
+        )
+        for required in (
+            '"ddpm_derm.config" not in sys.modules',
+            '"ddpm_derm.manifests" not in sys.modules',
+            "config.DATA_DIR.resolve(strict=True) == LOCAL_DATA_DIR.resolve(strict=True)",
+            "config.MANIFESTS_DIR.resolve(strict=True)",
+            '"train.csv", "val.csv", "class_to_idx.json"',
+            '"test.csv").exists()',
+        ):
+            self.assertIn(required, staging)
+        self.assertNotIn("importlib.reload", code)
+        self.assertNotIn(
+            'os.environ["DDPM_DERM_DATA_DIR"] = str(SHARED_PROJECT_DIR / "data")',
+            code,
+        )
+
+    def test_python_subprocesses_are_unbuffered_cache_free_and_heartbeat_visible(self):
+        _, code = load(VALIDATION)
+        self.assertIn('env["PYTHONDONTWRITEBYTECODE"] = "1"', code)
+        self.assertIn('output_queue.get(timeout=60)', code)
+        self.assertIn('"[subprocess] heartbeat elapsed=', code)
+        self.assertIn('alive={process.poll() is None}', code)
+        for required in (
+            '[sys.executable, "-B", "-u", "-m", "unittest"',
+            '[sys.executable, "-B", "-u", "-m", "ddpm_derm.train_panderm"',
+            '[sys.executable, "-B", "-u", "-c", child_code]',
+        ):
+            self.assertIn(required, code)
 
     def test_local_tests_package_prevents_colab_package_shadowing(self):
         self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
