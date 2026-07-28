@@ -28,6 +28,12 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
+# The reviewed, pushed implementation commit the canonical notebook checks out.
+# Colab clones this SHA, so it must be the *implementation* commit: neither its
+# parent (which lacks the fix) nor the pinning commit that carries this line
+# (which does not exist yet when the pin is written).
+IMPLEMENTATION_COMMIT = "74b92a50aa4d6fbf6ae225ea2e950beb2658e453"
+IMPLEMENTATION_PARENT = "c815985aeeb2b6a089558756399b5b717d780520"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -104,26 +110,46 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_an_unpinned_fail_loud_implementation_candidate(self):
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
-        self.assertNotRegex(
-            first,
-            r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"',
-        )
+        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first)
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        # Both halves of the fail-loud guard must survive the pinning.
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_unpinned_first_cell_fails_its_own_guard(self):
+    def test_pin_is_the_implementation_commit_and_exists_in_history(self):
+        """Colab checks out this SHA, so it must carry the preflight fix itself.
+
+        The parent predates the fix, so pinning it would clone code without the
+        dataset-free import. The pin is deliberately *not* compared against the
+        current HEAD: pinning the implementation commit means that checking out
+        that commit legitimately makes pin == HEAD, so such a comparison would
+        fail for a correct pin.
+        """
+        notebook, _ = load(VALIDATION)
+        first = "".join(notebook["cells"][0]["source"])
+        pinned = re.search(r'EXPECTED_GIT_COMMIT = "([0-9a-f]{40})"', first).group(1)
+        self.assertEqual(pinned, IMPLEMENTATION_COMMIT)
+        self.assertNotEqual(pinned, IMPLEMENTATION_PARENT)
+        # The pinned commit must be a real object, or Colab's checkout dies.
+        resolved = subprocess.run(
+            ["git", "cat-file", "-t", pinned],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        if resolved.returncode == 0:
+            self.assertEqual(resolved.stdout.strip(), "commit")
+
+    def test_pinned_first_cell_passes_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
-            exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], IMPLEMENTATION_COMMIT)
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
