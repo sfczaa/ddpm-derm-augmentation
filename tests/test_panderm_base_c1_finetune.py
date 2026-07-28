@@ -50,7 +50,9 @@ class MockPanDerm(nn.Module):
     def __init__(self, num_classes=7, depth=MOCK_DEPTH, dim=MOCK_DIM):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 5, dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, 5, dim), requires_grad=False
+        )
         self.patch_embed = nn.Module()
         self.patch_embed.proj = nn.Conv2d(3, dim, kernel_size=112, stride=112)
         self.add_module("patch_embed", self.patch_embed)
@@ -67,7 +69,7 @@ class MockPanDerm(nn.Module):
         tokens = torch.cat(
             [self.cls_token.expand(tokens.shape[0], -1, -1), tokens], dim=1
         )
-        tokens = tokens + self.pos_embed
+        tokens = tokens + self.pos_embed.clone().detach()
         for block in self.blocks:
             tokens = block(tokens)
         return self.head(self.fc_norm(tokens.mean(dim=1)))
@@ -947,16 +949,27 @@ class UpstreamDynamicImportTests(unittest.TestCase):
 
 
 class FullTrainabilityTests(unittest.TestCase):
-    def test_every_parameter_is_trainable(self):
+    def test_every_learnable_parameter_is_trainable_and_pos_embed_is_fixed(self):
         model = build_mock_model()
         total, trainable = panderm.parameter_counts(model)
-        self.assertEqual(total, trainable)
+        self.assertGreater(total, trainable)
+        self.assertEqual(
+            total - trainable,
+            model.pos_embed.numel(),
+        )
+        self.assertFalse(model.pos_embed.requires_grad)
         self.assertGreater(panderm.assert_full_trainability(model), 0)
 
     def test_a_frozen_backbone_is_refused(self):
         model = build_mock_model()
         model.blocks[0].attn.weight.requires_grad = False
-        with self.assertRaisesRegex(ValueError, "requires_grad=True everywhere"):
+        with self.assertRaisesRegex(ValueError, "unexpectedly_frozen"):
+            panderm.assert_full_trainability(model)
+
+    def test_accidentally_trainable_fixed_pos_embed_is_refused(self):
+        model = build_mock_model()
+        model.pos_embed.requires_grad = True
+        with self.assertRaisesRegex(ValueError, "unexpectedly_trainable"):
             panderm.assert_full_trainability(model)
 
     def test_backbone_receives_gradients_and_updates(self):
@@ -967,11 +980,33 @@ class FullTrainabilityTests(unittest.TestCase):
         targets = torch.tensor([0, 3])
         nn.CrossEntropyLoss()(model(images), targets).backward()
         report = panderm.backbone_gradient_report(model)
-        self.assertTrue(report["all_backbone_parameters_have_gradient"])
+        self.assertTrue(
+            report["all_trainable_backbone_parameters_have_gradient"]
+        )
         self.assertTrue(report["backbone_gradients_finite"])
+        self.assertTrue(report["fixed_backbone_parameters_without_gradient"])
+        self.assertEqual(report["fixed_backbone_parameter_names"], ["pos_embed"])
+        self.assertEqual(report["blocks_with_gradient"], list(range(MOCK_DEPTH)))
+        self.assertTrue(report["all_backbone_blocks_have_gradient"])
         self.assertTrue(report["head_parameters_have_gradient"])
+        self.assertTrue(report["head_gradients_finite"])
         optimizer.step()
         self.assertGreater(panderm.changed_parameter_count(before, model), 0)
+
+    def test_missing_gradient_from_a_learnable_backbone_parameter_is_reported(self):
+        model = build_mock_model()
+        images = torch.randn(2, 3, 224, 224)
+        targets = torch.tensor([0, 3])
+        nn.CrossEntropyLoss()(model(images), targets).backward()
+        model.blocks[0].attn.weight.grad = None
+        report = panderm.backbone_gradient_report(model)
+        self.assertFalse(
+            report["all_trainable_backbone_parameters_have_gradient"]
+        )
+        self.assertEqual(
+            report["missing_trainable_backbone_gradient_names"],
+            ["blocks.0.attn.weight"],
+        )
 
     def test_model_identity_reports_full_finetune(self):
         model = build_mock_model()
@@ -980,7 +1015,13 @@ class FullTrainabilityTests(unittest.TestCase):
         )
         self.assertEqual(identity["arch"], "panderm_base_vit_b16")
         self.assertEqual(identity["freeze_mode"], "full_finetune")
-        self.assertTrue(identity["all_parameters_trainable"])
+        self.assertFalse(identity["all_parameters_trainable"])
+        self.assertTrue(identity["all_learnable_parameters_trainable"])
+        self.assertEqual(identity["fixed_parameter_names"], ["pos_embed"])
+        self.assertEqual(
+            identity["fixed_parameter_identity"],
+            {"pos_embed": "upstream_fixed_2d_sincos_detached"},
+        )
         self.assertEqual(identity["input_resolution"], [224, 224])
         self.assertEqual(identity["embed_dim"], 768)
         self.assertEqual(identity["depth"], 12)
@@ -1053,6 +1094,7 @@ class OptimizerAndScheduleTests(unittest.TestCase):
         seen = [id(p) for group in optimizer.param_groups for p in group["params"]]
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(len(seen), expected)
+        self.assertNotIn(id(model.pos_embed), seen)
 
     def test_duplicate_parameter_in_two_groups_is_rejected(self):
         model = build_mock_model()
@@ -1156,7 +1198,12 @@ class GradientAccumulationTests(unittest.TestCase):
 
         full = build_mock_model()
         criterion(full(images), targets).backward()
-        full_grads = {n: p.grad.clone() for n, p in full.named_parameters()}
+        self.assertIsNone(full.pos_embed.grad)
+        full_grads = {
+            name: parameter.grad.clone()
+            for name, parameter in full.named_parameters()
+            if parameter.requires_grad
+        }
 
         accumulated = build_mock_model()
         accumulated.load_state_dict(full.state_dict())
@@ -1164,7 +1211,10 @@ class GradientAccumulationTests(unittest.TestCase):
             chunk = slice(index * 2, index * 2 + 2)
             loss = criterion(accumulated(images[chunk]), targets[chunk])
             (loss * panderm.accumulation_loss_scale(index, 4, 4)).backward()
+        self.assertIsNone(accumulated.pos_embed.grad)
         for name, parameter in accumulated.named_parameters():
+            if not parameter.requires_grad:
+                continue
             torch.testing.assert_close(
                 parameter.grad, full_grads[name], rtol=1e-4, atol=1e-6, msg=name
             )
