@@ -30,6 +30,7 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
+PINNED_IMPLEMENTATION_COMMIT = "9c41b8f346950797adbfe0cb43b84d207e37fdf3"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -284,22 +285,27 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_requires_post_review_pinning(self):
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertIn(
+            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            first,
+        )
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_uncommitted_candidate_first_cell_fails_loud(self):
+    def test_pinned_first_cell_passes_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
-            exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(
+            namespace["EXPECTED_GIT_COMMIT"],
+            PINNED_IMPLEMENTATION_COMMIT,
+        )
 
     def test_archive_expected_identity_comes_from_the_reviewed_constant(self):
         """The notebook must not carry its own copy of the approved digest."""
