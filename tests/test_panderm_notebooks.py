@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import json
@@ -9,7 +10,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 
@@ -27,7 +30,6 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-IMPLEMENTATION_COMMIT = "65b3b7745025e129bbd900eb890c78a9d218d9ca"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -58,6 +60,184 @@ def load(name):
         if cell["cell_type"] == "code"
     )
     return notebook, code
+
+
+VALIDATION_ORDER_TOKENS = (
+    (
+        "checkpoint SHA",
+        "checkpoint_sha256 = panderm_run.require_checkpoint_sha256",
+    ),
+    (
+        "CPU checkpoint layout",
+        "pretrained_layout = panderm.detect_checkpoint_layout",
+    ),
+    (
+        "CPU model",
+        "preflight_model = panderm.build_panderm_classifier",
+    ),
+    (
+        "checkpoint serialization",
+        "checkpoint_preflight = train_panderm.checkpoint_serialization_preflight",
+    ),
+    (
+        "manifest checks",
+        "frames = {split: manifests.load_split(split)",
+    ),
+    ("GPU smoke start", 'print("[Phase 4] START'),
+    ("GPU smoke assertions complete", "GPU_SMOKE_COMPLETE = True"),
+    (
+        "GPU model and tensor cleanup",
+        "del model, optimizer, schedule, scaler, batch, logits",
+    ),
+    ("GPU cache cleanup", "torch.cuda.empty_cache()"),
+    ("all preflights complete", "PHASE3_COMPLETE = True"),
+    (
+        "version parent setup",
+        "verified_v1_root = panderm_run.ensure_tree",
+    ),
+    (
+        "version parent verification",
+        "resolved_v1_root = verified_v1_root.resolve(strict=True)",
+    ),
+    (
+        "validation lock path",
+        "VALIDATION_RUN_LOCK = panderm_run.validation_run_lock_path",
+    ),
+    (
+        "validation lock parent verification",
+        "assert VALIDATION_RUN_LOCK.parent.samefile(verified_v1_root)",
+    ),
+    ("validation lock acquisition", "panderm_run.acquire_validation_run_lock"),
+    ("archive build", "panderm_run.build_validation_archive_cache"),
+    ("archive reuse", "panderm_run.reuse_validation_archive_cache"),
+    ("validation id", "validation_id = datetime"),
+    (
+        "attempt directory",
+        "VALIDATION_DIR = panderm_run.ensure_tree",
+    ),
+    (
+        "fresh five-epoch runner",
+        "gate_seconds, gate_output = run_stream(gate_command",
+    ),
+)
+
+
+def validate_validation_notebook_order(source):
+    """Reject durable validation work before every cheap/GPU preflight passes."""
+    positions = {}
+    for label, token in VALIDATION_ORDER_TOKENS:
+        try:
+            positions[label] = source.index(token)
+        except ValueError as error:
+            raise AssertionError(f"missing validation ordering token: {label}") from error
+    for (earlier, _), (later, _) in zip(
+        VALIDATION_ORDER_TOKENS,
+        VALIDATION_ORDER_TOKENS[1:],
+    ):
+        if positions[earlier] >= positions[later]:
+            raise AssertionError(
+                f"validation ordering violation: {earlier} must precede {later}"
+            )
+    return positions
+
+
+def prepare_fresh_validation_lock(shared_run_root):
+    """Mirror the notebook's bounded, fail-loud version-parent setup."""
+    resolved_root = panderm_run.require_existing_shared_root(shared_run_root)
+    version_root = Path(shared_run_root) / panderm_run.RUN_VERSION
+    if version_root.is_symlink():
+        raise ValueError(f"validation version parent must not be a symlink: {version_root}")
+    try:
+        verified_v1_root = panderm_run.ensure_tree(
+            shared_run_root,
+            version_root.relative_to(shared_run_root),
+        )
+    except FileExistsError:
+        verified_v1_root = panderm_run.ensure_tree(
+            shared_run_root,
+            version_root.relative_to(shared_run_root),
+        )
+    if not verified_v1_root.is_dir() or verified_v1_root.is_symlink():
+        raise ValueError(
+            f"validation version parent is not a real directory: {verified_v1_root}"
+        )
+    resolved_v1_root = verified_v1_root.resolve(strict=True)
+    if (
+        not resolved_v1_root.is_relative_to(resolved_root)
+        or not resolved_v1_root.parent.samefile(resolved_root)
+    ):
+        raise ValueError(
+            f"validation version parent escaped the shared root: {resolved_v1_root}"
+        )
+    lock_path = panderm_run.validation_run_lock_path(shared_run_root)
+    if not lock_path.parent.samefile(verified_v1_root):
+        raise ValueError("validation lock parent does not match the version parent")
+    return lock_path
+
+
+FRESH_ROOT_RACE_WORKER = r"""
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from ddpm_derm import panderm_run
+
+shared_run_root = Path(sys.argv[2])
+session_id = sys.argv[3]
+start_at = float(sys.argv[4])
+calls = {"archive": 0, "attempt": 0, "runner": 0}
+while time.time() < start_at:
+    pass
+resolved_root = panderm_run.require_existing_shared_root(shared_run_root)
+version_root = shared_run_root / panderm_run.RUN_VERSION
+if version_root.is_symlink():
+    raise ValueError("validation version parent must not be a symlink")
+try:
+    verified_v1_root = panderm_run.ensure_tree(
+        shared_run_root, version_root.relative_to(shared_run_root)
+    )
+except FileExistsError:
+    verified_v1_root = panderm_run.ensure_tree(
+        shared_run_root, version_root.relative_to(shared_run_root)
+    )
+resolved_v1_root = verified_v1_root.resolve(strict=True)
+if (
+    verified_v1_root.is_symlink()
+    or not resolved_v1_root.is_relative_to(resolved_root)
+    or not resolved_v1_root.parent.samefile(resolved_root)
+):
+    raise ValueError("validation version parent escaped the shared root")
+lock_path = panderm_run.validation_run_lock_path(shared_run_root)
+if not lock_path.parent.samefile(verified_v1_root):
+    raise ValueError("validation lock parent mismatch")
+try:
+    marker = panderm_run.acquire_validation_run_lock(
+        lock_path,
+        session_id=session_id,
+        run_version=panderm_run.RUN_VERSION,
+        git_commit="c" * 40,
+        shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
+        account_label="A",
+    )
+    calls = {"archive": 1, "attempt": 1, "runner": 1}
+    print(json.dumps({
+        "acquired": True,
+        "session_id": session_id,
+        "owner": marker["session_id"],
+        "parent_ready": True,
+        "calls": calls,
+    }))
+except FileExistsError as error:
+    print(json.dumps({
+        "acquired": False,
+        "session_id": session_id,
+        "parent_ready": verified_v1_root.is_dir(),
+        "calls": calls,
+        "error": str(error),
+    }))
+"""
 
 
 class NotebookHygieneTests(unittest.TestCase):
@@ -104,23 +284,318 @@ class NotebookHygieneTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_requires_post_review_pinning(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertRegex(IMPLEMENTATION_COMMIT, r"^[0-9a-f]{40}$")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{IMPLEMENTATION_COMMIT}"', first)
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_uncommitted_candidate_first_cell_fails_loud(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], IMPLEMENTATION_COMMIT)
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
+
+    def test_archive_expected_identity_comes_from_the_reviewed_constant(self):
+        """The notebook must not carry its own copy of the approved digest."""
+        _, code = load(VALIDATION)
+        self.assertIn(
+            "panderm_run.require_approved_content_identity(", code
+        )
+        self.assertIn(
+            "panderm_run.EXPECTED_VALIDATION_CONTENT_IDENTITY_SHA256", code
+        )
+        for call in (
+            "panderm_run.build_validation_archive_cache",
+            "panderm_run.reuse_validation_archive_cache",
+            "panderm_run.validate_validation_archive_cache",
+        ):
+            with self.subTest(call=call):
+                self.assertIn(call, code)
+        self.assertEqual(
+            code.count("expected_file_content_identity_sha256=APPROVED_CONTENT_IDENTITY"),
+            3,
+        )
+        # A drifting second literal is exactly what the constant exists to avoid.
+        self.assertNotRegex(code, r'"[0-9a-f]{64}"')
+
+    def test_validation_run_lock_follows_all_preflights_and_precedes_durable_work(self):
+        """Cheap checks and GPU cleanup must finish before the durable lock."""
+        notebook, code = load(VALIDATION)
+        positions = validate_validation_notebook_order(code)
+        self.assertLess(
+            positions["GPU smoke assertions complete"],
+            positions["GPU model and tensor cleanup"],
+        )
+        self.assertLess(
+            positions["GPU cache cleanup"],
+            positions["all preflights complete"],
+        )
+        self.assertLess(
+            positions["all preflights complete"],
+            positions["version parent setup"],
+        )
+        self.assertLess(
+            positions["version parent verification"],
+            positions["validation lock path"],
+        )
+        self.assertLess(
+            positions["validation lock parent verification"],
+            positions["validation lock acquisition"],
+        )
+        self.assertIn("panderm_run.validation_run_lock_path(SHARED_RUN_ROOT)", code)
+        self.assertIn("VALIDATION_LOCK_HELD", code)
+        self.assertNotIn("V1_ROOT.mkdir", code)
+        sources = [
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "code"
+        ]
+        phase_zero = next(text for text in sources if 'drive.mount("/content/drive")' in text)
+        gpu_smoke = next(text for text in sources if "GPU_SMOKE_COMPLETE = True" in text)
+        for forbidden in (
+            "validation_run_lock_path",
+            "acquire_validation_run_lock",
+            "VALIDATION_SESSION",
+        ):
+            with self.subTest(phase_zero_forbidden=forbidden):
+                self.assertNotIn(forbidden, phase_zero)
+        self.assertNotIn(
+            "V1_ROOT.relative_to(SHARED_RUN_ROOT)",
+            phase_zero,
+        )
+        self.assertLess(
+            gpu_smoke.index("PHASE3_COMPLETE = True"),
+            gpu_smoke.index("verified_v1_root = panderm_run.ensure_tree"),
+        )
+        self.assertIn("acquire_validation_run_lock", gpu_smoke)
+
+    def test_validation_order_validator_rejects_the_old_early_lock_order(self):
+        ordered_tokens = [token for _, token in VALIDATION_ORDER_TOKENS]
+        correct = "\n".join(ordered_tokens)
+        validate_validation_notebook_order(correct)
+
+        early_lock = ordered_tokens.copy()
+        lock_path = early_lock.pop(
+            [label for label, _ in VALIDATION_ORDER_TOKENS].index(
+                "validation lock path"
+            )
+        )
+        lock_acquire = early_lock.pop(
+            [token for _, token in VALIDATION_ORDER_TOKENS].index(
+                "panderm_run.acquire_validation_run_lock"
+            )
+        )
+        early_lock[0:0] = [lock_path, lock_acquire]
+        with self.assertRaisesRegex(
+            AssertionError,
+            "validation ordering violation",
+        ):
+            validate_validation_notebook_order("\n".join(early_lock))
+
+    def test_validator_rejects_version_parent_after_lock_or_before_gpu(self):
+        labels = [label for label, _ in VALIDATION_ORDER_TOKENS]
+        ordered_tokens = [token for _, token in VALIDATION_ORDER_TOKENS]
+        setup_tokens = [
+            ordered_tokens[labels.index("version parent setup")],
+            ordered_tokens[labels.index("version parent verification")],
+        ]
+
+        parent_after_lock = [
+            token for token in ordered_tokens if token not in setup_tokens
+        ]
+        acquire_index = parent_after_lock.index(
+            "panderm_run.acquire_validation_run_lock"
+        )
+        parent_after_lock[acquire_index + 1:acquire_index + 1] = setup_tokens
+        with self.assertRaisesRegex(AssertionError, "validation ordering violation"):
+            validate_validation_notebook_order("\n".join(parent_after_lock))
+
+        parent_before_gpu = [
+            token for token in ordered_tokens if token not in setup_tokens
+        ]
+        gpu_index = parent_before_gpu.index('print("[Phase 4] START')
+        parent_before_gpu[gpu_index:gpu_index] = setup_tokens
+        with self.assertRaisesRegex(AssertionError, "validation ordering violation"):
+            validate_validation_notebook_order("\n".join(parent_before_gpu))
+
+    def test_fresh_version_parent_setup_then_lock_acquire_and_owner_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            shared_run_root = Path(temporary)
+            version_root = shared_run_root / panderm_run.RUN_VERSION
+            self.assertFalse(version_root.exists())
+
+            lock_path = prepare_fresh_validation_lock(shared_run_root)
+            self.assertTrue(version_root.is_dir())
+            owner = str(uuid.uuid4())
+            marker = panderm_run.acquire_validation_run_lock(
+                lock_path,
+                session_id=owner,
+                run_version=panderm_run.RUN_VERSION,
+                git_commit="c" * 40,
+                shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
+                account_label="A",
+            )
+            self.assertEqual(marker["session_id"], owner)
+            released = panderm_run.release_validation_run_lock(
+                lock_path, session_id=owner
+            )
+            self.assertEqual(released["session_id"], owner)
+            self.assertFalse(lock_path.exists())
+
+    def test_old_fresh_root_order_fails_before_any_durable_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            shared_run_root = Path(temporary)
+            lock_path = panderm_run.validation_run_lock_path(shared_run_root)
+            calls = {"archive": 0, "attempt": 0, "runner": 0}
+            with self.assertRaisesRegex(FileNotFoundError, "directory is missing"):
+                panderm_run.acquire_validation_run_lock(
+                    lock_path,
+                    session_id=str(uuid.uuid4()),
+                    run_version=panderm_run.RUN_VERSION,
+                    git_commit="c" * 40,
+                    shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
+                    account_label="A",
+                )
+            self.assertEqual(calls, {"archive": 0, "attempt": 0, "runner": 0})
+            self.assertFalse(lock_path.parent.exists())
+
+    def test_version_parent_setup_failures_do_not_acquire_the_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            missing_root = base / "missing"
+            with self.assertRaisesRegex(FileNotFoundError, "shared run root is missing"):
+                prepare_fresh_validation_lock(missing_root)
+            self.assertFalse(missing_root.exists())
+
+            shared_run_root = base / "shared"
+            shared_run_root.mkdir()
+            version_root = shared_run_root / panderm_run.RUN_VERSION
+            version_root.write_text("not a directory\n", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                prepare_fresh_validation_lock(shared_run_root)
+            self.assertFalse(
+                panderm_run.validation_run_lock_path(shared_run_root).exists()
+            )
+
+    def test_version_parent_rejects_path_escape_and_preserves_legal_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            shared_run_root = base / "shared"
+            outside = base / "outside"
+            shared_run_root.mkdir()
+            outside.mkdir()
+            version_root = shared_run_root / panderm_run.RUN_VERSION
+            try:
+                version_root.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                result = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(version_root), str(outside)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with self.assertRaisesRegex(ValueError, "symlink|escaped"):
+                prepare_fresh_validation_lock(shared_run_root)
+            self.assertFalse(
+                panderm_run.validation_run_lock_path(shared_run_root).exists()
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            shared_run_root = Path(temporary)
+            version_root = shared_run_root / panderm_run.RUN_VERSION
+            version_root.mkdir()
+            preserved = version_root / "reviewer.txt"
+            preserved.write_text("keep\n", encoding="utf-8")
+            prepare_fresh_validation_lock(shared_run_root)
+            self.assertEqual(preserved.read_text(encoding="utf-8"), "keep\n")
+
+    def test_two_fresh_root_processes_create_parent_then_one_wins_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            shared_run_root = base / "shared"
+            shared_run_root.mkdir()
+            worker = base / "worker.py"
+            worker.write_text(FRESH_ROOT_RACE_WORKER, encoding="utf-8")
+            src = str((ROOT / "src").resolve())
+            start_at = time.time() + 1.5
+            sessions = [str(uuid.uuid4()), str(uuid.uuid4())]
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-u",
+                        str(worker),
+                        src,
+                        str(shared_run_root),
+                        session,
+                        str(start_at),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for session in sessions
+            ]
+            outputs = [process.communicate()[0] for process in processes]
+            results = []
+            for output in outputs:
+                rows = [
+                    json.loads(line)
+                    for line in output.splitlines()
+                    if line.startswith("{")
+                ]
+                self.assertEqual(len(rows), 1, output)
+                results.append(rows[0])
+            self.assertTrue(all(result["parent_ready"] for result in results))
+            winners = [result for result in results if result["acquired"]]
+            losers = [result for result in results if not result["acquired"]]
+            self.assertEqual(len(winners), 1, results)
+            self.assertEqual(len(losers), 1, results)
+            self.assertEqual(
+                losers[0]["calls"], {"archive": 0, "attempt": 0, "runner": 0}
+            )
+            self.assertEqual(
+                winners[0]["calls"], {"archive": 1, "attempt": 1, "runner": 1}
+            )
+            lock_path = panderm_run.validation_run_lock_path(shared_run_root)
+            self.assertEqual(
+                panderm_run._read_validation_run_lock(lock_path)["session_id"],
+                winners[0]["session_id"],
+            )
+            panderm_run.release_validation_run_lock(
+                lock_path, session_id=winners[0]["session_id"]
+            )
+
+    def test_run_all_never_clears_a_stale_lock_and_releases_only_its_own(self):
+        _, code = load(VALIDATION)
+        self.assertNotIn("clear_stale_validation_run_lock", code)
+        self.assertNotIn("clear_stale_marker", code)
+        self.assertIn(
+            "panderm_run.release_validation_run_lock(VALIDATION_RUN_LOCK, "
+            "session_id=VALIDATION_SESSION_ID)",
+            code,
+        )
+        # Released on the success path and on the caught-failure path only.
+        self.assertEqual(code.count("release_validation_run_lock"), 2)
+        self.assertNotIn("VALIDATION_RUN_LOCK.unlink", code)
+
+    def test_account_label_is_operational_metadata_only(self):
+        notebook, code = load(VALIDATION)
+        self.assertIn('ACCOUNT_LABEL = "A"', code)
+        self.assertIn('ACCOUNT_LABEL in {"A", "B", "C"}', code)
+        identity_block = code[code.index("run_identity") if "run_identity" in code else 0:]
+        self.assertNotIn('"account_label": ACCOUNT_LABEL', identity_block)
+        self.assertNotIn("ACCOUNT_LABEL", json.dumps(
+            panderm_run.IMMUTABLE_IDENTITY_KEYS
+        ))
 
     def test_validation_is_seed_zero_five_epoch_validation_only(self):
         _, code = load(VALIDATION)
@@ -144,7 +619,16 @@ class ValidationNotebookTests(unittest.TestCase):
         self.assertIn('for split in ("train", "val")', code)
         self.assertNotIn("test_manifest_rows_read", code)
         self.assertNotIn("shutil.copytree", code)
-        self.assertIn("panderm_run.stage_validation_data", code)
+        self.assertIn("panderm_run.build_validation_archive_cache", code)
+        self.assertIn("panderm_run.reuse_validation_archive_cache", code)
+        tree = ast.parse(code)
+        legacy_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "stage_validation_data"
+        ]
+        self.assertEqual(legacy_calls, [])
         panderm_run.validate_validation_notebook_source(code)
         self.assertIn('result["test_metrics"] is None', code)
         self.assertIn('"test": None', code)
@@ -196,39 +680,32 @@ class ValidationNotebookTests(unittest.TestCase):
             self.assertIn(required, code)
         self.assertNotIn("scripts/smoke_test.py", code)
 
-    def test_preflight_and_staging_enforce_fresh_config_binding(self):
+    def test_preflight_and_archive_staging_enforce_runtime_binding(self):
         notebook, code = load(VALIDATION)
         sources = ["".join(cell["source"]) for cell in notebook["cells"]]
-        preflight = next(
-            text for text in sources if "CHECKPOINT_PREFLIGHT_COMPLETE = True" in text
+        serialization = next(
+            text for text in sources
+            if "checkpoint_preflight = train_panderm.checkpoint_serialization_preflight" in text
         )
         staging = next(
-            text for text in sources if "panderm_run.stage_validation_data" in text
+            text for text in sources
+            if "panderm_run.reuse_validation_archive_cache" in text
         )
-        self.assertIn('"DDPM_DERM_DATA_DIR" not in os.environ', preflight)
-        self.assertGreaterEqual(preflight.count('"ddpm_derm.config" not in sys.modules'), 2)
-        self.assertGreaterEqual(
-            preflight.count('"ddpm_derm.manifests" not in sys.modules'), 2
-        )
-        self.assertLess(
-            staging.index("panderm_run.stage_validation_data"),
-            staging.index('os.environ["DDPM_DERM_DATA_DIR"] = str(LOCAL_DATA_DIR)'),
-        )
-        self.assertLess(
-            staging.index('os.environ["DDPM_DERM_DATA_DIR"] = str(LOCAL_DATA_DIR)'),
-            staging.index("from ddpm_derm import config, manifests"),
-        )
+        self.assertIn("assert not LOCAL_DATA_DIR.exists()", serialization)
+        self.assertIn('temporary_directory=Path("/content")', serialization)
+        self.assertIn("stage_after_validation_preflights", staging)
+        self.assertIn("training_env[\"DDPM_DERM_DATA_DIR\"] = str(LOCAL_DATA_DIR)", staging)
         for required in (
-            '"ddpm_derm.config" not in sys.modules',
-            '"ddpm_derm.manifests" not in sys.modules',
-            "config.DATA_DIR.resolve(strict=True) == LOCAL_DATA_DIR.resolve(strict=True)",
-            "config.MANIFESTS_DIR.resolve(strict=True)",
+            "build_validation_archive_cache",
+            "reuse_validation_archive_cache",
+            'expected_manifest_sha256=manifest_sha256',
+            'expected_class_mapping_sha256=class_mapping_sha256',
             '"train.csv", "val.csv", "class_to_idx.json"',
             '"test.csv").exists()',
         ):
             self.assertIn(required, staging)
         self.assertNotIn("importlib.reload", code)
-        self.assertNotIn(
+        self.assertIn(
             'os.environ["DDPM_DERM_DATA_DIR"] = str(SHARED_PROJECT_DIR / "data")',
             code,
         )
@@ -249,13 +726,7 @@ class ValidationNotebookTests(unittest.TestCase):
     def test_local_tests_package_prevents_colab_package_shadowing(self):
         self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
 
-    def test_checkpoint_preflight_runs_before_any_image_is_staged(self):
-        """Ordering is the whole point: fail on a bad checkpoint, not after 67 min.
-
-        The preflight must sit after the SHA-256 gate and before the cell that
-        copies the 8,505 train/val images, so an incompatible checkpoint costs
-        seconds rather than an hour of staging.
-        """
+    def test_checkpoint_and_gpu_preflights_run_before_full_staging(self):
         notebook, _ = load(VALIDATION)
         sources = ["".join(cell["source"]) for cell in notebook["cells"]]
         sha_gate = next(
@@ -263,118 +734,131 @@ class ValidationNotebookTests(unittest.TestCase):
             for index, text in enumerate(sources)
             if "panderm_run.require_checkpoint_sha256(" in text
         )
-        preflight = next(
+        serialization = next(
             index
             for index, text in enumerate(sources)
-            if "CHECKPOINT_PREFLIGHT_COMPLETE = True" in text
+            if "checkpoint_preflight = train_panderm.checkpoint_serialization_preflight" in text
+        )
+        gpu_smoke = next(
+            index for index, text in enumerate(sources)
+            if "stage_train_smoke_sample" in text
         )
         staging = next(
             index
             for index, text in enumerate(sources)
-            if "panderm_run.stage_validation_data" in text
+            if "panderm_run.build_validation_archive_cache" in text
         )
-        self.assertLess(sha_gate, preflight)
-        self.assertLess(preflight, staging)
+        self.assertLess(sha_gate, serialization)
+        self.assertLess(serialization, gpu_smoke)
+        self.assertLess(gpu_smoke, staging)
 
-    def test_checkpoint_preflight_really_reopens_remaps_and_loads(self):
+    def test_checkpoint_preflight_reopens_remaps_loads_and_round_trips(self):
         _, code = load(VALIDATION)
         for required in (
             "panderm.load_pretrained_state(CHECKPOINT_PATH)",
-            "panderm.detect_checkpoint_layout(preflight_state)",
-            "panderm.remap_pretrained_state_dict(preflight_state, layout=preflight_layout)",
+            "panderm.detect_checkpoint_layout(pretrained_state)",
+            "panderm.remap_pretrained_state_dict(pretrained_state, layout=pretrained_layout)",
             "panderm.build_panderm_classifier(checkpoint_path=CHECKPOINT_PATH",
-            "preflight_layout == panderm.LAYOUT_DIRECT_BACKBONE",
-            'assert "fc_norm.weight" in preflight_remapped',
-            'assert not any(key.startswith("head.") for key in preflight_remapped)',
-            "assert preflight_unexpected == []",
-            "assert preflight_missing == []",
+            "pretrained_layout == panderm.LAYOUT_DIRECT_BACKBONE",
+            'assert "fc_norm.weight" in remapped_state',
+            "checkpoint_serialization_preflight",
+            'type(dependency_versions["torch"]) is str',
+            "panderm_run.require_primitive_identity(production_run_identity)",
+            "preflight_num_batches == 469 and preflight_steps_per_epoch == 58",
+            'checkpoint_preflight["weights_only_round_trip"] is True',
             "gc.collect()",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, code)
-        for printed in (
-            '"[preflight] checkpoint bytes:"',
-            '"[preflight] checkpoint sha256:"',
-            '"[preflight] detected layout:"',
-            '"[preflight] tensor entries:"',
-            '"[preflight] remapped keys:"',
-            '"[preflight] unexpected keys:"',
-            '"[preflight] missing non-head keys:"',
-            '"CHECKPOINT_PREFLIGHT_COMPLETE=True"',
-        ):
-            with self.subTest(printed=printed):
-                self.assertIn(printed, code)
-
-    def test_phase_one_keeps_its_live_copy_progress(self):
+    def test_archive_build_and_reuse_keep_live_progress(self):
         _, code = load(VALIDATION)
-        self.assertIn("panderm_run.stage_validation_data", code)
-        self.assertIn('staging_report["images_copied"] == 6995 + 1510', code)
+        self.assertIn("panderm_run.build_validation_archive_cache", code)
+        self.assertIn("panderm_run.reuse_validation_archive_cache", code)
+        self.assertIn('staging_report["images_staged"] == 8505', code)
         staging = (
             ROOT / "src" / "ddpm_derm" / "panderm_run.py"
         ).read_text(encoding="utf-8")
         for marker in (
-            "[Phase 1] START validation staging",
-            "[Phase 1] copy images:",
-            "[Phase 1] verify images:",
-            "images/s eta=",
+            "[archive-build] START",
+            "files={index}/{total}",
+            "current_file={member_name}",
+            'phase="archive-runtime-copy"',
+            "source_bytes={source_bytes_completed}",
+            "tar_stream_bytes={archive.fileobj.tell()}",
+            "bytes={copied}/{total}",
+            "eta={eta:.1f}s",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, staging)
 
-    def test_phase_three_streams_real_progress_markers(self):
-        """Phase 3 must never go silent for minutes again."""
+    def test_phase_four_gpu_smoke_has_full_update_contract(self):
         _, code = load(VALIDATION)
         for marker in (
-            '"[Phase 3] START"',
-            "[Phase 3] loading upstream module",
-            "[Phase 3] building model and loading checkpoint on CPU",
-            "[Phase 3] checkpoint load/remap/load_state complete",
-            "[Phase 3] moving model to CUDA",
-            "[Phase 3] batch preparation ",
-            "[Phase 3] initial forward complete",
-            "[Phase 3] optimizer created",
-            "[Phase 3] accumulation micro-step ",
-            "[Phase 3] gradient validation complete",
-            "[Phase 3] optimizer step complete",
-            "[Phase 3] changed backbone tensors:",
-            "[Phase 3] COMPLETE elapsed=",
+            "stage_train_smoke_sample",
+            "train_panderm.set_seed(0)",
+            "sample_tensors = [train_transform(",
+            "[Phase 4] accumulation micro-step=",
+            'gradient_report["blocks_with_gradient"] == list(range(12))',
+            'gradient_report["head_parameters_have_gradient"]',
+            "model.pos_embed.grad is None",
+            "verify_optimizer_covers_parameters_once",
+            "scaler.step(optimizer)",
+            "changed_backbone > 0",
+            "post_step_checkpoint_preflight",
+            '"smoke_model_discarded": True',
+            "torch.cuda.empty_cache()",
+            "[Phase 4] COMPLETE elapsed=",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, code)
-        phase_three = next(
+        phase_four = next(
             text
             for text in (
                 "".join(cell["source"]) for cell in load(VALIDATION)[0]["cells"]
             )
-            if "panderm.backbone_gradient_report" in text
+            if "stage_train_smoke_sample" in text
         )
-        # Every progress print must flush, or Colab buffers it into silence.
-        for line in phase_three.splitlines():
+        for line in phase_four.splitlines():
             stripped = line.strip()
-            if stripped.startswith("print(") and "[Phase 3]" in stripped:
+            if stripped.startswith("print(") and "[Phase 4]" in stripped:
                 with self.subTest(line=stripped[:60]):
                     self.assertIn("flush=True", stripped)
-        self.assertIn("assert CHECKPOINT_PREFLIGHT_COMPLETE is True", phase_three)
         self.assertIn(
-            'model_details["fixed_parameter_names"] == ["pos_embed"]',
-            phase_three,
+            'post_step_checkpoint_preflight["weights_only_round_trip"] is True',
+            code,
         )
         self.assertIn(
-            'gradient_report["all_trainable_backbone_parameters_have_gradient"]',
-            phase_three,
+            'require_matching_identity(result["run_identity"], '
+            "production_run_identity)",
+            code,
         )
-        self.assertIn(
-            'gradient_report["fixed_backbone_parameters_without_gradient"]',
-            phase_three,
+
+    def test_smoke_state_is_discarded_before_fresh_non_resume_subprocess(self):
+        notebook, _ = load(VALIDATION)
+        sources = ["".join(cell["source"]) for cell in notebook["cells"]]
+        smoke_index = next(
+            index for index, text in enumerate(sources)
+            if "stage_train_smoke_sample" in text
         )
-        self.assertIn(
-            'gradient_report["blocks_with_gradient"] == list(range(12))',
-            phase_three,
+        run_index = next(
+            index for index, text in enumerate(sources)
+            if "gate_seconds, gate_output = run_stream(gate_command" in text
         )
+        smoke = sources[smoke_index]
+        run = sources[run_index]
+        self.assertLess(smoke_index, run_index)
+        self.assertIn("del model, optimizer, schedule, scaler", smoke)
+        self.assertIn('"smoke_model_discarded": True', smoke)
+        self.assertIn("[start] fresh run (no --resume) from epoch 1", run)
         self.assertNotIn(
-            'gradient_report["all_backbone_parameters_have_gradient"]',
-            phase_three,
+            'if (checkpoint_dir / "last.pt").is_file(): '
+            'gate_command.append("--resume")',
+            run,
         )
+        initial_call = run.split(
+            "gate_seconds, gate_output = run_stream(gate_command", 1
+        )[1].splitlines()[0]
+        self.assertNotIn("--resume", initial_call)
 
     def test_notebook_is_account_neutral_with_shared_root_prerequisites(self):
         notebook, code = load(VALIDATION)
@@ -405,6 +889,8 @@ class ValidationNotebookTests(unittest.TestCase):
         self.assertIn("assert SHARED_RUN_ROOT.is_dir()", code)
         self.assertIn("do not create a private replacement", code)
         self.assertIn("panderm_run.require_existing_shared_root", code)
+        self.assertIn("assert SHARED_ROOT_SENTINEL.is_file()", code)
+        self.assertIn("do not recreate it", code)
         self.assertIn("panderm_run.create_or_validate_sentinel", code)
         self.assertIn("panderm_run.require_shared_root_sentinel_identity", code)
         self.assertIn("panderm_run.probe_shared_drive", code)
@@ -414,7 +900,8 @@ class ValidationNotebookTests(unittest.TestCase):
         # Pre-existing markers/records stop the run rather than being removed.
         self.assertIn("a validation_record already exists", code)
         self.assertIn("a prior gate already failed this version", code)
-        self.assertNotIn("shutil.rmtree", code)
+        self.assertIn("shutil.rmtree(SMOKE_SAMPLE_DIR)", code)
+        self.assertNotIn("shutil.rmtree(SHARED", code)
         self.assertNotIn("SHARED_RUN_ROOT.mkdir", code)
         self.assertNotIn("SHARED_PROJECT_DIR.mkdir", code)
 
