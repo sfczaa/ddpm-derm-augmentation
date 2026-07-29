@@ -5,21 +5,25 @@ from __future__ import annotations
 import ast
 import csv
 import hashlib
+import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import uuid
+from contextlib import redirect_stderr
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ddpm_derm import panderm_run  # noqa: E402
+from ddpm_derm import panderm_run, train_panderm  # noqa: E402
 
 
 VALIDATION = "colab_panderm_base_c1_finetune_validation.ipynb"
@@ -28,9 +32,11 @@ NAMES = (VALIDATION, FORMAL)
 
 PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
+PHASE2_TRAIN_SHA256 = "eea3fdf281120687b45dfcb5139d927888c6dc84867c67f053c7a743eb02b6fa"
+PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df819f4"
+PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "9c41b8f346950797adbfe0cb43b84d207e37fdf3"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -61,6 +67,66 @@ def load(name):
         if cell["cell_type"] == "code"
     )
     return notebook, code
+
+
+def load_phase2_manifest_helpers():
+    notebook, _ = load(VALIDATION)
+    phase2 = next(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if "prepare_test_manifest_data_root" in "".join(cell.get("source", []))
+    )
+    tree = ast.parse(phase2)
+    helper_names = {
+        "assert_phase2_real_path",
+        "prepare_test_manifest_data_root",
+        "verify_test_manifest_data_root",
+    }
+    constant_names = {
+        "PHASE2_EXPECTED_MANIFEST_SHA256",
+        "PHASE2_EXPECTED_CLASS_MAPPING_SHA256",
+        "PHASE2_EXPECTED_CLASS_TO_IDX",
+    }
+    selected_nodes = []
+    selected_names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in helper_names:
+                selected_nodes.append(node)
+                selected_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names = {
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            }
+            if names & constant_names:
+                selected_nodes.append(node)
+                selected_names.update(names & constant_names)
+    required_names = helper_names | constant_names
+    if selected_names != required_names:
+        raise AssertionError(
+            f"Phase 2 manifest helper definitions are incomplete: "
+            f"{sorted(required_names - selected_names)}"
+        )
+    namespace = {
+        "Path": Path,
+        "csv": csv,
+        "hashlib": hashlib,
+        "json": json,
+        "os": os,
+        "stat": stat,
+    }
+    exec(
+        compile(
+            ast.Module(body=selected_nodes, type_ignores=[]),
+            "phase2-manifest-helpers",
+            "exec",
+        ),
+        namespace,
+    )
+    return (
+        namespace["prepare_test_manifest_data_root"],
+        namespace["verify_test_manifest_data_root"],
+    )
 
 
 VALIDATION_ORDER_TOKENS = (
@@ -284,28 +350,340 @@ class NotebookHygieneTests(unittest.TestCase):
                 )
 
 
+class Phase2ManifestBindingTests(unittest.TestCase):
+    @staticmethod
+    def _sha256(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    @staticmethod
+    def _approved_manifest_root():
+        data_root = Path(os.environ.get("DDPM_DERM_DATA_DIR", ROOT / "data"))
+        return data_root / "manifests"
+
+    def _copy_approved_source_manifests(self, destination):
+        destination = Path(destination)
+        destination.mkdir(parents=True)
+        expected = {
+            "train.csv": PHASE2_TRAIN_SHA256,
+            "val.csv": PHASE2_VAL_SHA256,
+            "class_to_idx.json": PHASE2_MAPPING_SHA256,
+        }
+        source_root = self._approved_manifest_root()
+        for name, expected_sha256 in expected.items():
+            source = source_root / name
+            self.assertTrue(source.is_file(), source)
+            self.assertEqual(self._sha256(source), expected_sha256)
+            shutil.copyfile(source, destination / name)
+        return destination
+
+    def _prepare(self, source_root, target_root):
+        prepare, verify = load_phase2_manifest_helpers()
+        source_manifest_root = self._copy_approved_source_manifests(
+            Path(source_root) / "manifests"
+        )
+        prepare(source_manifest_root, target_root)
+        return verify
+
+    def _make_directory_link(self, link, target):
+        link, target = Path(link), Path(target)
+        if os.name == "nt":
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+        else:
+            link.symlink_to(target, target_is_directory=True)
+
+    @staticmethod
+    def _remove_directory_link(link):
+        link = Path(link)
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            link.rmdir()
+
+    def test_manifest_only_root_has_exact_verified_files_and_no_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "manifest-only"
+            verify = self._prepare(root / "shared", data_root)
+            report = verify(data_root)
+            self.assertEqual(
+                report["files"],
+                [
+                    "manifests/class_to_idx.json",
+                    "manifests/train.csv",
+                    "manifests/val.csv",
+                ],
+            )
+            self.assertEqual(report["train_rows"], 6995)
+            self.assertEqual(report["val_rows"], 1510)
+            self.assertFalse((data_root / "manifests" / "test.csv").exists())
+            self.assertFalse(any(path.is_symlink() for path in data_root.rglob("*")))
+            self.assertFalse(
+                any(path.suffix.lower() == ".jpg" for path in data_root.rglob("*"))
+            )
+
+    def test_common_wrong_source_and_recomputed_expected_is_rejected(self):
+        prepare, _ = load_phase2_manifest_helpers()
+        self.assertEqual(prepare.__code__.co_argcount, 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = self._copy_approved_source_manifests(
+                root / "shared" / "manifests"
+            )
+            train_path = source_root / "train.csv"
+            payload = train_path.read_bytes()
+            first_row = payload.find(b"\n") + 1
+            first_comma = payload.find(b",", first_row)
+            self.assertGreater(first_row, 0)
+            self.assertGreater(first_comma, first_row)
+            train_path.write_bytes(
+                payload[:first_comma] + b"-wrong" + payload[first_comma:]
+            )
+            recomputed_wrong_sha256 = self._sha256(train_path)
+            self.assertNotEqual(recomputed_wrong_sha256, PHASE2_TRAIN_SHA256)
+            self.assertEqual(
+                train_path.read_bytes().count(b"\n"), payload.count(b"\n")
+            )
+            target_root = root / "manifest-only"
+            with self.assertRaisesRegex(
+                AssertionError, "authoritative train.csv SHA-256 drift"
+            ):
+                prepare(source_root, target_root)
+            self.assertFalse(target_root.exists())
+
+    def test_source_directory_junction_or_symlink_is_rejected(self):
+        prepare, _ = load_phase2_manifest_helpers()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_source = self._copy_approved_source_manifests(
+                root / "real-manifests"
+            )
+            source_link = root / "source-link"
+            self._make_directory_link(source_link, real_source)
+            try:
+                with self.assertRaisesRegex(AssertionError, "reparse point"):
+                    prepare(source_link, root / "manifest-only")
+            finally:
+                self._remove_directory_link(source_link)
+
+    def test_destination_parent_junction_or_symlink_is_rejected(self):
+        prepare, _ = load_phase2_manifest_helpers()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = self._copy_approved_source_manifests(
+                root / "shared" / "manifests"
+            )
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            destination_parent_link = root / "destination-parent-link"
+            self._make_directory_link(destination_parent_link, real_parent)
+            try:
+                with self.assertRaisesRegex(AssertionError, "reparse point"):
+                    prepare(
+                        source_root,
+                        destination_parent_link / "manifest-only",
+                    )
+            finally:
+                self._remove_directory_link(destination_parent_link)
+            self.assertFalse((real_parent / "manifest-only").exists())
+
+    def test_manifest_gate_rejects_test_extra_and_hash_drift(self):
+        mutations = (
+            ("test manifest", "manifests/test.csv", b"forbidden"),
+            ("extra file", "extra.txt", b"forbidden"),
+            ("train hash", "manifests/train.csv", b"\ndrift"),
+            ("val hash", "manifests/val.csv", b"\ndrift"),
+            ("mapping hash", "manifests/class_to_idx.json", b"\n"),
+        )
+        for label, relative_path, payload in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                data_root = root / "manifest-only"
+                verify = self._prepare(root / "shared", data_root)
+                path = data_root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("ab") as handle:
+                    handle.write(payload)
+                with self.assertRaises(AssertionError):
+                    verify(data_root)
+
+    def test_missing_class_mapping_fails_loud_on_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            shutil.copytree(ROOT / "src", checkout / "src")
+            shutil.copytree(ROOT / "tests", checkout / "tests")
+            data_root = root / "manifest-only"
+            manifests_root = data_root / "manifests"
+            manifests_root.mkdir(parents=True)
+            for split in ("train", "val"):
+                (manifests_root / f"{split}.csv").write_text(
+                    "image_path,label_idx,dx,lesion_id,image_id\n",
+                    encoding="utf-8",
+                )
+            env = os.environ.copy()
+            env["DDPM_DERM_DATA_DIR"] = str(data_root)
+            env["DDPM_DERM_OUTPUTS_DIR"] = str(root / "outputs")
+            env["PYTHONPATH"] = str(checkout / "src")
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-c",
+                    "import tests.test_panderm_blockers",
+                ],
+                cwd=checkout,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Could not locate the HAM10000 data directory", result.stdout)
+
+    def test_fresh_checkout_imports_and_runs_c1_data_tests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            shutil.copytree(ROOT / "src", checkout / "src")
+            shutil.copytree(ROOT / "tests", checkout / "tests")
+            shutil.copytree(ROOT / "notebooks", checkout / "notebooks")
+            data_root = root / "manifest-only"
+            self._prepare(root / "shared", data_root)
+            env = os.environ.copy()
+            env["DDPM_DERM_DATA_DIR"] = str(data_root)
+            env["DDPM_DERM_OUTPUTS_DIR"] = str(root / "outputs")
+            env["PYTHONPATH"] = str(checkout / "src")
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            imports = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-c",
+                    (
+                        "import tests.test_panderm_blockers; "
+                        "import tests.test_panderm_base_c1_finetune; "
+                        "import tests.test_panderm_notebooks; "
+                        "print('MANIFEST_ONLY_IMPORTS_OK')"
+                    ),
+                ],
+                cwd=checkout,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertEqual(imports.returncode, 0, imports.stdout)
+            self.assertIn("MANIFEST_ONLY_IMPORTS_OK", imports.stdout)
+            c1 = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-m",
+                    "unittest",
+                    "-v",
+                    "tests.test_panderm_base_c1_finetune.C1DataTests",
+                ],
+                cwd=checkout,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertEqual(c1.returncode, 0, c1.stdout)
+            self.assertIn("Ran 4 tests", c1.stdout)
+            self.assertFalse((checkout / "data").exists())
+            self.assertFalse((checkout.parent / "data").exists())
+
+    def test_illegal_cli_matrix_fails_for_each_expected_reason(self):
+        base = [
+            "--checkpoint",
+            "weights.pth",
+            "--upstream-dir",
+            "upstream",
+            "--output-dir",
+            "outputs",
+        ]
+        cases = (
+            (["--variant", "C4"], "invalid choice"),
+            (
+                ["--generated-manifest", "/tmp/nope.csv"],
+                "synthetic manifests are rejected",
+            ),
+            (
+                ["--run-version", "v2_other"],
+                "--run-version must be v1_panderm_base_c1_finetune",
+            ),
+            (["--df-target-count", "586"], "--df-target-count must be 585"),
+            (
+                ["--accumulation-steps", "0"],
+                "--accumulation-steps must be exactly 8",
+            ),
+            (["--batch-size", "0"], "--batch-size must be exactly 16"),
+            (["--warmup-epochs", "999"], "--warmup-epochs must be exactly 5"),
+            (["--evaluation-scope", "full"], "invalid choice"),
+            (["--drop-path", "0.3"], "unrecognized arguments"),
+            (["--no-amp"], "unrecognized arguments"),
+            (["--seed", "1"], "--seed must be exactly 0"),
+            (["--epochs", "50"], "--epochs must be exactly 5"),
+        )
+        for extra, expected_error in cases:
+            with self.subTest(extra=extra):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    train_panderm.parse_args(base + extra)
+                self.assertIn(expected_error, stderr.getvalue())
+
+    def test_manifest_only_root_is_removed_after_test_failure(self):
+        temporary_path = None
+        with self.assertRaisesRegex(RuntimeError, "forced Phase 2 failure"):
+            with tempfile.TemporaryDirectory(
+                prefix="panderm-phase2-failure-"
+            ) as temporary:
+                temporary_path = Path(temporary)
+                self._prepare(
+                    temporary_path / "shared",
+                    temporary_path / "manifest-only",
+                )
+                raise RuntimeError("forced Phase 2 failure")
+        self.assertIsNotNone(temporary_path)
+        self.assertFalse(temporary_path.exists())
+
+
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_requires_post_review_implementation_pin(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_placeholder_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
 
     def test_archive_expected_identity_comes_from_the_reviewed_constant(self):
         """The notebook must not carry its own copy of the approved digest."""
@@ -327,8 +705,24 @@ class ValidationNotebookTests(unittest.TestCase):
             code.count("expected_file_content_identity_sha256=APPROVED_CONTENT_IDENTITY"),
             3,
         )
-        # A drifting second literal is exactly what the constant exists to avoid.
-        self.assertNotRegex(code, r'"[0-9a-f]{64}"')
+        # Archive content identity remains centralized in production code, while
+        # Phase 2 intentionally binds its three approved manifest byte identities.
+        digest_literals = {
+            node.value
+            for node in ast.walk(ast.parse(code))
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and len(node.value) == 64
+            and all(character in "0123456789abcdef" for character in node.value)
+        }
+        self.assertEqual(
+            digest_literals,
+            {
+                PHASE2_TRAIN_SHA256,
+                PHASE2_VAL_SHA256,
+                PHASE2_MAPPING_SHA256,
+            },
+        )
 
     def test_validation_run_lock_follows_all_preflights_and_precedes_durable_work(self):
         """Cheap checks and GPU cleanup must finish before the durable lock."""
@@ -685,6 +1079,80 @@ class ValidationNotebookTests(unittest.TestCase):
         ):
             self.assertIn(required, code)
         self.assertNotIn("scripts/smoke_test.py", code)
+
+    def test_phase2_uses_verified_temporary_manifest_and_output_roots(self):
+        notebook, code = load(VALIDATION)
+        phase2 = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "prepare_test_manifest_data_root" in "".join(cell.get("source", []))
+        )
+        for required in (
+            'tempfile.TemporaryDirectory(dir="/content", prefix="panderm-test-manifests-")',
+            'SHARED_PROJECT_DIR / "data" / "manifests"',
+            'test_env["DDPM_DERM_DATA_DIR"] = str(TEST_MANIFEST_DATA_ROOT)',
+            'test_env["DDPM_DERM_OUTPUTS_DIR"] = str(TEST_OUTPUT_ROOT)',
+            'test_env["PYTHONPATH"] = str(CODE_DIR / "src")',
+            'test_env["PYTHONUNBUFFERED"] = "1"',
+            'test_env["PYTHONDONTWRITEBYTECODE"] = "1"',
+            'TEST_OUTPUT_ROOT / "illegal"',
+            "for extra, expected_error in illegal:",
+            "assert expected_error in illegal_output",
+            "assert not LOCAL_DATA_DIR.exists()",
+            "assert not list(Path(\"/content\").glob(\"panderm-test-manifests-*\"))",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, phase2)
+        self.assertNotIn('test_env.pop("DDPM_DERM_DATA_DIR", None)', phase2)
+        self.assertNotIn('"--output-dir", "/content/panderm-illegal"', phase2)
+        self.assertNotIn("scripts/smoke_test.py", code)
+
+    def test_phase2_manifest_gate_is_exact_train_val_only(self):
+        _, code = load(VALIDATION)
+        phase2 = next(
+            "".join(cell["source"])
+            for cell in load(VALIDATION)[0]["cells"]
+            if "prepare_test_manifest_data_root" in "".join(cell.get("source", []))
+        )
+        for required in (
+            PHASE2_TRAIN_SHA256,
+            PHASE2_VAL_SHA256,
+            PHASE2_MAPPING_SHA256,
+            'source_manifest_root / "train.csv"',
+            'source_manifest_root / "val.csv"',
+            'source_manifest_root / "class_to_idx.json"',
+            '"manifests/train.csv"',
+            '"manifests/val.csv"',
+            '"manifests/class_to_idx.json"',
+            "actual_entries == expected_entries",
+            'len(train_rows) == 6995',
+            'len(val_rows) == 1510',
+            "class_mapping == PHASE2_EXPECTED_CLASS_TO_IDX",
+            'not (manifests_root / "test.csv").exists()',
+            '"source manifest root"',
+            '"temporary data root parent"',
+            '"temporary test data root"',
+            '"temporary manifests directory"',
+            '"st_file_attributes"',
+            '"FILE_ATTRIBUTE_REPARSE_POINT"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, phase2)
+        prepare, verify = load_phase2_manifest_helpers()
+        self.assertEqual(prepare.__code__.co_argcount, 2)
+        self.assertEqual(verify.__code__.co_argcount, 1)
+        self.assertNotIn("expected_manifest_sha256", phase2)
+        self.assertNotIn("expected_class_mapping_sha256", phase2)
+        self.assertNotIn("expected_class_to_idx", phase2)
+        self.assertNotIn("copytree(source_manifest_root", code)
+        self.assertNotIn("copytree(SHARED_PROJECT_DIR", code)
+
+    def test_fresh_runtime_probe_still_removes_parent_data_binding(self):
+        source = (ROOT / "tests" / "test_panderm_fresh_runtime.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('env.pop("DDPM_DERM_DATA_DIR", None)', source)
+        self.assertIn('assert "DDPM_DERM_DATA_DIR" not in os.environ', source)
 
     def test_preflight_and_archive_staging_enforce_runtime_binding(self):
         notebook, code = load(VALIDATION)
