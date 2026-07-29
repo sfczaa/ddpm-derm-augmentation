@@ -266,11 +266,20 @@ def _load_staged_checkpoint_for_save(path, *, map_location="cpu"):
     return torch.load(path, map_location=map_location, weights_only=True)
 
 
-def save_checkpoint(
-    path, model, optimizer, schedule, scaler, epoch, best_val_f1, history,
-    args, run_identity, val_metrics=None,
-) -> None:
-    """Same-directory atomic write with recursive exact reopen validation."""
+def build_checkpoint_payload(
+    model,
+    optimizer,
+    schedule,
+    scaler,
+    epoch,
+    best_val_f1,
+    history,
+    args,
+    run_identity,
+    val_metrics=None,
+) -> dict:
+    """Build the production checkpoint payload shared by save and preflight."""
+    panderm_run.require_primitive_identity(run_identity)
     payload = {
         "checkpoint_schema_version": 1,
         "checkpoint_format": panderm_run.CHECKPOINT_FORMAT,
@@ -288,6 +297,90 @@ def save_checkpoint(
     }
     if val_metrics is not None:
         payload["val_metrics"] = val_metrics
+    return payload
+
+
+def checkpoint_serialization_preflight(
+    *,
+    temporary_directory,
+    model,
+    optimizer,
+    schedule,
+    scaler,
+    args,
+    run_identity,
+) -> dict:
+    """Round-trip a production payload locally without creating durable artifacts."""
+    temporary_directory = Path(temporary_directory)
+    if not temporary_directory.is_dir():
+        raise FileNotFoundError(
+            f"checkpoint preflight temporary directory is missing: "
+            f"{temporary_directory}"
+        )
+    payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        schedule,
+        scaler,
+        epoch=0,
+        best_val_f1=-1.0,
+        history=[],
+        args=args,
+        run_identity=run_identity,
+    )
+    temporary: Path | None = None
+    print(
+        f"[checkpoint-preflight] START directory={temporary_directory}",
+        flush=True,
+    )
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".panderm-checkpoint-preflight.",
+            suffix=".pt",
+            dir=temporary_directory,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        torch.save(payload, temporary)
+        with temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        reopened = _load_staged_checkpoint_for_save(
+            temporary, map_location="cpu"
+        )
+        validate_checkpoint_payload(reopened, model, expected_payload=payload)
+        print("[checkpoint-preflight] COMPLETE weights_only_round_trip=true", flush=True)
+        return {
+            "checkpoint_format": reopened["checkpoint_format"],
+            "payload_keys": sorted(reopened),
+            "weights_only_round_trip": True,
+            "temporary_cleanup_required": True,
+        }
+    except Exception as error:
+        raise RuntimeError(
+            f"checkpoint serialization preflight failed during save/reopen: {error}"
+        ) from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_checkpoint(
+    path, model, optimizer, schedule, scaler, epoch, best_val_f1, history,
+    args, run_identity, val_metrics=None,
+) -> None:
+    """Same-directory atomic write with recursive exact reopen validation."""
+    payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        schedule,
+        scaler,
+        epoch,
+        best_val_f1,
+        history,
+        args,
+        run_identity,
+        val_metrics,
+    )
     path = Path(path)
     if not path.parent.is_dir():
         raise FileNotFoundError(

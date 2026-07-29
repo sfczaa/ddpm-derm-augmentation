@@ -13,16 +13,20 @@ from __future__ import annotations
 
 import ast
 import csv
+import hashlib
 import json
+import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -156,6 +160,36 @@ EXPECTED_C1_CLASS_COUNTS = {
     "mel": 782, "nv": 4684, "vasc": 92,
 }
 EXPECTED_C1_TRAIN_ROWS = 7495
+EXPECTED_VALIDATION_IMAGE_COUNT = 8505
+VALIDATION_ARCHIVE_FILENAME = "ham10000_train_val_only_v1.tar"
+VALIDATION_ARCHIVE_IDENTITY_FILENAME = "archive_identity.json"
+VALIDATION_ARCHIVE_READY_FILENAME = "_READY.json"
+VALIDATION_ARCHIVE_CACHE_FORMAT = "ham10000_train_val_only_tar_v1"
+VALIDATION_ARCHIVE_SCHEMA_VERSION = 1
+
+# Approved content identity of the train/val archive payload: the canonical
+# aggregate over every member's (POSIX relative path, exact byte size, SHA-256).
+#
+# This is the independent trust anchor. Every other content witness -- the tar
+# bytes, the persisted per-file rows, the aggregate inside archive_identity.json,
+# the archive SHA-256 and _READY.json -- lives inside the cache directory and can
+# all be rewritten together, so validating them only against each other proves
+# nothing. This constant is Git-reviewed and must never be read back from the
+# artifact under validation.
+#
+# Derived from the fixed train/val split at
+#   train.csv     eea3fdf281120687b45dfcb5139d927888c6dc84867c67f053c7a743eb02b6fa
+#   val.csv       22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df819f4
+#   class_to_idx  5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c
+# over 8508 members (8505 images + 3 manifest members), 2352169696 bytes.
+VALIDATION_CONTENT_IDENTITY_PLACEHOLDER = "REPLACE_AFTER_CONTENT_IDENTITY_PIN"
+EXPECTED_VALIDATION_CONTENT_IDENTITY_SHA256 = (
+    "189c4c1fc630cb1717cd3b87390b9dbff2e412fd2c6eefab525ff057760fe74e"
+)
+EXPECTED_VALIDATION_CONTENT_MEMBER_COUNT = 8508
+EXPECTED_CLASS_TO_IDX = {
+    name: index for index, name in enumerate(EXPECTED_C1_CLASS_COUNTS)
+}
 
 # Frozen historical ResNet-18 matched-585 benchmark. Descriptive comparison
 # only: different architecture, resolution, optimizer, schedule and budget.
@@ -277,6 +311,1008 @@ def _canonical_manifest_image_path(value: Any) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"manifest image_path is not canonical: {raw!r}")
     return "/".join(parts)
+
+
+def _sorted_string_sha256(values: Sequence[str]) -> str:
+    encoded = "".join(f"{value}\n" for value in sorted(values)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_mapping_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(value),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_file_content_rows_sha256(
+    rows: Sequence[Mapping[str, Any]],
+) -> str:
+    canonical_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        if type(row) is not dict or set(row) != {"path", "size_bytes", "sha256"}:
+            raise ValueError(f"file content row {index} schema mismatch")
+        path = _canonical_manifest_image_path(row["path"])
+        if path != row["path"] or path.casefold() in seen:
+            raise ValueError(f"file content row {index} path mismatch")
+        seen.add(path.casefold())
+        size_bytes = row["size_bytes"]
+        if type(size_bytes) is not int or size_bytes < 0:
+            raise ValueError(f"file content row {index} size mismatch")
+        digest = row["sha256"]
+        if not is_pinned_sha256(digest):
+            raise ValueError(f"file content row {index} SHA-256 mismatch")
+        canonical_rows.append(
+            {"path": path, "size_bytes": size_bytes, "sha256": digest}
+        )
+    if [row["path"] for row in canonical_rows] != sorted(
+        row["path"] for row in canonical_rows
+    ):
+        raise ValueError("file content rows are not in canonical sorted order")
+    encoded = json.dumps(
+        canonical_rows,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def require_approved_content_identity(value: Any) -> str:
+    """Accept only a real, reviewed, non-placeholder approved content digest.
+
+    Callers must pass this in explicitly. It deliberately has no default and is
+    never read back from the tar, ``archive_identity.json``, ``_READY.json``, the
+    cache directory or the extracted tree: an expected value supplied by the
+    artifact under validation would be rewritten together with everything else it
+    is supposed to police.
+    """
+    if value is None:
+        raise ValueError(
+            "approved expected file content identity is required; it must come "
+            "from the reviewed constant, never from the artifact being validated"
+        )
+    if value == VALIDATION_CONTENT_IDENTITY_PLACEHOLDER:
+        raise ValueError(
+            "approved expected file content identity is still the placeholder "
+            f"{VALIDATION_CONTENT_IDENTITY_PLACEHOLDER!r}; run the one-off "
+            "bootstrap source-hash step and pin the reviewed digest before any "
+            "archive publish, reuse, attempt or runner start"
+        )
+    if not is_pinned_sha256(value):
+        raise ValueError(
+            "approved expected file content identity must be 64 lowercase hex "
+            f"characters, got {value!r}"
+        )
+    return value
+
+
+def _require_content_identity_matches_approved(
+    observed: Mapping[str, Any],
+    approved_sha256: str,
+    *,
+    witness: str,
+) -> None:
+    """Every witness (source, tar, extracted tree, persisted rows) must agree."""
+    recomputed = _canonical_file_content_rows_sha256(observed["rows"])
+    if recomputed != observed["sha256"]:
+        raise ValueError(
+            f"{witness} content rows do not hash to their own aggregate: "
+            f"{recomputed} != {observed['sha256']}"
+        )
+    if recomputed != approved_sha256:
+        raise ValueError(
+            f"{witness} content identity does not match the approved expected "
+            f"identity: {recomputed} != {approved_sha256}"
+        )
+
+
+def _file_content_identity_from_sources(
+    member_sources: Mapping[str, str | Path],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    names = sorted(member_sources)
+    rows: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    last_report = started
+    completed_bytes = 0
+    print(f"[{phase}] START files_total={len(names)}", flush=True)
+    for index, name in enumerate(names, start=1):
+        canonical = _canonical_manifest_image_path(name)
+        if canonical != name:
+            raise ValueError(f"non-canonical file content path: {name!r}")
+        source = Path(member_sources[name])
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"file content source must be a regular file: {source}")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        with source.open("rb") as handle:
+            while True:
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size_bytes += len(chunk)
+                now = time.perf_counter()
+                if now - last_report >= 60:
+                    elapsed = now - started
+                    print(
+                        f"[{phase}] files={index - 1}/{len(names)} "
+                        f"bytes={completed_bytes + size_bytes} "
+                        f"elapsed={elapsed:.1f}s current_file={name}",
+                        flush=True,
+                    )
+                    last_report = now
+        rows.append(
+            {
+                "path": name,
+                "size_bytes": size_bytes,
+                "sha256": digest.hexdigest(),
+            }
+        )
+        completed_bytes += size_bytes
+        now = time.perf_counter()
+        if index % 250 == 0 or index == len(names) or now - last_report >= 60:
+            elapsed = now - started
+            rate = index / elapsed if elapsed > 0 else float("inf")
+            eta = (len(names) - index) / rate if rate > 0 else float("inf")
+            print(
+                f"[{phase}] files={index}/{len(names)} bytes={completed_bytes} "
+                f"elapsed={elapsed:.1f}s rate={rate:.1f}files/s "
+                f"eta={eta:.1f}s current_file={name}",
+                flush=True,
+            )
+            last_report = now
+    return {
+        "rows": rows,
+        "sha256": _canonical_file_content_rows_sha256(rows),
+    }
+
+
+def _file_content_identity_from_tar(
+    archive_path: str | Path,
+    *,
+    expected_members: Sequence[str],
+    phase: str,
+) -> dict[str, Any]:
+    expected = sorted(expected_members)
+    _validated_tar_members(archive_path, expected_members=expected)
+    rows: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    last_report = started
+    completed_bytes = 0
+    print(f"[{phase}] START files_total={len(expected)}", flush=True)
+    with tarfile.open(archive_path, mode="r:") as archive:
+        members = {member.name: member for member in archive.getmembers()}
+        for index, name in enumerate(expected, start=1):
+            member = members[name]
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"regular tar member has no payload: {name}")
+            digest = hashlib.sha256()
+            size_bytes = 0
+            with source:
+                while True:
+                    chunk = source.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+                    now = time.perf_counter()
+                    if now - last_report >= 60:
+                        elapsed = now - started
+                        print(
+                            f"[{phase}] files={index - 1}/{len(expected)} "
+                            f"bytes={completed_bytes + size_bytes} "
+                            f"elapsed={elapsed:.1f}s current_file={name}",
+                            flush=True,
+                        )
+                        last_report = now
+            if size_bytes != member.size:
+                raise ValueError(
+                    f"tar member byte count mismatch for {name}: "
+                    f"{size_bytes} != {member.size}"
+                )
+            rows.append(
+                {
+                    "path": name,
+                    "size_bytes": size_bytes,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+            completed_bytes += size_bytes
+            now = time.perf_counter()
+            if (
+                index % 250 == 0
+                or index == len(expected)
+                or now - last_report >= 60
+            ):
+                elapsed = now - started
+                rate = index / elapsed if elapsed > 0 else float("inf")
+                eta = (
+                    (len(expected) - index) / rate
+                    if rate > 0 else float("inf")
+                )
+                print(
+                    f"[{phase}] files={index}/{len(expected)} "
+                    f"bytes={completed_bytes} elapsed={elapsed:.1f}s "
+                    f"rate={rate:.1f}files/s eta={eta:.1f}s "
+                    f"current_file={name}",
+                    flush=True,
+                )
+                last_report = now
+    return {
+        "rows": rows,
+        "sha256": _canonical_file_content_rows_sha256(rows),
+    }
+
+
+def validation_source_inventory(
+    shared_data_root: str | Path,
+    *,
+    expected_train_rows: int = EXPECTED_SPLIT_COUNTS["train"],
+    expected_val_rows: int = EXPECTED_SPLIT_COUNTS["val"],
+    expected_unique_images: int = EXPECTED_VALIDATION_IMAGE_COUNT,
+) -> dict[str, Any]:
+    """Read only train/val allowlists and return their exact source inventory."""
+    shared_data_root = Path(shared_data_root).resolve(strict=True)
+    inventory_started = time.perf_counter()
+    print(
+        f"[validation-inventory] START source={shared_data_root}",
+        flush=True,
+    )
+    manifests_root = shared_data_root / "manifests"
+    manifest_paths = {
+        split: manifests_root / f"{split}.csv" for split in ("train", "val")
+    }
+    class_mapping_path = manifests_root / "class_to_idx.json"
+    for required in (*manifest_paths.values(), class_mapping_path):
+        if required.is_symlink() or not required.is_file():
+            raise FileNotFoundError(
+                f"required regular validation source file missing: {required}"
+            )
+
+    class_mapping = json.loads(class_mapping_path.read_text(encoding="utf-8"))
+    if class_mapping != EXPECTED_CLASS_TO_IDX:
+        raise ValueError(
+            f"class mapping mismatch: {class_mapping!r} != "
+            f"{EXPECTED_CLASS_TO_IDX!r}"
+        )
+
+    split_paths: dict[str, list[str]] = {}
+    image_sources: dict[str, Path] = {}
+    canonical_destinations: set[str] = set()
+    expected_rows = {
+        "train": int(expected_train_rows),
+        "val": int(expected_val_rows),
+    }
+    for split, manifest_path in manifest_paths.items():
+        rows: list[str] = []
+        split_started = time.perf_counter()
+        last_report = split_started
+        print(
+            f"[validation-inventory] scan={split} START manifest={manifest_path}",
+            flush=True,
+        )
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None or "image_path" not in reader.fieldnames:
+                raise ValueError(f"{manifest_path} is missing image_path")
+            for row_number, row in enumerate(reader, start=2):
+                relative = _canonical_manifest_image_path(row.get("image_path"))
+                destination_key = relative.casefold()
+                if destination_key in canonical_destinations:
+                    raise ValueError(
+                        f"duplicate validation archive destination at "
+                        f"{manifest_path}:{row_number}: {relative}"
+                    )
+                canonical_destinations.add(destination_key)
+                unresolved = shared_data_root / Path(*relative.split("/"))
+                if unresolved.is_symlink():
+                    raise ValueError(
+                        f"validation archive source may not be a symlink: {relative}"
+                    )
+                source = unresolved.resolve(strict=True)
+                try:
+                    source.relative_to(shared_data_root)
+                except ValueError as error:
+                    raise ValueError(
+                        f"validation archive source escapes shared root: {relative}"
+                    ) from error
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f"validation archive source is not a file: {source}"
+                    )
+                rows.append(relative)
+                image_sources[relative] = source
+                now = time.perf_counter()
+                if len(rows) % 250 == 0 or now - last_report >= 60:
+                    elapsed = now - split_started
+                    rate = len(rows) / elapsed if elapsed > 0 else float("inf")
+                    eta = (
+                        (expected_rows[split] - len(rows)) / rate
+                        if rate > 0 else float("inf")
+                    )
+                    print(
+                        f"[validation-inventory] scan={split} "
+                        f"rows={len(rows)}/{expected_rows[split]} "
+                        f"elapsed={elapsed:.1f}s rate={rate:.1f}files/s "
+                        f"eta={eta:.1f}s "
+                        f"current_file={relative}",
+                        flush=True,
+                    )
+                    last_report = now
+        if len(rows) != expected_rows[split]:
+            raise ValueError(
+                f"{split} manifest row count mismatch: "
+                f"{len(rows)} != {expected_rows[split]}"
+            )
+        split_paths[split] = rows
+        print(
+            f"[validation-inventory] scan={split} COMPLETE "
+            f"rows={len(rows)} elapsed={time.perf_counter() - split_started:.1f}s",
+            flush=True,
+        )
+
+    if len(image_sources) != int(expected_unique_images):
+        raise ValueError(
+            f"unique train/val image count mismatch: "
+            f"{len(image_sources)} != {expected_unique_images}"
+        )
+    member_sources = {
+        "manifests/train.csv": manifest_paths["train"],
+        "manifests/val.csv": manifest_paths["val"],
+        "manifests/class_to_idx.json": class_mapping_path,
+        **image_sources,
+    }
+    member_names = sorted(member_sources)
+    file_content_identity = _file_content_identity_from_sources(
+        member_sources,
+        phase="validation-inventory-content",
+    )
+    inventory = {
+        "shared_data_root": shared_data_root,
+        "manifest_paths": manifest_paths,
+        "class_mapping_path": class_mapping_path,
+        "class_mapping": class_mapping,
+        "split_relative_paths": split_paths,
+        "image_sources": image_sources,
+        "member_sources": member_sources,
+        "member_names": member_names,
+        "file_content_identity": file_content_identity,
+        "train_rows": len(split_paths["train"]),
+        "val_rows": len(split_paths["val"]),
+        "unique_images": len(image_sources),
+        "manifest_sha256": {
+            split: sha256_file(path)
+            for split, path in manifest_paths.items()
+        },
+        "class_mapping_sha256": sha256_file(class_mapping_path),
+        "canonical_sorted_member_list_sha256": _sorted_string_sha256(
+            member_names
+        ),
+        "exact_relative_file_set_identity": _sorted_string_sha256(
+            list(image_sources)
+        ),
+        "test_manifest_included": False,
+        "whole_data_copy_used": False,
+    }
+    print(
+        f"[validation-inventory] COMPLETE images={len(image_sources)} "
+        f"elapsed={time.perf_counter() - inventory_started:.1f}s",
+        flush=True,
+    )
+    return inventory
+
+
+def stage_train_smoke_sample(
+    shared_data_root: str | Path,
+    sample_directory: str | Path,
+    *,
+    count: int = 4,
+) -> dict[str, Any]:
+    """Deterministically copy only fixed train-manifest images for GPU smoke."""
+    shared_data_root = Path(shared_data_root).resolve(strict=True)
+    sample_directory = Path(sample_directory)
+    if sample_directory.exists():
+        raise FileExistsError(f"smoke sample directory already exists: {sample_directory}")
+    train_manifest = shared_data_root / "manifests" / "train.csv"
+    if train_manifest.is_symlink() or not train_manifest.is_file():
+        raise FileNotFoundError(f"train manifest missing: {train_manifest}")
+    relative_paths: list[str] = []
+    with train_manifest.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "image_path" not in reader.fieldnames:
+            raise ValueError(f"{train_manifest} is missing image_path")
+        for row in reader:
+            relative_paths.append(
+                _canonical_manifest_image_path(row.get("image_path"))
+            )
+    selected = sorted(set(relative_paths))[: int(count)]
+    if len(selected) != int(count):
+        raise ValueError(
+            f"train manifest has only {len(selected)} unique images; "
+            f"{count} required"
+        )
+    sample_directory.mkdir()
+    try:
+        for index, relative in enumerate(selected, start=1):
+            unresolved = shared_data_root / Path(*relative.split("/"))
+            if unresolved.is_symlink():
+                raise ValueError(f"smoke sample source may not be a symlink: {relative}")
+            source = unresolved.resolve(strict=True)
+            source.relative_to(shared_data_root)
+            if not source.is_file():
+                raise FileNotFoundError(f"smoke sample source is not a file: {source}")
+            destination = sample_directory / Path(*relative.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            print(
+                f"[gpu-smoke-sample] copied={index}/{count} "
+                f"source_manifest=train.csv relative_path={relative}",
+                flush=True,
+            )
+    except Exception:
+        shutil.rmtree(sample_directory, ignore_errors=True)
+        raise
+    return {
+        "source_manifest": "manifests/train.csv",
+        "relative_paths": selected,
+        "sample_count": len(selected),
+        "test_manifest_read": False,
+        "whole_data_copy_used": False,
+    }
+
+
+def _validated_tar_members(
+    archive_path: str | Path,
+    *,
+    expected_members: Sequence[str] | None = None,
+) -> list[tarfile.TarInfo]:
+    archive_path = Path(archive_path)
+    seen: set[str] = set()
+    validated: list[tarfile.TarInfo] = []
+    with tarfile.open(archive_path, mode="r:") as archive:
+        for member in archive.getmembers():
+            canonical = _canonical_manifest_image_path(member.name)
+            key = canonical.casefold()
+            if key in seen:
+                raise ValueError(
+                    f"duplicate canonical tar member path: {canonical}"
+                )
+            seen.add(key)
+            if member.name != canonical:
+                raise ValueError(f"non-canonical tar member path: {member.name!r}")
+            if not member.isreg():
+                raise ValueError(
+                    f"tar member must be a regular file: {member.name} "
+                    f"type={member.type!r}"
+                )
+            validated.append(member)
+    if expected_members is not None:
+        expected = sorted(expected_members)
+        actual = sorted(member.name for member in validated)
+        if actual != expected:
+            raise ValueError(
+                "validation archive member allowlist mismatch: "
+                f"missing={sorted(set(expected) - set(actual))[:10]} "
+                f"extra={sorted(set(actual) - set(expected))[:10]}"
+            )
+    return validated
+
+
+def _safe_extract_validation_archive(
+    archive_path: str | Path,
+    destination: str | Path,
+    *,
+    expected_members: Sequence[str],
+    phase: str = "archive-extract",
+) -> None:
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f"archive extraction destination exists: {destination}")
+    members = _validated_tar_members(
+        archive_path, expected_members=expected_members
+    )
+    destination.mkdir()
+    started = time.perf_counter()
+    last_report = started
+    extracted_bytes = 0
+    print(
+        f"[{phase}] START members_total={len(members)}",
+        flush=True,
+    )
+    with tarfile.open(archive_path, mode="r:") as archive:
+        for index, member in enumerate(members, start=1):
+            target = destination / Path(*member.name.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"regular tar member has no payload: {member.name}")
+            with source, target.open("xb") as handle:
+                shutil.copyfileobj(source, handle, length=8 * 1024 * 1024)
+            extracted_bytes += member.size
+            now = time.perf_counter()
+            if index % 250 == 0 or index == len(members) or now - last_report >= 60:
+                elapsed = now - started
+                rate = index / elapsed if elapsed > 0 else float("inf")
+                eta = (
+                    (len(members) - index) / rate
+                    if rate > 0 else float("inf")
+                )
+                print(
+                    f"[{phase}] members={index}/{len(members)} "
+                    f"bytes={extracted_bytes} elapsed={elapsed:.1f}s "
+                    f"rate={rate:.1f}files/s eta={eta:.1f}s "
+                    f"current_file={member.name}",
+                    flush=True,
+                )
+                last_report = now
+
+
+def _copy_file_with_progress(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    phase: str,
+) -> None:
+    source = Path(source)
+    destination = Path(destination)
+    total = source.stat().st_size
+    copied = 0
+    started = time.perf_counter()
+    last_report = started
+    print(
+        f"[{phase}] START file={source.name} bytes_total={total}",
+        flush=True,
+    )
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        while True:
+            chunk = reader.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            writer.write(chunk)
+            copied += len(chunk)
+            now = time.perf_counter()
+            if copied == total or now - last_report >= 60:
+                elapsed = now - started
+                rate = copied / elapsed if elapsed > 0 else float("inf")
+                eta = (total - copied) / rate if rate > 0 else float("inf")
+                print(
+                    f"[{phase}] bytes={copied}/{total} elapsed={elapsed:.1f}s "
+                    f"rate={rate:.1f}B/s eta={eta:.1f}s file={source.name}",
+                    flush=True,
+                )
+                last_report = now
+        writer.flush()
+        os.fsync(writer.fileno())
+    if copied != total:
+        raise ValueError(f"{phase} byte count mismatch: {copied} != {total}")
+
+
+def _validate_extracted_validation_data(
+    extracted_root: str | Path,
+    identity: Mapping[str, Any],
+    *,
+    approved_file_content_identity_sha256: str,
+) -> dict[str, Any]:
+    approved = require_approved_content_identity(
+        approved_file_content_identity_sha256
+    )
+    inventory = validation_source_inventory(
+        extracted_root,
+        expected_train_rows=int(identity["train_rows"]),
+        expected_val_rows=int(identity["val_rows"]),
+        expected_unique_images=int(identity["unique_images"]),
+    )
+    actual_files = sorted(
+        path.relative_to(extracted_root).as_posix()
+        for path in Path(extracted_root).rglob("*")
+        if path.is_file()
+    )
+    if actual_files != inventory["member_names"]:
+        raise ValueError("extracted validation archive contains an unexpected file set")
+    comparisons = {
+        "canonical_sorted_member_list_sha256":
+            inventory["canonical_sorted_member_list_sha256"],
+        "train_manifest_sha256": inventory["manifest_sha256"]["train"],
+        "val_manifest_sha256": inventory["manifest_sha256"]["val"],
+        "class_mapping_sha256": inventory["class_mapping_sha256"],
+        "exact_relative_file_set_identity":
+            inventory["exact_relative_file_set_identity"],
+        "file_content_identity_sha256":
+            inventory["file_content_identity"]["sha256"],
+        "file_content_rows": inventory["file_content_identity"]["rows"],
+    }
+    for key, actual in comparisons.items():
+        if actual != identity[key]:
+            raise ValueError(f"extracted validation archive {key} mismatch")
+    # Witness C: the extracted tree, judged against the approved constant as
+    # well, so a tar/identity/READY rewritten together cannot certify itself.
+    _require_content_identity_matches_approved(
+        inventory["file_content_identity"],
+        approved,
+        witness="extracted validation archive tree",
+    )
+    return inventory
+
+
+def build_validation_archive_cache(
+    shared_data_root: str | Path,
+    cache_directory: str | Path,
+    runtime_temporary_root: str | Path,
+    *,
+    expected_file_content_identity_sha256: str,
+    source_fixed_split_identity: str,
+    expected_train_rows: int = EXPECTED_SPLIT_COUNTS["train"],
+    expected_val_rows: int = EXPECTED_SPLIT_COUNTS["val"],
+    expected_unique_images: int = EXPECTED_VALIDATION_IMAGE_COUNT,
+) -> dict[str, Any]:
+    """Build and verify one immutable train/val-only tar, then write READY last."""
+    approved_content_sha256 = require_approved_content_identity(
+        expected_file_content_identity_sha256
+    )
+    cache_directory = Path(cache_directory)
+    runtime_temporary_root = Path(runtime_temporary_root).resolve(strict=True)
+    if cache_directory.exists():
+        raise FileExistsError(
+            f"refusing to overwrite existing validation archive cache: "
+            f"{cache_directory}"
+        )
+    if not cache_directory.parent.is_dir():
+        raise FileNotFoundError(
+            f"validation archive cache parent is missing: {cache_directory.parent}"
+        )
+    inventory = validation_source_inventory(
+        shared_data_root,
+        expected_train_rows=expected_train_rows,
+        expected_val_rows=expected_val_rows,
+        expected_unique_images=expected_unique_images,
+    )
+    # Witness A: the source tree itself, before a tar exists to be tampered with.
+    _require_content_identity_matches_approved(
+        inventory["file_content_identity"],
+        approved_content_sha256,
+        witness="validation source",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix=".panderm-validation-archive.",
+        dir=runtime_temporary_root,
+    ) as temporary:
+        temporary_root = Path(temporary)
+        temporary_archive = temporary_root / VALIDATION_ARCHIVE_FILENAME
+        started = time.perf_counter()
+        last_report = started
+        total = len(inventory["member_names"])
+        source_bytes_completed = 0
+        print(
+            f"[archive-build] START files_total={total} "
+            f"images_total={inventory['unique_images']}",
+            flush=True,
+        )
+        with tarfile.open(temporary_archive, mode="w") as archive:
+            for index, member_name in enumerate(
+                inventory["member_names"], start=1
+            ):
+                source = inventory["member_sources"][member_name]
+                info = tarfile.TarInfo(member_name)
+                info.size = source.stat().st_size
+                info.mode = 0o644
+                info.mtime = 0
+                with source.open("rb") as handle:
+                    archive.addfile(info, handle)
+                source_bytes_completed += info.size
+                now = time.perf_counter()
+                if index % 250 == 0 or index == total or now - last_report >= 60:
+                    elapsed = now - started
+                    rate = index / elapsed if elapsed > 0 else float("inf")
+                    eta = (total - index) / rate if rate > 0 else float("inf")
+                    print(
+                        f"[archive-build] files={index}/{total} "
+                        f"source_bytes={source_bytes_completed} "
+                        f"tar_stream_bytes={archive.fileobj.tell()} "
+                        f"elapsed={elapsed:.1f}s rate={rate:.1f}files/s "
+                        f"eta={eta:.1f}s current_file={member_name}",
+                        flush=True,
+                    )
+                    last_report = now
+        tar_file_content_identity = _file_content_identity_from_tar(
+            temporary_archive,
+            expected_members=inventory["member_names"],
+            phase="archive-build-content",
+        )
+        if tar_file_content_identity != inventory["file_content_identity"]:
+            raise ValueError(
+                "validation archive source and reopened tar content mismatch"
+            )
+        # Witness B: the reopened tar, judged against the approved constant too,
+        # not merely against the inventory it was built from.
+        _require_content_identity_matches_approved(
+            tar_file_content_identity,
+            approved_content_sha256,
+            witness="reopened validation archive tar",
+        )
+        extracted = temporary_root / "extracted"
+        _safe_extract_validation_archive(
+            temporary_archive,
+            extracted,
+            expected_members=inventory["member_names"],
+            phase="archive-build-extract",
+        )
+        archive_sha256 = sha256_file(temporary_archive)
+        identity = {
+            "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
+            "cache_format_identity": VALIDATION_ARCHIVE_CACHE_FORMAT,
+            "archive_filename": VALIDATION_ARCHIVE_FILENAME,
+            "archive_sha256": archive_sha256,
+            "byte_size": temporary_archive.stat().st_size,
+            "tar_member_count": len(inventory["member_names"]),
+            "canonical_sorted_member_list_sha256":
+                inventory["canonical_sorted_member_list_sha256"],
+            "train_manifest_sha256": inventory["manifest_sha256"]["train"],
+            "val_manifest_sha256": inventory["manifest_sha256"]["val"],
+            "class_mapping_sha256": inventory["class_mapping_sha256"],
+            "train_rows": inventory["train_rows"],
+            "val_rows": inventory["val_rows"],
+            "unique_images": inventory["unique_images"],
+            "exact_relative_file_set_identity":
+                inventory["exact_relative_file_set_identity"],
+            "file_content_identity_sha256":
+                inventory["file_content_identity"]["sha256"],
+            "file_content_rows": inventory["file_content_identity"]["rows"],
+            "test_manifest_included": False,
+            "whole_data_copy_used": False,
+            "source_fixed_split_identity": source_fixed_split_identity,
+            "created_utc": utc_now(),
+        }
+        _validate_extracted_validation_data(
+            extracted,
+            identity,
+            approved_file_content_identity_sha256=approved_content_sha256,
+        )
+        cache_directory.mkdir()
+        cached_archive = cache_directory / VALIDATION_ARCHIVE_FILENAME
+        _copy_file_with_progress(
+            temporary_archive, cached_archive, phase="archive-publish"
+        )
+        if sha256_file(cached_archive) != archive_sha256:
+            raise ValueError("published validation archive SHA-256 mismatch")
+        identity_path = cache_directory / VALIDATION_ARCHIVE_IDENTITY_FILENAME
+        write_json_atomic(identity_path, identity)
+        ready = {
+            "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
+            "cache_format_identity": VALIDATION_ARCHIVE_CACHE_FORMAT,
+            "archive_filename": VALIDATION_ARCHIVE_FILENAME,
+            "archive_sha256": archive_sha256,
+            "file_content_identity_sha256":
+                identity["file_content_identity_sha256"],
+            "archive_identity_sha256": _canonical_mapping_sha256(identity),
+        }
+        write_json_atomic(
+            cache_directory / VALIDATION_ARCHIVE_READY_FILENAME, ready
+        )
+    return identity
+
+
+def validate_validation_archive_cache(
+    cache_directory: str | Path,
+    *,
+    expected_file_content_identity_sha256: str,
+    expected_fixed_split_identity: str,
+    expected_manifest_sha256: Mapping[str, str],
+    expected_class_mapping_sha256: str,
+) -> dict[str, Any]:
+    """Fail loud on any incomplete, drifted, or tampered durable cache."""
+    approved_content_sha256 = require_approved_content_identity(
+        expected_file_content_identity_sha256
+    )
+    cache_directory = Path(cache_directory)
+    ready_path = cache_directory / VALIDATION_ARCHIVE_READY_FILENAME
+    identity_path = cache_directory / VALIDATION_ARCHIVE_IDENTITY_FILENAME
+    archive_path = cache_directory / VALIDATION_ARCHIVE_FILENAME
+    for required in (ready_path, identity_path, archive_path):
+        if not required.is_file():
+            raise FileNotFoundError(
+                f"validation archive cache is incomplete; inspect manually: {required}"
+            )
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    required_identity = {
+        "schema_version", "cache_format_identity", "archive_filename",
+        "archive_sha256", "byte_size", "tar_member_count",
+        "canonical_sorted_member_list_sha256", "train_manifest_sha256",
+        "val_manifest_sha256", "class_mapping_sha256", "train_rows",
+        "val_rows", "unique_images", "exact_relative_file_set_identity",
+        "file_content_identity_sha256", "file_content_rows",
+        "test_manifest_included", "whole_data_copy_used",
+        "source_fixed_split_identity", "created_utc",
+    }
+    if not isinstance(identity, dict) or set(identity) != required_identity:
+        raise ValueError("validation archive identity schema mismatch")
+    expected_ready = {
+        "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
+        "cache_format_identity": VALIDATION_ARCHIVE_CACHE_FORMAT,
+        "archive_filename": VALIDATION_ARCHIVE_FILENAME,
+        "archive_sha256": identity["archive_sha256"],
+        "file_content_identity_sha256":
+            identity["file_content_identity_sha256"],
+        "archive_identity_sha256": _canonical_mapping_sha256(identity),
+    }
+    if ready != expected_ready:
+        raise ValueError("validation archive READY identity mismatch")
+    if (
+        identity["schema_version"] != VALIDATION_ARCHIVE_SCHEMA_VERSION
+        or identity["cache_format_identity"] != VALIDATION_ARCHIVE_CACHE_FORMAT
+        or identity["archive_filename"] != VALIDATION_ARCHIVE_FILENAME
+        or identity["test_manifest_included"] is not False
+        or identity["whole_data_copy_used"] is not False
+    ):
+        raise ValueError("validation archive immutable identity mismatch")
+    if identity["source_fixed_split_identity"] != expected_fixed_split_identity:
+        raise ValueError("validation archive fixed split identity mismatch")
+    if set(expected_manifest_sha256) != {"train", "val"}:
+        raise ValueError("expected archive manifests must be exactly train/val")
+    for split in ("train", "val"):
+        if identity[f"{split}_manifest_sha256"] != expected_manifest_sha256[split]:
+            raise ValueError(f"validation archive {split} manifest hash mismatch")
+    if identity["class_mapping_sha256"] != expected_class_mapping_sha256:
+        raise ValueError("validation archive class mapping hash mismatch")
+    if (
+        _canonical_file_content_rows_sha256(identity["file_content_rows"])
+        != identity["file_content_identity_sha256"]
+    ):
+        raise ValueError("validation archive file content identity mismatch")
+    # Persisted per-file rows must re-canonicalize to the *approved* aggregate,
+    # not merely to the aggregate stored beside them.
+    _require_content_identity_matches_approved(
+        {
+            "rows": identity["file_content_rows"],
+            "sha256": identity["file_content_identity_sha256"],
+        },
+        approved_content_sha256,
+        witness="persisted validation archive identity",
+    )
+    if archive_path.stat().st_size != identity["byte_size"]:
+        raise ValueError("validation archive byte size mismatch")
+    if sha256_file(archive_path) != identity["archive_sha256"]:
+        raise ValueError("validation archive SHA-256 mismatch")
+    members = _validated_tar_members(archive_path)
+    member_names = sorted(member.name for member in members)
+    if len(member_names) != identity["tar_member_count"]:
+        raise ValueError("validation archive tar member count mismatch")
+    if (
+        _sorted_string_sha256(member_names)
+        != identity["canonical_sorted_member_list_sha256"]
+    ):
+        raise ValueError("validation archive member-list hash mismatch")
+    tar_file_content_identity = _file_content_identity_from_tar(
+        archive_path,
+        expected_members=member_names,
+        phase="archive-cache-content",
+    )
+    if tar_file_content_identity != {
+        "rows": identity["file_content_rows"],
+        "sha256": identity["file_content_identity_sha256"],
+    }:
+        raise ValueError("validation archive file content mismatch")
+    # Witness B against the independent anchor: a tar, its rows, its aggregate,
+    # its archive SHA-256 and READY rewritten consistently still fail here.
+    _require_content_identity_matches_approved(
+        tar_file_content_identity,
+        approved_content_sha256,
+        witness="reopened validation archive tar",
+    )
+    return identity
+
+
+def reuse_validation_archive_cache(
+    cache_directory: str | Path,
+    runtime_temporary_root: str | Path,
+    local_data_root: str | Path,
+    *,
+    expected_file_content_identity_sha256: str,
+    expected_fixed_split_identity: str,
+    expected_manifest_sha256: Mapping[str, str],
+    expected_class_mapping_sha256: str,
+) -> dict[str, Any]:
+    """Copy one verified tar to runtime, safely extract, then publish atomically."""
+    approved_content_sha256 = require_approved_content_identity(
+        expected_file_content_identity_sha256
+    )
+    runtime_temporary_root = Path(runtime_temporary_root).resolve(strict=True)
+    local_data_root = Path(local_data_root)
+    if local_data_root.exists():
+        raise FileExistsError(f"local validation data already exists: {local_data_root}")
+    if local_data_root.parent.resolve(strict=True) != runtime_temporary_root:
+        raise ValueError(
+            "local validation data must be a direct child of runtime temporary root"
+        )
+    identity = validate_validation_archive_cache(
+        cache_directory,
+        expected_file_content_identity_sha256=approved_content_sha256,
+        expected_fixed_split_identity=expected_fixed_split_identity,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_class_mapping_sha256=expected_class_mapping_sha256,
+    )
+    source_archive = Path(cache_directory) / VALIDATION_ARCHIVE_FILENAME
+    with tempfile.TemporaryDirectory(
+        prefix=".panderm-validation-reuse.",
+        dir=runtime_temporary_root,
+    ) as temporary:
+        temporary_root = Path(temporary)
+        runtime_archive = temporary_root / VALIDATION_ARCHIVE_FILENAME
+        _copy_file_with_progress(
+            source_archive, runtime_archive, phase="archive-runtime-copy"
+        )
+        if sha256_file(runtime_archive) != identity["archive_sha256"]:
+            raise ValueError("runtime validation archive SHA-256 mismatch")
+        members = _validated_tar_members(runtime_archive)
+        member_names = sorted(member.name for member in members)
+        extracted = temporary_root / "extracted"
+        _safe_extract_validation_archive(
+            runtime_archive,
+            extracted,
+            expected_members=member_names,
+            phase="archive-reuse-extract",
+        )
+        inventory = _validate_extracted_validation_data(
+            extracted,
+            identity,
+            approved_file_content_identity_sha256=approved_content_sha256,
+        )
+        os.replace(extracted, local_data_root)
+    return {
+        "archive_files_copied": 1,
+        "approved_file_content_identity_sha256": approved_content_sha256,
+        "images_staged": inventory["unique_images"],
+        "manifest_files_staged": 2,
+        "class_mapping_files_staged": 1,
+        "archive_sha256": identity["archive_sha256"],
+        "image_set_exact": True,
+        "test_manifest_present": False,
+        "whole_data_copy_used": False,
+    }
+
+
+def stage_after_validation_preflights(
+    *,
+    checkpoint_preflight: Mapping[str, Any],
+    gpu_smoke: Mapping[str, Any],
+    staging: Callable[[], Any],
+) -> Any:
+    """Make full staging unreachable until both fast production gates pass."""
+    if checkpoint_preflight.get("weights_only_round_trip") is not True:
+        raise RuntimeError(
+            "validation preflight failed before full staging: "
+            "checkpoint serialization round-trip"
+        )
+    required_smoke = {
+        "official_preprocessing",
+        "official_checkpoint_loaded",
+        "cuda_forward",
+        "backward",
+        "all_12_blocks_have_gradients",
+        "head_has_gradients",
+        "fixed_pos_embed_has_no_gradient",
+        "optimizer_coverage",
+        "optimizer_step",
+        "backbone_updated",
+        "post_step_checkpoint_round_trip",
+        "smoke_model_discarded",
+    }
+    failed = sorted(key for key in required_smoke if gpu_smoke.get(key) is not True)
+    if failed:
+        raise RuntimeError(
+            f"validation preflight failed before full staging: gpu smoke {failed}"
+        )
+    return staging()
 
 
 def stage_validation_data(
@@ -621,6 +1657,35 @@ def require_provenance_clearance(
     }
 
 
+def require_primitive_identity(value: Any, path: str = "run_identity") -> None:
+    """Require exact JSON primitives so weights-only checkpoint loads stay safe."""
+    value_type = type(value)
+    if value is None or value_type in {str, int, bool}:
+        return
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite float")
+        return
+    if value_type is list:
+        for index, item in enumerate(value):
+            require_primitive_identity(item, f"{path}[{index}]")
+        return
+    if value_type is tuple:
+        for index, item in enumerate(value):
+            require_primitive_identity(item, f"{path}[{index}]")
+        return
+    if value_type is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError(f"{path} contains a non-string mapping key")
+            require_primitive_identity(item, f"{path}.{key}")
+        return
+    raise ValueError(
+        f"{path} contains non-primitive {value_type.__module__}."
+        f"{value_type.__qualname__}"
+    )
+
+
 def build_run_identity(
     *,
     git_commit: str | None,
@@ -680,7 +1745,7 @@ def build_run_identity(
         raise ValueError("PanDerm CUDA validation requires effective AMP")
     if device_type != "cuda" and amp_effective is not False:
         raise ValueError("PanDerm non-CUDA validation cannot claim effective AMP")
-    return {
+    identity = {
         "schema_version": 1,
         "git_commit": git_commit,
         "run_version": run_version,
@@ -740,6 +1805,8 @@ def build_run_identity(
         "contamination_review": dict(CONTAMINATION_REVIEW),
         "claim_boundary": CLAIM_BOUNDARY,
     }
+    require_primitive_identity(identity)
+    return identity
 
 
 def require_matching_identity(
@@ -890,6 +1957,168 @@ def require_shared_root_sentinel_identity(
             f"saved={stored_path!r} current={str(current_root)!r}"
         )
     return shared_root_uuid
+
+
+VALIDATION_RUN_LOCK_FILENAME = "validation_run.lock.json"
+VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION = "CLEAR STALE PANDERM VALIDATION LOCK"
+VALIDATION_RUN_LOCK_FIELDS = (
+    "schema_version",
+    "session_id",
+    "run_version",
+    "git_commit",
+    "shared_root_uuid",
+    "evaluation_scope",
+    "account_label",
+    "hostname",
+    "acquired_utc",
+)
+
+
+def validation_run_lock_path(
+    shared_run_root: str | Path, *, run_version: str = RUN_VERSION
+) -> Path:
+    """The one durable lock for a run version.
+
+    Deliberately fixed per run version and *outside* any timestamped attempt
+    directory: a lock that lived inside ``validation_runs/<timestamp>/`` would be
+    a different path for every attempt, so two accounts would each create their
+    own and never collide.
+    """
+    return Path(shared_run_root) / run_version / VALIDATION_RUN_LOCK_FILENAME
+
+
+def _read_validation_run_lock(lock_path: str | Path) -> dict[str, Any]:
+    marker = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+    if not isinstance(marker, dict) or set(marker) != set(VALIDATION_RUN_LOCK_FIELDS):
+        raise ValueError(
+            f"validation run lock schema mismatch at {lock_path}; inspect manually"
+        )
+    for field in VALIDATION_RUN_LOCK_FIELDS:
+        if field == "schema_version":
+            if type(marker[field]) is not int:
+                raise ValueError("validation run lock schema_version must be int")
+            continue
+        if type(marker[field]) is not str or not marker[field]:
+            raise ValueError(f"validation run lock {field} must be a non-empty string")
+    return marker
+
+
+def acquire_validation_run_lock(
+    lock_path: str | Path,
+    *,
+    session_id: str,
+    run_version: str,
+    git_commit: str,
+    shared_root_uuid: str,
+    account_label: str,
+    evaluation_scope: str = VALIDATION_ONLY,
+) -> dict[str, Any]:
+    """Atomically take the single validation run lock, or fail loud.
+
+    Acquisition is a single exclusive create (``open("x")`` inside
+    ``create_running_marker``), never ``exists()`` then write: two accounts that
+    both see "no attempt yet" must not both proceed. The marker is re-read after
+    creation so a caller only continues if it still owns the lock it just took.
+    """
+    if evaluation_scope != VALIDATION_ONLY:
+        raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
+    try:
+        uuid.UUID(str(session_id))
+    except ValueError as error:
+        raise ValueError("validation run lock session_id must be a UUID") from error
+    lock_path = Path(lock_path)
+    if not lock_path.parent.is_dir():
+        raise FileNotFoundError(
+            f"validation run lock directory is missing: {lock_path.parent}"
+        )
+    marker = {
+        "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
+        "session_id": str(session_id),
+        "run_version": str(run_version),
+        "git_commit": str(git_commit),
+        "shared_root_uuid": str(shared_root_uuid),
+        "evaluation_scope": evaluation_scope,
+        "account_label": str(account_label),
+        "hostname": socket.gethostname(),
+        "acquired_utc": utc_now(),
+    }
+    try:
+        create_running_marker(lock_path, marker)
+    except FileExistsError as error:
+        try:
+            holder = _read_validation_run_lock(lock_path)
+            detail = (
+                f"session_id={holder['session_id']} "
+                f"account_label={holder['account_label']} "
+                f"hostname={holder['hostname']} "
+                f"acquired_utc={holder['acquired_utc']} "
+                f"run_version={holder['run_version']}"
+            )
+        except (OSError, ValueError) as read_error:
+            detail = f"existing lock could not be parsed: {read_error}"
+        raise FileExistsError(
+            "another PanDerm validation session already holds the run lock; "
+            "no staging, attempt or runner may start. Existing owner: "
+            f"{detail}. Lock: {lock_path}. If that runtime is definitely stopped, "
+            "clear it manually with clear_stale_validation_run_lock; Run all must "
+            "never clear it automatically."
+        ) from error
+    # Re-read: only continue while we still own what we just created.
+    observed = _read_validation_run_lock(lock_path)
+    if observed != marker:
+        raise ValueError(
+            "validation run lock changed between create and re-read; refusing to "
+            f"proceed. Lock: {lock_path}"
+        )
+    return observed
+
+
+def release_validation_run_lock(
+    lock_path: str | Path, *, session_id: str
+) -> dict[str, Any]:
+    """Release only a lock this session owns; a wrong owner never deletes it."""
+    lock_path = Path(lock_path)
+    if not lock_path.is_file():
+        raise FileNotFoundError(
+            f"validation run lock is not present to release: {lock_path}"
+        )
+    holder = _read_validation_run_lock(lock_path)
+    if holder["session_id"] != str(session_id):
+        raise PermissionError(
+            "refusing to release a validation run lock owned by another session: "
+            f"owner={holder['session_id']} caller={session_id} lock={lock_path}"
+        )
+    lock_path.unlink()
+    return holder
+
+
+def clear_stale_validation_run_lock(
+    lock_path: str | Path,
+    *,
+    stale_session_id: str,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Manual, human-confirmed recovery only.
+
+    Never called by Run all and never time-based: an abruptly killed runtime must
+    leave the lock behind so the next run fails loud, and the operator must first
+    confirm the old Colab runtime really is stopped. Switching account A/B/C is
+    not by itself a reason to clear.
+    """
+    lock_path = Path(lock_path)
+    if confirmation != VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION:
+        raise ValueError(
+            "stale validation run lock confirmation text did not match "
+            f"{VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION!r}"
+        )
+    holder = _read_validation_run_lock(lock_path)
+    if holder["session_id"] != str(stale_session_id):
+        raise PermissionError(
+            "stale validation run lock owner mismatch; refusing to clear: "
+            f"owner={holder['session_id']} supplied={stale_session_id}"
+        )
+    clear_stale_marker(lock_path, "CLEAR STALE MARKER")
+    return holder
 
 
 def probe_shared_drive(root: str | Path) -> dict[str, str]:

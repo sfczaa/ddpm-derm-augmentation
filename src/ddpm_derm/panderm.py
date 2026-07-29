@@ -788,7 +788,7 @@ def parameter_counts(model: nn.Module) -> tuple[int, int]:
 
 
 def dependency_versions() -> dict[str, Any]:
-    versions: dict[str, Any] = {"torch": torch.__version__}
+    versions: dict[str, Any] = {"torch": str(torch.__version__)}
     for package in ("timm", "torchvision"):
         try:
             versions[package] = version(package)
