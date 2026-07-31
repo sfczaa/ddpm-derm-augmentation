@@ -20,13 +20,15 @@ Example
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import random
+import re
+import shutil
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +47,7 @@ CHECKPOINT_INTEGRITY_KEYS = {
     "byte_size",
     "sha256",
     "epoch",
+    "global_step",
     "checkpoint_format",
     "run_identity_sha256",
 }
@@ -75,9 +78,17 @@ def _get_rng_state() -> dict:
     return state
 
 
-def _set_rng_state(state: dict) -> None:
+def _set_rng_state(state: dict, *, write_guard=None) -> None:
+    if write_guard is not None:
+        _require_durable_write_guard(
+            write_guard, "checkpoint resume Python RNG state"
+        )
     random.setstate(state["python"])
     numpy_state = state["numpy"]
+    if write_guard is not None:
+        _require_durable_write_guard(
+            write_guard, "checkpoint resume NumPy RNG state"
+        )
     np.random.set_state(
         (
             numpy_state["bit_generator"],
@@ -87,8 +98,16 @@ def _set_rng_state(state: dict) -> None:
             numpy_state["cached_gaussian"],
         )
     )
+    if write_guard is not None:
+        _require_durable_write_guard(
+            write_guard, "checkpoint resume Torch RNG state"
+        )
     torch.set_rng_state(state["torch"].cpu())
     if "cuda" in state and torch.cuda.is_available():
+        if write_guard is not None:
+            _require_durable_write_guard(
+                write_guard, "checkpoint resume CUDA RNG state"
+            )
         torch.cuda.set_rng_state_all([item.cpu() for item in state["cuda"]])
 
 
@@ -151,21 +170,23 @@ def checkpoint_integrity_path(path) -> Path:
 
 def _canonical_identity_sha256(run_identity) -> str:
     panderm_run.require_expected_identity_complete(run_identity)
-    encoded = json.dumps(
-        dict(run_identity),
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return panderm_run.canonical_identity_sha256(run_identity)
 
 
-def _write_integrity_sidecar_atomic(path, value) -> None:
+def _require_durable_write_guard(write_guard, phase):
+    if write_guard is None or not hasattr(write_guard, "require"):
+        raise ValueError("durable PanDerm writes require an active-session guard")
+    return write_guard.require(phase)
+
+
+def _write_integrity_sidecar_atomic(path, value, *, write_guard) -> None:
     path = Path(path)
     canonical = json.loads(json.dumps(dict(value), sort_keys=True))
     temporary: Path | None = None
     try:
+        _require_durable_write_guard(
+            write_guard, f"checkpoint integrity temporary write {path.name}"
+        )
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -183,6 +204,9 @@ def _write_integrity_sidecar_atomic(path, value) -> None:
         staged = json.loads(temporary.read_text(encoding="utf-8"))
         if staged != canonical:
             raise ValueError(f"checkpoint integrity sidecar staging failed: {path}")
+        _require_durable_write_guard(
+            write_guard, f"checkpoint integrity publish {path.name}"
+        )
         os.replace(temporary, path)
         temporary = None
         reopened = json.loads(path.read_text(encoding="utf-8"))
@@ -193,7 +217,7 @@ def _write_integrity_sidecar_atomic(path, value) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _build_checkpoint_integrity(path, *, epoch, run_identity) -> dict:
+def _build_checkpoint_integrity(path, *, epoch, global_step, run_identity) -> dict:
     path = Path(path)
     return {
         "schema_version": CHECKPOINT_INTEGRITY_SCHEMA_VERSION,
@@ -201,6 +225,7 @@ def _build_checkpoint_integrity(path, *, epoch, run_identity) -> dict:
         "byte_size": path.stat().st_size,
         "sha256": sha256_file(path),
         "epoch": int(epoch),
+        "global_step": int(global_step),
         "checkpoint_format": panderm_run.CHECKPOINT_FORMAT,
         "run_identity_sha256": _canonical_identity_sha256(run_identity),
     }
@@ -212,6 +237,31 @@ def checkpoint_integrity_record(path, *, expected_identity=None) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint is missing: {path}")
     sidecar_path = checkpoint_integrity_path(path)
+    if not sidecar_path.is_file():
+        raise FileNotFoundError(
+            f"checkpoint integrity sidecar is missing: {sidecar_path}"
+        )
+    return require_checkpoint_integrity_sidecar(
+        path,
+        sidecar_path,
+        expected_filename=path.name,
+        expected_identity=expected_identity,
+    )
+
+
+def require_checkpoint_integrity_sidecar(
+    path, sidecar_path, *, expected_filename, expected_identity=None
+) -> dict:
+    """The one authoritative sidecar validator for final and preserved bytes.
+
+    Preserved predecessors carry the final checkpoint's filename in their
+    sidecar, so recovery candidates are validated by exactly this code instead
+    of a weaker inline subset.
+    """
+    path = Path(path)
+    sidecar_path = Path(sidecar_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint is missing: {path}")
     if not sidecar_path.is_file():
         raise FileNotFoundError(
             f"checkpoint integrity sidecar is missing: {sidecar_path}"
@@ -228,7 +278,7 @@ def checkpoint_integrity_record(path, *, expected_identity=None) -> dict:
         )
     if record["schema_version"] != CHECKPOINT_INTEGRITY_SCHEMA_VERSION:
         raise ValueError("checkpoint integrity schema_version mismatch")
-    if record["checkpoint_filename"] != path.name:
+    if record["checkpoint_filename"] != expected_filename:
         raise ValueError("checkpoint integrity filename mismatch")
     if (
         not isinstance(record["byte_size"], int)
@@ -248,6 +298,12 @@ def checkpoint_integrity_record(path, *, expected_identity=None) -> dict:
         or record["epoch"] < 0
     ):
         raise ValueError("checkpoint integrity epoch is invalid")
+    if (
+        not isinstance(record["global_step"], int)
+        or isinstance(record["global_step"], bool)
+        or record["global_step"] < 0
+    ):
+        raise ValueError("checkpoint integrity global_step is invalid")
     if record["checkpoint_format"] != panderm_run.CHECKPOINT_FORMAT:
         raise ValueError("checkpoint integrity format mismatch")
     if not panderm_run.is_pinned_sha256(record["run_identity_sha256"]):
@@ -288,6 +344,7 @@ def build_checkpoint_payload(
         "scheduler_state_dict": schedule.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "epoch": epoch,
+        "global_step": int(schedule.step_count),
         "best_val_df_f1": best_val_f1,
         "history": history,
         "config": vars(args),
@@ -366,7 +423,7 @@ def checkpoint_serialization_preflight(
 
 def save_checkpoint(
     path, model, optimizer, schedule, scaler, epoch, best_val_f1, history,
-    args, run_identity, val_metrics=None,
+    args, run_identity, val_metrics=None, *, write_guard,
 ) -> None:
     """Same-directory atomic write with recursive exact reopen validation."""
     payload = build_checkpoint_payload(
@@ -386,26 +443,111 @@ def save_checkpoint(
         raise FileNotFoundError(
             f"prepared checkpoint directory disappeared: {path.parent}"
         )
-    temporary: Path | None = None
+    local_temporary: Path | None = None
+    shared_temporary: Path | None = None
+    previous_checkpoint: Path | None = None
+    previous_sidecar: Path | None = None
+    final_replaced = False
     try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.runtime.",
+            suffix=".pt",
+            delete=False,
+        ) as handle:
+            local_temporary = Path(handle.name)
+        torch.save(payload, local_temporary)
+        with local_temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        local_staged = _load_staged_checkpoint_for_save(
+            local_temporary, map_location="cpu"
+        )
+        validate_checkpoint_payload(local_staged, model, expected_payload=payload)
+
+        _require_durable_write_guard(
+            write_guard, f"checkpoint temporary write {path.name}"
+        )
         with tempfile.NamedTemporaryFile(
             prefix=f".{path.name}.",
             suffix=".tmp",
             dir=path.parent,
             delete=False,
         ) as handle:
-            temporary = Path(handle.name)
-        torch.save(payload, temporary)
-        with temporary.open("rb+") as handle:
+            shared_temporary = Path(handle.name)
+        with local_temporary.open("rb") as source, shared_temporary.open("wb") as target:
+            shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        if sha256_file(local_temporary) != sha256_file(shared_temporary):
+            raise ValueError("shared checkpoint staging copy hash mismatch")
+        with shared_temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
-        staged = _load_staged_checkpoint_for_save(temporary, map_location="cpu")
+        staged = _load_staged_checkpoint_for_save(shared_temporary, map_location="cpu")
         validate_checkpoint_payload(staged, model, expected_payload=payload)
-        os.replace(temporary, path)
-        temporary = None
-        sidecar = _build_checkpoint_integrity(
-            path, epoch=epoch, run_identity=run_identity
+        if path.exists():
+            existing = load_checkpoint_safe(
+                path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+            )
+            existing_position = (
+                int(existing["epoch"]),
+                int(existing["global_step"]),
+            )
+            new_position = (int(payload["epoch"]), int(payload["global_step"]))
+            if (
+                new_position[0] < existing_position[0]
+                or new_position[1] < existing_position[1]
+            ):
+                raise ValueError(
+                    "checkpoint rollback rejected: "
+                    f"existing={existing_position} new={new_position}"
+                )
+            if new_position == existing_position:
+                try:
+                    require_recursive_exact(payload, existing)
+                except ValueError as error:
+                    raise ValueError(
+                        "same-step checkpoint differs; refusing overwrite"
+                    ) from error
+                # The existing final bytes and sidecar are already the exact,
+                # reopened publication for this state.  Do not replace them
+                # with a serialization-equivalent retry.
+                return
+            _require_durable_write_guard(
+                write_guard, f"checkpoint preserve previous {path.name}"
+            )
+            previous_id = uuid.uuid4().hex
+            previous_checkpoint = path.parent / (
+                f".{path.name}.previous.{previous_id}.pt"
+            )
+            previous_sidecar = path.parent / (
+                f".{path.name}.previous.{previous_id}.integrity.json"
+            )
+            shutil.copy2(path, previous_checkpoint)
+            shutil.copy2(checkpoint_integrity_path(path), previous_sidecar)
+            if sha256_file(previous_checkpoint) != sha256_file(path):
+                raise ValueError("previous checkpoint preservation hash mismatch")
+            if (
+                previous_sidecar.read_bytes()
+                != checkpoint_integrity_path(path).read_bytes()
+            ):
+                raise ValueError("previous checkpoint sidecar preservation mismatch")
+        _require_durable_write_guard(
+            write_guard, f"checkpoint publish {path.name}"
         )
-        _write_integrity_sidecar_atomic(checkpoint_integrity_path(path), sidecar)
+        os.replace(shared_temporary, path)
+        shared_temporary = None
+        final_replaced = True
+        sidecar = _build_checkpoint_integrity(
+            path,
+            epoch=epoch,
+            global_step=payload["global_step"],
+            run_identity=run_identity,
+        )
+        _write_integrity_sidecar_atomic(
+            checkpoint_integrity_path(path), sidecar, write_guard=write_guard
+        )
         checkpoint_integrity_record(path, expected_identity=run_identity)
         reopened = load_checkpoint_safe(
             path,
@@ -414,9 +556,41 @@ def save_checkpoint(
             expected_identity=run_identity,
         )
         validate_checkpoint_payload(reopened, model, expected_payload=payload)
+        if previous_checkpoint is not None:
+            previous_checkpoint.unlink(missing_ok=True)
+            previous_checkpoint = None
+        if previous_sidecar is not None:
+            previous_sidecar.unlink(missing_ok=True)
+            previous_sidecar = None
+    except Exception:
+        if (
+            final_replaced
+            and previous_checkpoint is not None
+            and previous_sidecar is not None
+        ):
+            _require_durable_write_guard(
+                write_guard, f"checkpoint restore previous {path.name}"
+            )
+            os.replace(previous_checkpoint, path)
+            previous_checkpoint = None
+            os.replace(previous_sidecar, checkpoint_integrity_path(path))
+            previous_sidecar = None
+            load_checkpoint_safe(
+                path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+            )
+        raise
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if local_temporary is not None:
+            local_temporary.unlink(missing_ok=True)
+        if shared_temporary is not None:
+            shared_temporary.unlink(missing_ok=True)
+        if previous_checkpoint is not None:
+            previous_checkpoint.unlink(missing_ok=True)
+        if previous_sidecar is not None:
+            previous_sidecar.unlink(missing_ok=True)
 
 
 def load_checkpoint_safe(
@@ -436,6 +610,19 @@ def load_checkpoint_safe(
         and dict(expected_result_checkpoint) != record
     ):
         raise ValueError("result checkpoint integrity record mismatch")
+    return require_verified_checkpoint_payload(
+        path,
+        record,
+        map_location=map_location,
+        model=model,
+        expected_identity=expected_identity,
+    )
+
+
+def require_verified_checkpoint_payload(
+    path, record, *, map_location="cpu", model=None, expected_identity=None
+):
+    """Deserialize restricted bytes and require exact sidecar/payload agreement."""
     checkpoint = torch.load(path, map_location=map_location, weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint integrity payload is not a mapping")
@@ -443,6 +630,21 @@ def load_checkpoint_safe(
         raise ValueError("checkpoint integrity payload format mismatch")
     if checkpoint.get("epoch") != record["epoch"]:
         raise ValueError("checkpoint integrity payload epoch mismatch")
+    if checkpoint.get("global_step") != record["global_step"]:
+        raise ValueError("checkpoint integrity payload global_step mismatch")
+    history = checkpoint.get("history")
+    if (
+        not isinstance(history, list)
+        or len(history) != checkpoint["epoch"]
+        or (
+            history
+            and (
+                history[-1].get("epoch") != checkpoint["epoch"]
+                or history[-1].get("optimizer_steps") != checkpoint["global_step"]
+            )
+        )
+    ):
+        raise ValueError("checkpoint epoch/global_step/history mismatch")
     run_identity = checkpoint.get("run_identity")
     if not isinstance(run_identity, dict):
         raise ValueError("checkpoint integrity payload has no run identity")
@@ -452,6 +654,139 @@ def load_checkpoint_safe(
         panderm_run.require_matching_identity(run_identity, expected_identity)
     if model is not None:
         validate_checkpoint_payload(checkpoint, model)
+    return checkpoint
+
+
+def load_checkpoint_for_resume(
+    path,
+    *,
+    map_location,
+    model,
+    expected_identity,
+    write_guard,
+):
+    """Load the final pair or restore the newest preserved complete predecessor."""
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume before state load"
+    )
+    path = Path(path)
+    try:
+        checkpoint = load_checkpoint_safe(
+            path,
+            map_location=map_location,
+            model=model,
+            expected_identity=expected_identity,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError):
+        candidates = []
+        prefix = f".{path.name}.previous."
+        for backup in sorted(path.parent.glob(f"{prefix}*.pt")):
+            previous_id = backup.name[len(prefix) : -len(".pt")]
+            if not previous_id or not re.fullmatch(r"[0-9a-f]{32}", previous_id):
+                continue
+            sidecar = path.parent / (
+                f"{prefix}{previous_id}.integrity.json"
+            )
+            if not sidecar.is_file():
+                continue
+            try:
+                # The full production validator decides candidacy: exact keys,
+                # schema_version, SHA-256, byte size, run identity, epoch,
+                # global_step and history must all agree before this candidate
+                # is allowed to influence ranking at all.
+                record = require_checkpoint_integrity_sidecar(
+                    backup,
+                    sidecar,
+                    expected_filename=path.name,
+                    expected_identity=expected_identity,
+                )
+                payload = require_verified_checkpoint_payload(
+                    backup,
+                    record,
+                    map_location=map_location,
+                    model=model,
+                    expected_identity=expected_identity,
+                )
+            except (
+                FileNotFoundError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+                ValueError,
+                RuntimeError,
+            ):
+                continue
+            candidates.append(
+                (
+                    (record["epoch"], record["global_step"]),
+                    backup,
+                    sidecar,
+                    record,
+                    payload["history"],
+                )
+            )
+        if not candidates:
+            raise
+        # Deterministic canonical order: newest position first, then filename.
+        candidates.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        newest_position = candidates[0][0]
+        same_step = [item for item in candidates if item[0] == newest_position]
+        canonical_record = same_step[0][3]
+        canonical_history = same_step[0][4]
+        canonical_sha256 = canonical_record["sha256"]
+        # Every candidate at the newest position is compared, not only the first
+        # two, so a third or Nth divergent backup can never be ignored.
+        for _, other, _, other_record, other_history in same_step[1:]:
+            if (
+                other_record != canonical_record
+                or sha256_file(other) != canonical_sha256
+                or other.stat().st_size != canonical_record["byte_size"]
+                or other_history != canonical_history
+            ):
+                raise ValueError(
+                    "ambiguous preserved checkpoints at the same epoch/global_step: "
+                    f"{sorted(item[1].name for item in same_step)}"
+                )
+        _, backup, sidecar, _, _ = same_step[0]
+        _require_durable_write_guard(
+            write_guard, "checkpoint resume restore last complete predecessor"
+        )
+        checkpoint_temporary: Path | None = None
+        sidecar_temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{path.name}.recovery.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as handle:
+                checkpoint_temporary = Path(handle.name)
+            shutil.copy2(backup, checkpoint_temporary)
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{path.name}.recovery-sidecar.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as handle:
+                sidecar_temporary = Path(handle.name)
+            shutil.copy2(sidecar, sidecar_temporary)
+            os.replace(checkpoint_temporary, path)
+            checkpoint_temporary = None
+            os.replace(sidecar_temporary, checkpoint_integrity_path(path))
+            sidecar_temporary = None
+        finally:
+            if checkpoint_temporary is not None:
+                checkpoint_temporary.unlink(missing_ok=True)
+            if sidecar_temporary is not None:
+                sidecar_temporary.unlink(missing_ok=True)
+        checkpoint = load_checkpoint_safe(
+            path,
+            map_location=map_location,
+            model=model,
+            expected_identity=expected_identity,
+        )
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume after state load"
+    )
     return checkpoint
 
 
@@ -538,7 +873,7 @@ def validate_checkpoint_payload(checkpoint, model, expected_payload=None) -> Non
     required = {
         "checkpoint_schema_version", "checkpoint_format", "model_state_dict",
         "optimizer_state_dict", "scheduler_state_dict", "scaler_state_dict",
-        "epoch", "best_val_df_f1", "history", "config", "class_to_idx",
+        "epoch", "global_step", "best_val_df_f1", "history", "config", "class_to_idx",
         "rng_state", "run_identity",
     }
     missing = sorted(required - set(checkpoint))
@@ -546,6 +881,23 @@ def validate_checkpoint_payload(checkpoint, model, expected_payload=None) -> Non
         raise ValueError(f"PanDerm checkpoint fields missing: {missing}")
     if "head_state_dict" in checkpoint:
         raise ValueError("PanDerm checkpoints must store the full model, not a head")
+    if (
+        type(checkpoint["epoch"]) is not int
+        or checkpoint["epoch"] < 0
+        or type(checkpoint["global_step"]) is not int
+        or checkpoint["global_step"] < 0
+        or not isinstance(checkpoint["history"], list)
+        or len(checkpoint["history"]) != checkpoint["epoch"]
+        or (
+            checkpoint["history"]
+            and (
+                checkpoint["history"][-1].get("epoch") != checkpoint["epoch"]
+                or checkpoint["history"][-1].get("optimizer_steps")
+                != checkpoint["global_step"]
+            )
+        )
+    ):
+        raise ValueError("checkpoint epoch/global_step/history mismatch")
     saved_keys = set(checkpoint["model_state_dict"])
     expected_keys = set(model.state_dict())
     missing_keys = sorted(expected_keys - saved_keys)
@@ -567,12 +919,26 @@ def validate_checkpoint_payload(checkpoint, model, expected_payload=None) -> Non
         require_recursive_exact(expected_payload, checkpoint)
 
 
-def restore_checkpoint_state(checkpoint, model, optimizer, schedule, scaler):
+def restore_checkpoint_state(
+    checkpoint, model, optimizer, schedule, scaler, *, write_guard
+):
     """Load state only after the caller has verified immutable identity."""
     validate_checkpoint_payload(checkpoint, model)
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume model state"
+    )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume optimizer state"
+    )
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume scheduler state"
+    )
     schedule.load_state_dict(checkpoint["scheduler_state_dict"])
+    _require_durable_write_guard(
+        write_guard, "checkpoint resume scaler state"
+    )
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
     panderm.assert_full_trainability(model)
     return (
@@ -704,6 +1070,7 @@ def main(argv=None) -> None:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
+    write_guard = panderm_run.SequentialSessionWriteGuard.from_environment()
     set_seed(args.seed)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -731,6 +1098,7 @@ def main(argv=None) -> None:
         purpose=panderm_run.VALIDATION_ONLY,
     )
 
+    write_guard.require("durable output directory preparation")
     base_dir = _ensure_durable_directory(args.output_dir)
     checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
     results_root = _ensure_durable_directory(base_dir / "results")
@@ -814,6 +1182,7 @@ def main(argv=None) -> None:
         device_type=device.type,
         run_version=args.run_version,
     )
+    write_guard.bind_run_identity(run_identity)
     print(f"[run] arch={panderm.ARCH} variant={args.variant} seed={args.seed} "
           f"epochs={args.epochs} bs={args.batch_size} "
           f"accum={args.accumulation_steps} "
@@ -834,15 +1203,42 @@ def main(argv=None) -> None:
     last_path = ckpt_dir / "last.pt"
     best_path = ckpt_dir / "best.pt"
     out_path = results_dir / f"results_{args.variant}_seed{args.seed}.json"
+    progress_path = results_dir / f"progress_{args.variant}_seed{args.seed}.json"
     if args.resume and last_path.exists():
-        checkpoint = load_checkpoint_safe(
+        checkpoint = load_checkpoint_for_resume(
             last_path,
             map_location=device,
             model=model,
             expected_identity=run_identity,
+            write_guard=write_guard,
         )
         if checkpoint["epoch"] > args.epochs:
             raise ValueError("last.pt epoch exceeds the fixed validation budget")
+        if progress_path.exists():
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            panderm_run.require_matching_identity(
+                progress.get("run_identity"), run_identity
+            )
+            progress_position = (
+                progress.get("epoch"),
+                progress.get("global_step"),
+            )
+            checkpoint_position = (
+                checkpoint["epoch"],
+                checkpoint["global_step"],
+            )
+            if (
+                not all(type(value) is int for value in progress_position)
+                or progress_position[0] > checkpoint_position[0]
+                or progress_position[1] > checkpoint_position[1]
+                or (
+                    progress_position == checkpoint_position
+                    and progress.get("history") != checkpoint["history"]
+                )
+            ):
+                raise ValueError(
+                    "progress/checkpoint epoch, global_step, or history mismatch"
+                )
         if checkpoint["epoch"] == args.epochs:
             if not out_path.is_file() or not best_path.is_file():
                 raise ValueError(
@@ -873,11 +1269,16 @@ def main(argv=None) -> None:
         # Identity, bytes and sidecar are verified before any model/optimizer/
         # scheduler/scaler state is touched.
         start_epoch, best_val_f1, history = restore_checkpoint_state(
-            checkpoint, model, optimizer, schedule, scaler
+            checkpoint,
+            model,
+            optimizer,
+            schedule,
+            scaler,
+            write_guard=write_guard,
         )
         rng = checkpoint.get("rng_state")
         if rng is not None:
-            _set_rng_state(rng)
+            _set_rng_state(rng, write_guard=write_guard)
         print(f"[resume] found last.pt (epoch {checkpoint['epoch']}) -> continuing "
               f"from epoch {start_epoch} (best val df_f1 so far={best_val_f1:.4f}"
               f"{'' if rng is None else ', RNG restored'})")
@@ -889,6 +1290,7 @@ def main(argv=None) -> None:
           f"best.pt on val df_f1 improvement; worst-case loss: one epoch)")
 
     for epoch in range(start_epoch, args.epochs + 1):
+        write_guard.require(f"epoch {epoch} start")
         started = time.time()
         train_loss, steps = train_one_epoch(
             model, train_loader, optimizer, schedule, scaler, criterion, device,
@@ -920,11 +1322,31 @@ def main(argv=None) -> None:
             save_checkpoint(
                 best_path, model, optimizer, schedule, scaler, epoch,
                 best_val_f1, history, args, run_identity, val_metrics=val_metrics,
+                write_guard=write_guard,
             )
             marker = "  <- new best, saved best.pt"
         save_checkpoint(
             last_path, model, optimizer, schedule, scaler, epoch, best_val_f1,
-            history, args, run_identity,
+            history, args, run_identity, write_guard=write_guard,
+        )
+        progress_record = {
+            "schema_version": 1,
+            "epoch": epoch,
+            "global_step": int(schedule.step_count),
+            "history": list(history),
+            "run_identity": run_identity,
+            "last_checkpoint_integrity": checkpoint_integrity_record(
+                last_path, expected_identity=run_identity
+            ),
+            "checkpoint_cadence": "every_epoch",
+            "maximum_quota_loss": "one_incomplete_epoch",
+            "formal_training_allowed": False,
+            "test_access_allowed": False,
+        }
+        panderm_run.write_monotonic_run_record_atomic(
+            progress_path,
+            progress_record,
+            write_guard=write_guard.require,
         )
         print(f"[epoch {epoch:02d}/{args.epochs}] loss={train_loss:.4f} "
               f"val_df_f1={val_metrics['target_f1']:.4f} "
@@ -934,16 +1356,24 @@ def main(argv=None) -> None:
               f"checkpoint_saved=last.pt{marker}")
 
     if best_state is not None:
+        write_guard.require("best validation state restore")
         model.load_state_dict(best_state, strict=True)
     elif best_path.exists():
+        write_guard.require("best checkpoint before state load")
         best_checkpoint = load_checkpoint_safe(
             best_path,
             map_location=device,
             model=model,
             expected_identity=run_identity,
         )
+        write_guard.require("best checkpoint after state load")
         restore_checkpoint_state(
-            best_checkpoint, model, optimizer, schedule, scaler
+            best_checkpoint,
+            model,
+            optimizer,
+            schedule,
+            scaler,
+            write_guard=write_guard,
         )
 
     best_checkpoint = load_checkpoint_safe(
@@ -972,6 +1402,8 @@ def main(argv=None) -> None:
         ),
     }
     result = {
+        "epoch": history[-1]["epoch"],
+        "global_step": history[-1]["optimizer_steps"],
         "variant": args.variant,
         "seed": args.seed,
         "config": vars(args),
@@ -1006,7 +1438,9 @@ def main(argv=None) -> None:
         # nested run_identity is rejected by require_identity_duplicates.
         **{key: run_identity[key] for key in panderm_run.IMMUTABLE_IDENTITY_KEYS},
     }
-    panderm_run.write_json_atomic(out_path, result)
+    panderm_run.write_monotonic_run_record_atomic(
+        out_path, result, write_guard=write_guard.require
+    )
     verified_best, verified_last = load_completed_checkpoint_pair_safe(
         best_path=best_path,
         last_path=last_path,

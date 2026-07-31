@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import csv
 import hashlib
 import io
@@ -19,11 +20,18 @@ import uuid
 from contextlib import redirect_stderr
 from pathlib import Path
 
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ddpm_derm import panderm_run, train_panderm  # noqa: E402
+from ddpm_derm import panderm, panderm_run, train_panderm  # noqa: E402
+
+from tests.test_panderm_base_c1_finetune import (  # noqa: E402
+    AllowDurableWriteGuard,
+    build_mock_model,
+)
+from tests.test_panderm_blockers import identity as blocker_identity  # noqa: E402
 
 
 VALIDATION = "colab_panderm_base_c1_finetune_validation.ipynb"
@@ -37,7 +45,6 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "bd4b532bcba34f4942fe99a759d4165b3ee45c06"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -130,7 +137,96 @@ def load_phase2_manifest_helpers():
     )
 
 
+def _selected_notebook_definitions(cell_source, *, helper_names, constant_names,
+                                   namespace, label):
+    """Execute exactly the named notebook helpers/constants, nothing else."""
+    tree = ast.parse(cell_source)
+    selected_nodes = []
+    selected_names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in helper_names:
+                selected_nodes.append(node)
+                selected_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names = {
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            }
+            if names & constant_names:
+                selected_nodes.append(node)
+                selected_names.update(names & constant_names)
+    required_names = set(helper_names) | set(constant_names)
+    if selected_names != required_names:
+        raise AssertionError(
+            f"{label} definitions are incomplete: "
+            f"{sorted(required_names - selected_names)}"
+        )
+    exec(
+        compile(ast.Module(body=selected_nodes, type_ignores=[]), label, "exec"),
+        namespace,
+    )
+    return namespace
+
+
+def load_phase6_resume_helpers():
+    """Return the notebook's own Phase 6 attempt-identity/resume helpers."""
+    notebook, _ = load(VALIDATION)
+    phase6 = next(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if "phase6_classify_existing_artifacts" in "".join(cell.get("source", []))
+    )
+    namespace = _selected_notebook_definitions(
+        phase6,
+        helper_names={
+            "phase6_attempt_identity",
+            "phase6_session_metadata",
+            "phase6_classify_existing_artifacts",
+        },
+        constant_names={
+            "PHASE6_ATTEMPT_IDENTITY_SCHEMA_VERSION",
+            "PHASE6_RESUMABLE_ARTIFACT_NAMES",
+        },
+        namespace={
+            "Path": Path,
+            "json": json,
+            "panderm_run": panderm_run,
+            "train_panderm": train_panderm,
+        },
+        label="phase6-resume-helpers",
+    )
+    return namespace
+
+
+def load_first_cell_takeover_guards():
+    """Return the first cell's own MANUAL_TAKEOVER_CONFIRMED guard statements."""
+    notebook, _ = load(VALIDATION)
+    first = "".join(notebook["cells"][0]["source"])
+    guards = [
+        node
+        for node in ast.parse(first).body
+        if isinstance(node, ast.Assert)
+        and "MANUAL_TAKEOVER_CONFIRMED" in ast.unparse(node.test)
+    ]
+    if not guards:
+        raise AssertionError("the first cell has no MANUAL_TAKEOVER_CONFIRMED guard")
+    return compile(
+        ast.Module(body=guards, type_ignores=[]), "cell-0-takeover-guards", "exec"
+    )
+
+
 VALIDATION_ORDER_TOKENS = (
+    (
+        "provider lock topology",
+        "VALIDATION_LOCK_STORAGE_TOPOLOGY = "
+        "panderm_run.require_validation_lock_storage_topology",
+    ),
+    (
+        "provider active-session guard",
+        "panderm_run.require_active_session_provider_state",
+    ),
+    ("nvidia probe", 'subprocess.run(["nvidia-smi"]'),
+    ("CUDA availability", "torch.cuda.is_available()"),
     (
         "checkpoint SHA",
         "checkpoint_sha256 = panderm_run.require_checkpoint_sha256",
@@ -167,15 +263,6 @@ VALIDATION_ORDER_TOKENS = (
         "version parent verification",
         "resolved_v1_root = verified_v1_root.resolve(strict=True)",
     ),
-    (
-        "validation lock path",
-        "VALIDATION_RUN_LOCK = panderm_run.validation_run_lock_path",
-    ),
-    (
-        "validation lock parent verification",
-        "assert VALIDATION_RUN_LOCK.parent.samefile(verified_v1_root)",
-    ),
-    ("validation lock acquisition", "panderm_run.acquire_validation_run_lock"),
     ("archive build", "panderm_run.build_validation_archive_cache"),
     ("archive reuse", "panderm_run.reuse_validation_archive_cache"),
     ("validation id", "validation_id = datetime"),
@@ -207,105 +294,6 @@ def validate_validation_notebook_order(source):
                 f"validation ordering violation: {earlier} must precede {later}"
             )
     return positions
-
-
-def prepare_fresh_validation_lock(shared_run_root):
-    """Mirror the notebook's bounded, fail-loud version-parent setup."""
-    resolved_root = panderm_run.require_existing_shared_root(shared_run_root)
-    version_root = Path(shared_run_root) / panderm_run.RUN_VERSION
-    if version_root.is_symlink():
-        raise ValueError(f"validation version parent must not be a symlink: {version_root}")
-    try:
-        verified_v1_root = panderm_run.ensure_tree(
-            shared_run_root,
-            version_root.relative_to(shared_run_root),
-        )
-    except FileExistsError:
-        verified_v1_root = panderm_run.ensure_tree(
-            shared_run_root,
-            version_root.relative_to(shared_run_root),
-        )
-    if not verified_v1_root.is_dir() or verified_v1_root.is_symlink():
-        raise ValueError(
-            f"validation version parent is not a real directory: {verified_v1_root}"
-        )
-    resolved_v1_root = verified_v1_root.resolve(strict=True)
-    if (
-        not resolved_v1_root.is_relative_to(resolved_root)
-        or not resolved_v1_root.parent.samefile(resolved_root)
-    ):
-        raise ValueError(
-            f"validation version parent escaped the shared root: {resolved_v1_root}"
-        )
-    lock_path = panderm_run.validation_run_lock_path(shared_run_root)
-    if not lock_path.parent.samefile(verified_v1_root):
-        raise ValueError("validation lock parent does not match the version parent")
-    return lock_path
-
-
-FRESH_ROOT_RACE_WORKER = r"""
-import json
-import sys
-import time
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from ddpm_derm import panderm_run
-
-shared_run_root = Path(sys.argv[2])
-session_id = sys.argv[3]
-start_at = float(sys.argv[4])
-calls = {"archive": 0, "attempt": 0, "runner": 0}
-while time.time() < start_at:
-    pass
-resolved_root = panderm_run.require_existing_shared_root(shared_run_root)
-version_root = shared_run_root / panderm_run.RUN_VERSION
-if version_root.is_symlink():
-    raise ValueError("validation version parent must not be a symlink")
-try:
-    verified_v1_root = panderm_run.ensure_tree(
-        shared_run_root, version_root.relative_to(shared_run_root)
-    )
-except FileExistsError:
-    verified_v1_root = panderm_run.ensure_tree(
-        shared_run_root, version_root.relative_to(shared_run_root)
-    )
-resolved_v1_root = verified_v1_root.resolve(strict=True)
-if (
-    verified_v1_root.is_symlink()
-    or not resolved_v1_root.is_relative_to(resolved_root)
-    or not resolved_v1_root.parent.samefile(resolved_root)
-):
-    raise ValueError("validation version parent escaped the shared root")
-lock_path = panderm_run.validation_run_lock_path(shared_run_root)
-if not lock_path.parent.samefile(verified_v1_root):
-    raise ValueError("validation lock parent mismatch")
-try:
-    marker = panderm_run.acquire_validation_run_lock(
-        lock_path,
-        session_id=session_id,
-        run_version=panderm_run.RUN_VERSION,
-        git_commit="c" * 40,
-        shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
-        account_label="A",
-    )
-    calls = {"archive": 1, "attempt": 1, "runner": 1}
-    print(json.dumps({
-        "acquired": True,
-        "session_id": session_id,
-        "owner": marker["session_id"],
-        "parent_ready": True,
-        "calls": calls,
-    }))
-except FileExistsError as error:
-    print(json.dumps({
-        "acquired": False,
-        "session_id": session_id,
-        "parent_ready": verified_v1_root.is_dir(),
-        "calls": calls,
-        "error": str(error),
-    }))
-"""
 
 
 class NotebookHygieneTests(unittest.TestCase):
@@ -667,28 +655,26 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_is_an_unpinned_fail_loud_candidate(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertNotRegex(
             first,
+            r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"',
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(namespace["EXPECTED_GIT_COMMIT"], PIN_PLACEHOLDER)
 
     def test_archive_expected_identity_comes_from_the_reviewed_constant(self):
         """The notebook must not carry its own copy of the approved digest."""
@@ -729,268 +715,52 @@ class ValidationNotebookTests(unittest.TestCase):
             },
         )
 
-    def test_validation_run_lock_follows_all_preflights_and_precedes_durable_work(self):
-        """Cheap checks and GPU cleanup must finish before the durable lock."""
+    def test_sequential_preflight_and_session_ordering(self):
         notebook, code = load(VALIDATION)
         positions = validate_validation_notebook_order(code)
-        self.assertLess(
-            positions["GPU smoke assertions complete"],
-            positions["GPU model and tensor cleanup"],
-        )
-        self.assertLess(
-            positions["GPU cache cleanup"],
-            positions["all preflights complete"],
-        )
-        self.assertLess(
-            positions["all preflights complete"],
-            positions["version parent setup"],
-        )
-        self.assertLess(
-            positions["version parent verification"],
-            positions["validation lock path"],
-        )
-        self.assertLess(
-            positions["validation lock parent verification"],
-            positions["validation lock acquisition"],
-        )
-        self.assertIn("panderm_run.validation_run_lock_path(SHARED_RUN_ROOT)", code)
-        self.assertIn("VALIDATION_LOCK_HELD", code)
-        self.assertNotIn("V1_ROOT.mkdir", code)
-        sources = [
-            "".join(cell["source"])
-            for cell in notebook["cells"]
-            if cell["cell_type"] == "code"
-        ]
-        phase_zero = next(text for text in sources if 'drive.mount("/content/drive")' in text)
-        gpu_smoke = next(text for text in sources if "GPU_SMOKE_COMPLETE = True" in text)
-        for forbidden in (
-            "validation_run_lock_path",
-            "acquire_validation_run_lock",
-            "VALIDATION_SESSION",
-        ):
-            with self.subTest(phase_zero_forbidden=forbidden):
-                self.assertNotIn(forbidden, phase_zero)
-        self.assertNotIn(
-            "V1_ROOT.relative_to(SHARED_RUN_ROOT)",
-            phase_zero,
-        )
-        self.assertLess(
-            gpu_smoke.index("PHASE3_COMPLETE = True"),
-            gpu_smoke.index("verified_v1_root = panderm_run.ensure_tree"),
-        )
-        self.assertIn("acquire_validation_run_lock", gpu_smoke)
+        self.assertLess(positions["provider active-session guard"], positions["nvidia probe"])
+        self.assertLess(code.index("assert isinstance(MANUAL_TAKEOVER_CONFIRMED, bool)"), code.index('subprocess.run(["nvidia-smi"]'))
+        self.assertLess(code.index("GPU_SMOKE_COMPLETE = True"), code.index("panderm_run.start_sequential_session("))
+        self.assertLess(code.index("panderm_run.start_sequential_session("), code.index("panderm_run.build_validation_archive_cache"))
+        self.assertLess(code.index("panderm_run.start_sequential_session("), code.index("run_stream(gate_command"))
+        self.assertNotIn("manual_takeover_confirmed=True", code)
+        self.assertIn("manual_takeover_confirmed=MANUAL_TAKEOVER_CONFIRMED", code)
 
-    def test_validation_order_validator_rejects_the_old_early_lock_order(self):
-        ordered_tokens = [token for _, token in VALIDATION_ORDER_TOKENS]
-        correct = "\n".join(ordered_tokens)
-        validate_validation_notebook_order(correct)
+    def test_phase5_and_phase6_reopen_active_marker_at_durable_boundaries(self):
+        notebook, _ = load(VALIDATION)
+        phase5 = "".join(notebook["cells"][15]["source"])
+        phase6 = "".join(notebook["cells"][17]["source"])
+        self.assertIn('require_active_session("Phase 5 archive staging start")', phase5)
+        self.assertIn('require_active_session("Phase 5 archive staging completion")', phase5)
+        self.assertGreaterEqual(phase5.count("write_guard=require_active_session"), 3)
+        for phase in ("Phase 6 attempt preflight", "Phase 6 validation runs root preparation", "Phase 6 attempt session metadata", "Phase 6 gate directory preparation"):
+            self.assertIn(f'require_active_session("{phase}")', phase6)
+        # Session identity belongs to the per-session metadata record, never to
+        # the immutable cross-session attempt identity.
+        self.assertNotIn('"active_session_id": VALIDATION_SESSION_ID', phase6)
+        self.assertIn("ATTEMPT_SESSION_METADATA = phase6_session_metadata(VALIDATION_SESSION_ID", phase6)
 
-        early_lock = ordered_tokens.copy()
-        lock_path = early_lock.pop(
-            [label for label, _ in VALIDATION_ORDER_TOKENS].index(
-                "validation lock path"
-            )
-        )
-        lock_acquire = early_lock.pop(
-            [token for _, token in VALIDATION_ORDER_TOKENS].index(
-                "panderm_run.acquire_validation_run_lock"
-            )
-        )
-        early_lock[0:0] = [lock_path, lock_acquire]
-        with self.assertRaisesRegex(
-            AssertionError,
-            "validation ordering violation",
-        ):
-            validate_validation_notebook_order("\n".join(early_lock))
+    def test_failure_retains_marker_and_success_completes_handoff(self):
+        notebook, code = load(VALIDATION)
+        failure = "".join(notebook["cells"][19]["source"])
+        success = "".join(notebook["cells"][21]["source"])
+        self.assertIn("failure retained the active marker for explicit review or manual takeover", failure)
+        self.assertNotIn("complete_sequential_session", failure)
+        self.assertIn("complete_sequential_session(", success)
+        self.assertIn('"active_session": ACTIVE_SESSION', failure)
+        self.assertIn('"active_session": ACTIVE_SESSION', success)
+        self.assertNotIn("unlink(", failure)
+        self.assertNotIn("unlink(", success)
 
-    def test_validator_rejects_version_parent_after_lock_or_before_gpu(self):
-        labels = [label for label, _ in VALIDATION_ORDER_TOKENS]
-        ordered_tokens = [token for _, token in VALIDATION_ORDER_TOKENS]
-        setup_tokens = [
-            ordered_tokens[labels.index("version parent setup")],
-            ordered_tokens[labels.index("version parent verification")],
-        ]
-
-        parent_after_lock = [
-            token for token in ordered_tokens if token not in setup_tokens
-        ]
-        acquire_index = parent_after_lock.index(
-            "panderm_run.acquire_validation_run_lock"
-        )
-        parent_after_lock[acquire_index + 1:acquire_index + 1] = setup_tokens
-        with self.assertRaisesRegex(AssertionError, "validation ordering violation"):
-            validate_validation_notebook_order("\n".join(parent_after_lock))
-
-        parent_before_gpu = [
-            token for token in ordered_tokens if token not in setup_tokens
-        ]
-        gpu_index = parent_before_gpu.index('print("[Phase 4] START')
-        parent_before_gpu[gpu_index:gpu_index] = setup_tokens
-        with self.assertRaisesRegex(AssertionError, "validation ordering violation"):
-            validate_validation_notebook_order("\n".join(parent_before_gpu))
-
-    def test_fresh_version_parent_setup_then_lock_acquire_and_owner_release(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            shared_run_root = Path(temporary)
-            version_root = shared_run_root / panderm_run.RUN_VERSION
-            self.assertFalse(version_root.exists())
-
-            lock_path = prepare_fresh_validation_lock(shared_run_root)
-            self.assertTrue(version_root.is_dir())
-            owner = str(uuid.uuid4())
-            marker = panderm_run.acquire_validation_run_lock(
-                lock_path,
-                session_id=owner,
-                run_version=panderm_run.RUN_VERSION,
-                git_commit="c" * 40,
-                shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
-                account_label="A",
-            )
-            self.assertEqual(marker["session_id"], owner)
-            released = panderm_run.release_validation_run_lock(
-                lock_path, session_id=owner
-            )
-            self.assertEqual(released["session_id"], owner)
-            self.assertFalse(lock_path.exists())
-
-    def test_old_fresh_root_order_fails_before_any_durable_work(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            shared_run_root = Path(temporary)
-            lock_path = panderm_run.validation_run_lock_path(shared_run_root)
-            calls = {"archive": 0, "attempt": 0, "runner": 0}
-            with self.assertRaisesRegex(FileNotFoundError, "directory is missing"):
-                panderm_run.acquire_validation_run_lock(
-                    lock_path,
-                    session_id=str(uuid.uuid4()),
-                    run_version=panderm_run.RUN_VERSION,
-                    git_commit="c" * 40,
-                    shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
-                    account_label="A",
-                )
-            self.assertEqual(calls, {"archive": 0, "attempt": 0, "runner": 0})
-            self.assertFalse(lock_path.parent.exists())
-
-    def test_version_parent_setup_failures_do_not_acquire_the_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            missing_root = base / "missing"
-            with self.assertRaisesRegex(FileNotFoundError, "shared run root is missing"):
-                prepare_fresh_validation_lock(missing_root)
-            self.assertFalse(missing_root.exists())
-
-            shared_run_root = base / "shared"
-            shared_run_root.mkdir()
-            version_root = shared_run_root / panderm_run.RUN_VERSION
-            version_root.write_text("not a directory\n", encoding="utf-8")
-            with self.assertRaises(FileExistsError):
-                prepare_fresh_validation_lock(shared_run_root)
-            self.assertFalse(
-                panderm_run.validation_run_lock_path(shared_run_root).exists()
-            )
-
-    def test_version_parent_rejects_path_escape_and_preserves_legal_content(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            shared_run_root = base / "shared"
-            outside = base / "outside"
-            shared_run_root.mkdir()
-            outside.mkdir()
-            version_root = shared_run_root / panderm_run.RUN_VERSION
-            try:
-                version_root.symlink_to(outside, target_is_directory=True)
-            except OSError:
-                result = subprocess.run(
-                    ["cmd", "/c", "mklink", "/J", str(version_root), str(outside)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            with self.assertRaisesRegex(ValueError, "symlink|escaped"):
-                prepare_fresh_validation_lock(shared_run_root)
-            self.assertFalse(
-                panderm_run.validation_run_lock_path(shared_run_root).exists()
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            shared_run_root = Path(temporary)
-            version_root = shared_run_root / panderm_run.RUN_VERSION
-            version_root.mkdir()
-            preserved = version_root / "reviewer.txt"
-            preserved.write_text("keep\n", encoding="utf-8")
-            prepare_fresh_validation_lock(shared_run_root)
-            self.assertEqual(preserved.read_text(encoding="utf-8"), "keep\n")
-
-    def test_two_fresh_root_processes_create_parent_then_one_wins_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            shared_run_root = base / "shared"
-            shared_run_root.mkdir()
-            worker = base / "worker.py"
-            worker.write_text(FRESH_ROOT_RACE_WORKER, encoding="utf-8")
-            src = str((ROOT / "src").resolve())
-            start_at = time.time() + 1.5
-            sessions = [str(uuid.uuid4()), str(uuid.uuid4())]
-            processes = [
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-B",
-                        "-u",
-                        str(worker),
-                        src,
-                        str(shared_run_root),
-                        session,
-                        str(start_at),
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-                for session in sessions
-            ]
-            outputs = [process.communicate()[0] for process in processes]
-            results = []
-            for output in outputs:
-                rows = [
-                    json.loads(line)
-                    for line in output.splitlines()
-                    if line.startswith("{")
-                ]
-                self.assertEqual(len(rows), 1, output)
-                results.append(rows[0])
-            self.assertTrue(all(result["parent_ready"] for result in results))
-            winners = [result for result in results if result["acquired"]]
-            losers = [result for result in results if not result["acquired"]]
-            self.assertEqual(len(winners), 1, results)
-            self.assertEqual(len(losers), 1, results)
-            self.assertEqual(
-                losers[0]["calls"], {"archive": 0, "attempt": 0, "runner": 0}
-            )
-            self.assertEqual(
-                winners[0]["calls"], {"archive": 1, "attempt": 1, "runner": 1}
-            )
-            lock_path = panderm_run.validation_run_lock_path(shared_run_root)
-            self.assertEqual(
-                panderm_run._read_validation_run_lock(lock_path)["session_id"],
-                winners[0]["session_id"],
-            )
-            panderm_run.release_validation_run_lock(
-                lock_path, session_id=winners[0]["session_id"]
-            )
-
-    def test_run_all_never_clears_a_stale_lock_and_releases_only_its_own(self):
-        _, code = load(VALIDATION)
-        self.assertNotIn("clear_stale_validation_run_lock", code)
-        self.assertNotIn("clear_stale_marker", code)
-        self.assertIn(
-            "panderm_run.release_validation_run_lock(VALIDATION_RUN_LOCK, "
-            "session_id=VALIDATION_SESSION_ID)",
-            code,
-        )
-        # Released on the success path and on the caught-failure path only.
-        self.assertEqual(code.count("release_validation_run_lock"), 2)
-        self.assertNotIn("VALIDATION_RUN_LOCK.unlink", code)
+    def test_active_marker_gate_precedes_shared_version_creation(self):
+        notebook, code = load(VALIDATION)
+        phase0 = "".join(notebook["cells"][3]["source"])
+        phase4 = "".join(notebook["cells"][13]["source"])
+        self.assertIn("require_active_session_provider_state", phase0)
+        self.assertIn("active session exists; confirm the previous runtime is stopped", phase0)
+        self.assertNotIn("ensure_tree(SHARED_RUN_ROOT, V1_ROOT", phase0)
+        self.assertIn("ensure_tree(SHARED_RUN_ROOT, V1_ROOT", phase4)
+        self.assertLess(phase0.index("require_active_session_provider_state"), phase0.index('subprocess.run(["nvidia-smi"]'))
 
     def test_account_label_is_operational_metadata_only(self):
         notebook, code = load(VALIDATION)
@@ -1269,6 +1039,16 @@ class ValidationNotebookTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, staging)
+        for marker in (
+            "archive durable staging directory create",
+            "archive durable staging",
+            "archive cache directory publish",
+            "archive reuse cache validation complete",
+            "archive reuse extraction complete",
+            "archive reuse local publish",
+        ):
+            with self.subTest(fence_marker=marker):
+                self.assertIn(marker, staging)
 
     def test_phase_four_gpu_smoke_has_full_update_contract(self):
         _, code = load(VALIDATION)
@@ -1312,7 +1092,7 @@ class ValidationNotebookTests(unittest.TestCase):
             code,
         )
 
-    def test_smoke_state_is_discarded_before_fresh_non_resume_subprocess(self):
+    def test_smoke_state_is_discarded_before_the_resumable_subprocess(self):
         notebook, _ = load(VALIDATION)
         sources = ["".join(cell["source"]) for cell in notebook["cells"]]
         smoke_index = next(
@@ -1328,58 +1108,46 @@ class ValidationNotebookTests(unittest.TestCase):
         self.assertLess(smoke_index, run_index)
         self.assertIn("del model, optimizer, schedule, scaler", smoke)
         self.assertIn('"smoke_model_discarded": True', smoke)
-        self.assertIn("[start] fresh run (no --resume) from epoch 1", run)
-        self.assertNotIn(
-            'if (checkpoint_dir / "last.pt").is_file(): '
-            'gate_command.append("--resume")',
+        # The GPU smoke model is discarded, but the durable checkpoint of the
+        # same fixed run version must survive an account handoff, so the initial
+        # gate call is always resumable and never a fresh overwrite.
+        self.assertNotIn("[start] fresh run (no --resume) from epoch 1", run)
+        self.assertIn(
+            "[start] --resume set but no checkpoint yet -> fresh run from epoch 1",
             run,
         )
         initial_call = run.split(
             "gate_seconds, gate_output = run_stream(gate_command", 1
         )[1].splitlines()[0]
         self.assertNotIn("--resume", initial_call)
+        self.assertIn('"--fixed-split-identity", fixed_split_identity, "--resume"]', run)
 
     def test_notebook_is_account_neutral_with_shared_root_prerequisites(self):
         notebook, code = load(VALIDATION)
-        markdown = "\n".join(
-            "".join(cell["source"])
-            for cell in notebook["cells"]
-            if cell["cell_type"] == "markdown"
-        )
-        for required in (
-            "/content/drive/MyDrive/ddpm-derm-augmentation",
-            "/content/drive/MyDrive/ddpm-derm-panderm-runs",
-            "Editor permission",
-            "GH_TOKEN",
-        ):
+        markdown = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "markdown")
+        for required in ("/content/drive/MyDrive/ddpm-derm-augmentation", "/content/drive/MyDrive/ddpm-derm-panderm-runs", "Editor permission", "GH_TOKEN", "run only in sequence"):
             with self.subTest(required=required):
                 self.assertIn(required, markdown)
-        self.assertIn("Never create a private folder of the", markdown)
-        # Account-neutral: no hard-coded identity anywhere in the notebook.
-        self.assertNotRegex(
-            json.dumps(notebook), r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-        )
-        self.assertNotIn("PANDERM_CHECKPOINT_DRIVE_ID = None", code)
-        for forbidden in ("MyDrive/ddpm-derm-panderm-runs-", "user_id", "account_email"):
+        self.assertNotRegex(json.dumps(notebook), r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+        for forbidden in (
+            "MyDrive/ddpm-derm-panderm-runs-",
+            "user_id",
+            "account_email",
+        ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, code)
-        # Both shared roots are asserted, never created.
         self.assertIn("assert SHARED_PROJECT_DIR.is_dir()", code)
         self.assertIn("assert SHARED_RUN_ROOT.is_dir()", code)
         self.assertIn("do not create a private replacement", code)
         self.assertIn("panderm_run.require_existing_shared_root", code)
         self.assertIn("assert SHARED_ROOT_SENTINEL.is_file()", code)
         self.assertIn("do not recreate it", code)
-        self.assertIn("panderm_run.create_or_validate_sentinel", code)
         self.assertIn("panderm_run.require_shared_root_sentinel_identity", code)
         self.assertIn("panderm_run.probe_shared_drive", code)
-        self.assertNotIn(
-            'sentinel["resolved_path"] == str(resolved_root)', code
-        )
-        # Pre-existing markers/records stop the run rather than being removed.
-        self.assertIn("a validation_record already exists", code)
-        self.assertIn("a prior gate already failed this version", code)
-        self.assertIn("shutil.rmtree(SMOKE_SAMPLE_DIR)", code)
+        self.assertIn("DURABLE_ROOT_PROVIDER_IDENTITY", code)
+        self.assertIn("MANUAL_TAKEOVER_CONFIRMED = False", code)
+        self.assertIn("checkpoint_cadence=every_epoch", code)
+        self.assertIn("max_quota_loss=one_incomplete_epoch", code)
         self.assertNotIn("shutil.rmtree(SHARED", code)
         self.assertNotIn("SHARED_RUN_ROOT.mkdir", code)
         self.assertNotIn("SHARED_PROJECT_DIR.mkdir", code)
@@ -1445,11 +1213,11 @@ class ValidationNotebookTests(unittest.TestCase):
     def test_failure_and_success_records_keep_prohibition_flags(self):
         _, code = load(VALIDATION)
         failure_write = code.index(
-            "panderm_run.write_json_atomic(LATEST_FAILURE_RECORD, failure_record)"
+            "panderm_run.write_json_atomic(LATEST_FAILURE_RECORD, failure_record,"
         )
         failure_raise = code.index("raise RuntimeError(gate_failures)")
         success_write = code.index(
-            "panderm_run.write_json_atomic(VALIDATION_RECORD, record)"
+            "panderm_run.write_json_atomic(VALIDATION_RECORD, record,"
         )
         self.assertLess(failure_write, failure_raise)
         self.assertLess(failure_raise, success_write)
@@ -1474,6 +1242,314 @@ class ValidationNotebookTests(unittest.TestCase):
             '"suggestive_exploratory_only"',
         ):
             self.assertIn(required, code)
+
+
+class Phase6SequentialResumeBlockerTests(unittest.TestCase):
+    """Executable Phase 6 regressions for the account-handoff blockers.
+
+    These run the notebook's own extracted helpers against real production
+    checkpoints instead of only searching notebook source strings.
+    """
+
+    def _components(self):
+        model = build_mock_model()
+        optimizer = panderm.build_optimizer(model, num_layers=4)
+        schedule = panderm.WarmupCosineSchedule(
+            optimizer, warmup_epochs=1, epochs=5, steps_per_epoch=2
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+        return model, optimizer, schedule, scaler
+
+    def _save(self, path, run_identity, epoch):
+        model, optimizer, schedule, scaler = self._components()
+        train_panderm.save_checkpoint(
+            path,
+            model,
+            optimizer,
+            schedule,
+            scaler,
+            epoch,
+            0.5,
+            [
+                {"epoch": completed, "optimizer_steps": schedule.step_count}
+                for completed in range(1, epoch + 1)
+            ],
+            type("A", (), {"seed": 0, "epochs": 5})(),
+            run_identity,
+            write_guard=AllowDurableWriteGuard(),
+        )
+
+    def _attempt(self, root, run_identity, *, epoch=None, with_result=False):
+        """Build a checkpoint directory that mirrors the Phase 6 gate layout."""
+        checkpoint_dir = Path(root) / "checkpoints" / panderm_run.ARCH / "C1_seed0"
+        checkpoint_dir.mkdir(parents=True)
+        result_path = (
+            Path(root) / "results" / panderm_run.ARCH / "results_C1_seed0.json"
+        )
+        result_path.parent.mkdir(parents=True)
+        if epoch is None:
+            return checkpoint_dir, result_path
+        self._save(checkpoint_dir / "last.pt", run_identity, epoch)
+        self._save(checkpoint_dir / "best.pt", run_identity, epoch)
+        if with_result:
+            result = {
+                "run_identity": copy.deepcopy(run_identity),
+                **copy.deepcopy(run_identity),
+                "checkpoint_integrity": {
+                    name: train_panderm.checkpoint_integrity_record(
+                        checkpoint_dir / name, expected_identity=run_identity
+                    )
+                    for name in ("best.pt", "last.pt")
+                },
+            }
+            result_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        return checkpoint_dir, result_path
+
+    # --- blocker 1 ---------------------------------------------------------
+    def test_phase6_verifies_and_skips_an_existing_complete_pair(self):
+        """probe phase6_rejects_existing_complete_last must be False.
+
+        Account B used to be unable to continue account A's attempt at all: the
+        notebook asserted that no last.pt/best.pt/result existed before it would
+        start, so a finished or partially finished run could only be overwritten.
+        """
+        helpers = load_phase6_resume_helpers()
+        run_identity = blocker_identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir, result_path = self._attempt(
+                temporary, run_identity, epoch=5, with_result=True
+            )
+            before = {
+                path.name: path.read_bytes()
+                for path in sorted(checkpoint_dir.iterdir())
+            }
+            rejected = True
+            state = helpers["phase6_classify_existing_artifacts"](
+                checkpoint_dir, result_path, run_identity, 5
+            )
+            rejected = False
+            self.assertFalse(
+                rejected, "phase6_rejects_existing_complete_last must be False"
+            )
+            self.assertEqual(state["mode"], "complete")
+            self.assertEqual(state["epoch"], 5)
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in sorted(checkpoint_dir.iterdir())
+                },
+                before,
+            )
+
+    def test_phase6_resumes_an_incomplete_attempt_from_another_session(self):
+        """A partial last.pt must classify as resume, not fresh."""
+        helpers = load_phase6_resume_helpers()
+        run_identity = blocker_identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir, result_path = self._attempt(
+                temporary, run_identity, epoch=2
+            )
+            state = helpers["phase6_classify_existing_artifacts"](
+                checkpoint_dir, result_path, run_identity, 5
+            )
+            self.assertEqual(state["mode"], "resume")
+            self.assertEqual(state["epoch"], 2)
+            self.assertIn("last.pt", state["present"])
+
+    def test_phase6_classifies_an_empty_attempt_as_fresh(self):
+        helpers = load_phase6_resume_helpers()
+        run_identity = blocker_identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir, result_path = self._attempt(temporary, run_identity)
+            state = helpers["phase6_classify_existing_artifacts"](
+                checkpoint_dir, result_path, run_identity, 5
+            )
+            self.assertEqual(state["mode"], "fresh")
+            self.assertEqual(state["present"], [])
+
+    def test_phase6_rejects_only_corruption_sidecar_and_identity_drift(self):
+        """Corrupt bytes, a bad sidecar or identity drift are the only rejections."""
+        helpers = load_phase6_resume_helpers()
+        run_identity = blocker_identity()
+        cases = {
+            "corrupt_checkpoint_bytes": lambda directory, result: (
+                (directory / "last.pt").write_bytes(b"interrupted")
+            ),
+            "invalid_sidecar": lambda directory, result: (
+                (directory / "last.pt.integrity.json").write_text(
+                    '{"partial":true}\n', encoding="utf-8"
+                )
+            ),
+            "missing_sidecar": lambda directory, result: (
+                (directory / "last.pt.integrity.json").unlink()
+            ),
+        }
+        for name, damage in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                checkpoint_dir, result_path = self._attempt(
+                    temporary, run_identity, epoch=2
+                )
+                damage(checkpoint_dir, result_path)
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    helpers["phase6_classify_existing_artifacts"](
+                        checkpoint_dir, result_path, run_identity, 5
+                    )
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir, result_path = self._attempt(
+                temporary, run_identity, epoch=2
+            )
+            drifted = copy.deepcopy(run_identity)
+            drifted["checkpoint_sha256"] = "0" * 64
+            with self.assertRaises(ValueError):
+                helpers["phase6_classify_existing_artifacts"](
+                    checkpoint_dir, result_path, drifted, 5
+                )
+
+    def test_attempt_identity_is_immutable_across_sessions_and_accounts(self):
+        """The same run must produce one identity for accounts A, B and C."""
+        helpers = load_phase6_resume_helpers()
+        run_identity = blocker_identity()
+        first = helpers["phase6_attempt_identity"](
+            "20260730T000000Z", panderm_run.RUN_VERSION, "root-uuid", run_identity
+        )
+        second = helpers["phase6_attempt_identity"](
+            "20260730T000000Z", panderm_run.RUN_VERSION, "root-uuid", run_identity
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {
+            "schema_version",
+            "validation_id",
+            "run_version",
+            "shared_root_uuid",
+            "run_identity",
+        })
+        for forbidden in ("active_session_id", "session_id", "account_label", "hostname"):
+            self.assertNotIn(forbidden, first)
+        metadata = [
+            helpers["phase6_session_metadata"](
+                str(uuid.uuid4()), account, f"host-{account}", "2026-07-30T00:00:00Z"
+            )
+            for account in ("A", "B", "C")
+        ]
+        self.assertEqual(len({record["session_id"] for record in metadata}), 3)
+        for record in metadata:
+            self.assertEqual(
+                set(record),
+                {
+                    "schema_version",
+                    "session_id",
+                    "account_label",
+                    "hostname",
+                    "started_utc",
+                },
+            )
+
+    def test_initial_gate_call_passes_resume(self):
+        """probe initial_gate_call_has_resume must be True.
+
+        Without --resume on the very first invocation, account B's run started
+        from epoch 1 and account A's durable checkpoint was never continued.
+        """
+        notebook, _ = load(VALIDATION)
+        phase6 = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "gate_seconds, gate_output = run_stream(gate_command" in "".join(
+                cell.get("source", [])
+            )
+        )
+        tree = ast.parse(phase6)
+        arguments = next(
+            [
+                element.value
+                for element in node.value.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            ]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "gate_command"
+                for target in node.targets
+            )
+        )
+        initial_gate_call_has_resume = "--resume" in arguments
+        self.assertTrue(
+            initial_gate_call_has_resume, "initial_gate_call_has_resume must be True"
+        )
+        # Every later invocation reuses the same resumable command instead of
+        # appending --resume only for follow-up calls.
+        self.assertNotIn('gate_command + ["--resume"]', phase6)
+        self.assertNotIn('mismatch + ["--resume"]', phase6)
+        self.assertIn(
+            "gate_seconds, gate_output = run_stream(gate_command, "
+            "process_env=training_env)",
+            phase6,
+        )
+
+    def test_phase0_keeps_resumable_attempt_artifacts_out_of_the_guard_set(self):
+        """Phase 0 must not treat the resumable gate output as immutable."""
+        notebook, _ = load(VALIDATION)
+        phase0 = "".join(notebook["cells"][3]["source"])
+        self.assertIn(
+            'resumable_gate_roots = [attempt / "non_collapse_gate" '
+            "for attempt in existing_attempts]",
+            phase0,
+        )
+        self.assertIn(
+            'unexpected_formal_names = {"_COMPLETED.json", "validation_record.json"}',
+            phase0,
+        )
+        self.assertNotIn(
+            'unexpected_formal_names = {"last.pt", "best.pt"', phase0
+        )
+        self.assertIn(
+            "path.is_file() and path not in resumable_attempt_artifacts", phase0
+        )
+
+    # --- blocker 2 ---------------------------------------------------------
+    def test_manual_takeover_confirmation_is_reachable(self):
+        """probe manual_takeover_forced_false must be False.
+
+        The first cell asserted the flag could only ever be False, so the
+        reviewed manual-takeover path was unreachable from the notebook.
+        """
+        guards = load_first_cell_takeover_guards()
+        _, code = load(VALIDATION)
+        self.assertIn("MANUAL_TAKEOVER_CONFIRMED = False", code)
+        self.assertNotIn("assert MANUAL_TAKEOVER_CONFIRMED is False", code)
+        manual_takeover_forced_false = False
+        try:
+            exec(guards, {"MANUAL_TAKEOVER_CONFIRMED": True})
+        except AssertionError:
+            manual_takeover_forced_false = True
+        self.assertFalse(
+            manual_takeover_forced_false, "manual_takeover_forced_false must be False"
+        )
+        exec(guards, {"MANUAL_TAKEOVER_CONFIRMED": False})
+        for invalid in ("True", 1, None, "yes"):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                exec(guards, {"MANUAL_TAKEOVER_CONFIRMED": invalid})
+        self.assertIn("manual_takeover_confirmed=MANUAL_TAKEOVER_CONFIRMED", code)
+        self.assertNotIn("manual_takeover_confirmed=True", code)
+
+    # --- blocker 5 ---------------------------------------------------------
+    def test_effective_session_id_comes_from_the_reopened_marker(self):
+        """An idempotent takeover retry may reuse a published replacement id."""
+        notebook, _ = load(VALIDATION)
+        phase4 = "".join(notebook["cells"][13]["source"])
+        self.assertIn(
+            'VALIDATION_SESSION_ID = ACTIVE_SESSION["session_id"]', phase4
+        )
+        self.assertLess(
+            phase4.index("ACTIVE_SESSION = panderm_run.start_sequential_session("),
+            phase4.index('VALIDATION_SESSION_ID = ACTIVE_SESSION["session_id"]'),
+        )
+        self.assertLess(
+            phase4.index('VALIDATION_SESSION_ID = ACTIVE_SESSION["session_id"]'),
+            phase4.index('"PANDERM_ACTIVE_SESSION_ID": VALIDATION_SESSION_ID'),
+        )
 
 
 class StopDecisionNotebookTests(unittest.TestCase):

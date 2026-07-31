@@ -108,6 +108,15 @@ def build_mock_model(num_classes=7):
     )
 
 
+class AllowDurableWriteGuard:
+    def bind_run_identity(self, run_identity):
+        self.run_identity = copy.deepcopy(run_identity)
+        return panderm_run.canonical_identity_sha256(run_identity)
+
+    def require(self, phase):
+        return {"phase": phase}
+
+
 class SharedRootSentinelIdentityTests(unittest.TestCase):
     UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
     ALIAS = "ddpm-derm-panderm-runs"
@@ -1272,8 +1281,15 @@ class CheckpointTests(unittest.TestCase):
             path = Path(tmp) / "last.pt"
             train_panderm.save_checkpoint(
                 path, model, optimizer, schedule, scaler, 1, 0.5,
-                [{"epoch": 1, "train_loss": 1.0, "val_df_f1": 0.5, "val_macro_f1": 0.3}],
+                [{
+                    "epoch": 1,
+                    "optimizer_steps": schedule.step_count,
+                    "train_loss": 1.0,
+                    "val_df_f1": 0.5,
+                    "val_macro_f1": 0.3,
+                }],
                 args, identity,
+                write_guard=AllowDurableWriteGuard(),
             )
             saved = train_panderm.load_checkpoint_safe(path, map_location="cpu")
         self.assertEqual(saved["checkpoint_format"], "panderm_full_model_v1")
@@ -1297,7 +1313,8 @@ class CheckpointTests(unittest.TestCase):
             "head_state_dict": model.head.state_dict(),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": {}, "scheduler_state_dict": {},
-            "scaler_state_dict": {}, "epoch": 1, "best_val_df_f1": 0.1,
+            "scaler_state_dict": {}, "epoch": 1, "global_step": 0,
+            "best_val_df_f1": 0.1,
             "history": [], "config": {}, "class_to_idx": {}, "rng_state": {},
             "run_identity": {},
         }
@@ -1327,17 +1344,27 @@ class CheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "last.pt"
             train_panderm.save_checkpoint(
-                path, model, optimizer, schedule, scaler, 1, 0.5, [{"epoch": 1}],
+                path, model, optimizer, schedule, scaler, 1, 0.5,
+                [{"epoch": 1, "optimizer_steps": schedule.step_count}],
                 args, identity,
+                write_guard=AllowDurableWriteGuard(),
             )
             saved = train_panderm.load_checkpoint_safe(path, map_location="cpu")
 
         fresh_model, fresh_opt, fresh_sched, fresh_scaler = self._components()
         self.assertNotEqual(fresh_sched.step_count, schedule.step_count)
         start, best, history = train_panderm.restore_checkpoint_state(
-            saved, fresh_model, fresh_opt, fresh_sched, fresh_scaler
+            saved,
+            fresh_model,
+            fresh_opt,
+            fresh_sched,
+            fresh_scaler,
+            write_guard=AllowDurableWriteGuard(),
         )
-        self.assertEqual((start, best, history), (2, 0.5, [{"epoch": 1}]))
+        self.assertEqual(
+            (start, best, history),
+            (2, 0.5, [{"epoch": 1, "optimizer_steps": 3}]),
+        )
         self.assertEqual(fresh_sched.step_count, schedule.step_count)
         for (name, restored), (_, original) in zip(
             fresh_model.named_parameters(), model.named_parameters()
@@ -1357,7 +1384,10 @@ class CheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "last.pt"
             train_panderm.save_checkpoint(
-                path, model, optimizer, schedule, scaler, 1, 0.5, [], args, identity
+                path, model, optimizer, schedule, scaler, 1, 0.5,
+                [{"epoch": 1, "optimizer_steps": schedule.step_count}],
+                args, identity,
+                write_guard=AllowDurableWriteGuard(),
             )
             saved = train_panderm.load_checkpoint_safe(path, map_location="cpu")
 
@@ -1951,8 +1981,10 @@ class OutputIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "last.pt"
             train_panderm.save_checkpoint(
-                path, model, optimizer, schedule, scaler, 1, 0.4, [{"epoch": 1}],
+                path, model, optimizer, schedule, scaler, 1, 0.4,
+                [{"epoch": 1, "optimizer_steps": schedule.step_count}],
                 args, identity,
+                write_guard=AllowDurableWriteGuard(),
             )
             self.assertTrue(path.is_file())
             # No temporary residue is left behind next to the checkpoint.
