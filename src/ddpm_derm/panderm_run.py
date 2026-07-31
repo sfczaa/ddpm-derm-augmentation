@@ -2213,8 +2213,14 @@ def require_drive_shortcut_target(
     if details.get("targetMimeType") != DRIVE_FOLDER_MIME_TYPE:
         raise ValueError("shared run shortcut target must be a Drive folder")
     target_resource_key = details.get("targetResourceKey")
-    if type(target_resource_key) is not str or not target_resource_key:
-        raise ValueError("shared run shortcut target resource key is missing or invalid")
+    if target_resource_key is None:
+        # Drive omits targetResourceKey when the target has no resource key.
+        # That is the normal case for a folder shared directly with an account
+        # instead of by a pre-2021 link, and it is also account-dependent, so
+        # absence is not drift and must not block an account switch.
+        target_resource_key = ""
+    elif type(target_resource_key) is not str or not target_resource_key:
+        raise ValueError("shared run shortcut target resource key is invalid")
     return {
         "target_id": target_id,
         "target_resource_key": target_resource_key,
@@ -2475,13 +2481,16 @@ def build_durable_root_provider_identity(
     if root["id"] != expected_root_id:
         raise ValueError("shared run root provider id drift")
     root_resource_key = root.get("resourceKey")
-    if type(root_resource_key) is not str or not root_resource_key:
-        raise ValueError("shared run root provider resource key is missing")
-    if (
-        type(shortcut_target_resource_key) is not str
-        or not shortcut_target_resource_key
-        or root_resource_key != shortcut_target_resource_key
-    ):
+    if root_resource_key is None:
+        # Keyless roots are legitimate; see require_drive_shortcut_target. The
+        # binding this check exists for is agreement between the shortcut and
+        # the provider record, not the presence of a resource key.
+        root_resource_key = ""
+    elif type(root_resource_key) is not str or not root_resource_key:
+        raise ValueError("shared run root provider resource key is invalid")
+    if type(shortcut_target_resource_key) is not str:
+        raise ValueError("shared run shortcut target resource key is invalid")
+    if root_resource_key != shortcut_target_resource_key:
         raise ValueError(
             "shared run shortcut target and provider resource key drift"
         )

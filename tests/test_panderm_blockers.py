@@ -1582,7 +1582,16 @@ class ValidationLockProviderTopologyTests(unittest.TestCase):
                         records, expected_alias="ddpm-derm-panderm-runs"
                     )
 
-    def test_shortcut_resource_key_missing_and_drift_are_distinguishable(self):
+    def test_shortcut_resource_key_is_optional_but_drift_is_still_rejected(self):
+        """A keyless shortcut target must resolve; a malformed one must not.
+
+        Drive omits targetResourceKey when the target has no resource key, which
+        is the normal case for a folder shared directly with accounts A, B and C
+        rather than by a pre-2021 link. What Drive reports also depends on how
+        the calling account obtained access, so requiring a key would lock out
+        exactly the account rotation this run version is built around. A present
+        but malformed value is still evidence of a broken provider record.
+        """
         shortcut = self._child_metadata(
             "ddpm-derm-panderm-runs",
             panderm_run.DRIVE_SHORTCUT_MIME_TYPE,
@@ -1592,12 +1601,23 @@ class ValidationLockProviderTopologyTests(unittest.TestCase):
                 "targetResourceKey": "first-resource-key",
             },
         )
-        missing = copy.deepcopy(shortcut)
-        missing["shortcutDetails"].pop("targetResourceKey")
-        with self.assertRaisesRegex(ValueError, "resource key is missing"):
+        keyless = copy.deepcopy(shortcut)
+        keyless["shortcutDetails"].pop("targetResourceKey")
+        self.assertEqual(
             panderm_run.require_drive_shortcut_target(
-                [missing], expected_alias="ddpm-derm-panderm-runs"
-            )
+                [keyless], expected_alias="ddpm-derm-panderm-runs"
+            ),
+            {"target_id": self.ROOT_ID, "target_resource_key": ""},
+        )
+        for invalid in ("", 1, True, [], {}):
+            broken = copy.deepcopy(shortcut)
+            broken["shortcutDetails"]["targetResourceKey"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "resource key is invalid"
+            ):
+                panderm_run.require_drive_shortcut_target(
+                    [broken], expected_alias="ddpm-derm-panderm-runs"
+                )
         self.assertNotEqual(
             panderm_run.require_drive_shortcut_target(
                 [shortcut], expected_alias="ddpm-derm-panderm-runs"
@@ -1796,6 +1816,55 @@ class ValidationLockProviderTopologyTests(unittest.TestCase):
                 shared_root_uuid=self.RUN_UUID,
                 topology=topology,
             )
+
+    def test_root_provider_identity_binds_a_keyless_root_without_collapsing_it(self):
+        """A keyless root must bind, and must not fingerprint as a keyed one.
+
+        This check exists to prove the shortcut and the provider record describe
+        the same folder, not to prove a resource key exists. Requiring one locks
+        out directly shared roots; ignoring the field entirely would let a keyed
+        and a keyless record be treated as the same durable root.
+        """
+        topology = self._owned_topology()
+        keyless_root = self._root_metadata(ownedByMe=False)
+        keyed_root = self._root_metadata(
+            ownedByMe=False, resourceKey="target-resource-key"
+        )
+        keyless = panderm_run.build_durable_root_provider_identity(
+            keyless_root,
+            expected_root_id=self.ROOT_ID,
+            shortcut_target_resource_key="",
+            shared_root_uuid=self.RUN_UUID,
+            topology=topology,
+        )
+        self.assertEqual(keyless["root_resource_key"], "")
+        self.assertEqual(keyless["root_file_id"], self.ROOT_ID)
+        keyed = panderm_run.build_durable_root_provider_identity(
+            keyed_root,
+            expected_root_id=self.ROOT_ID,
+            shortcut_target_resource_key="target-resource-key",
+            shared_root_uuid=self.RUN_UUID,
+            topology=topology,
+        )
+        self.assertNotEqual(
+            keyless["provider_fingerprint"],
+            keyed["provider_fingerprint"],
+            "a keyless root must not fingerprint as a keyed root",
+        )
+        for root, shortcut_key in (
+            (keyless_root, "target-resource-key"),
+            (keyed_root, ""),
+        ):
+            with self.subTest(shortcut_key=shortcut_key), self.assertRaisesRegex(
+                ValueError, "resource key drift"
+            ):
+                panderm_run.build_durable_root_provider_identity(
+                    root,
+                    expected_root_id=self.ROOT_ID,
+                    shortcut_target_resource_key=shortcut_key,
+                    shared_root_uuid=self.RUN_UUID,
+                    topology=topology,
+                )
 
     def test_provider_version_visibility_and_identity_are_reconciled(self):
         topology = self._owned_topology()
