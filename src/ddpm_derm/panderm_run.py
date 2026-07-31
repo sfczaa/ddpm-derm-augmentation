@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -260,7 +261,12 @@ def is_pinned_sha256(value: Any) -> bool:
     )
 
 
-def write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
+def write_json_atomic(
+    path: str | Path,
+    value: Mapping[str, Any],
+    *,
+    write_guard: Callable[[str], Any] | None = None,
+) -> None:
     """Write one new JSON record atomically, then re-open it exactly."""
     path = Path(path)
     if not path.parent.is_dir():
@@ -271,6 +277,8 @@ def write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
     canonical = json.loads(json.dumps(dict(value), sort_keys=True))
     temporary: Path | None = None
     try:
+        if write_guard is not None:
+            write_guard(f"JSON temporary write {path.name}")
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -288,11 +296,127 @@ def write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
         staged = json.loads(temporary.read_text(encoding="utf-8"))
         if staged != canonical:
             raise ValueError(f"temporary JSON verification failed: {temporary}")
+        if write_guard is not None:
+            write_guard(f"JSON publish {path.name}")
         os.replace(temporary, path)
         temporary = None
         reopened = json.loads(path.read_text(encoding="utf-8"))
         if reopened != canonical:
             raise ValueError(f"JSON replace/read verification failed: {path}")
+    finally:
+        if temporary is not None:
+            if write_guard is None:
+                temporary.unlink(missing_ok=True)
+
+
+def write_monotonic_run_record_atomic(
+    path: str | Path,
+    value: Mapping[str, Any],
+    *,
+    write_guard: Callable[[str], Any],
+) -> None:
+    """Publish one run history without rollback, truncation, or cross-run drift."""
+    path = Path(path)
+    record = json.loads(json.dumps(dict(value), allow_nan=False, sort_keys=True))
+    required = {"epoch", "global_step", "history", "run_identity"}
+    if not required.issubset(record):
+        raise ValueError("monotonic run record is missing identity/progress fields")
+    epoch = record["epoch"]
+    global_step = record["global_step"]
+    history = record["history"]
+    if (
+        type(epoch) is not int
+        or epoch < 0
+        or type(global_step) is not int
+        or global_step < 0
+        or not isinstance(history, list)
+        or len(history) != epoch
+        or (
+            history
+            and (
+                history[-1].get("epoch") != epoch
+                or history[-1].get("optimizer_steps") != global_step
+            )
+        )
+    ):
+        raise ValueError("run record epoch/global_step/history mismatch")
+    require_expected_identity_complete(record["run_identity"])
+    previous_bytes: bytes | None = None
+    if path.exists():
+        previous_bytes = path.read_bytes()
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict) or not required.issubset(existing):
+            raise ValueError("existing run record schema is invalid")
+        require_matching_identity(
+            existing["run_identity"], record["run_identity"]
+        )
+        existing_position = (existing["epoch"], existing["global_step"])
+        new_position = (epoch, global_step)
+        if (
+            new_position[0] < existing_position[0]
+            or new_position[1] < existing_position[1]
+            or history[: len(existing["history"])] != existing["history"]
+        ):
+            raise ValueError(
+                "run record rollback or history truncation rejected: "
+                f"existing={existing_position} new={new_position}"
+            )
+        if new_position == existing_position:
+            if existing != record:
+                raise ValueError(
+                    "same-step run record differs; refusing overwrite"
+                )
+            return
+    temporary: Path | None = None
+    published = False
+    try:
+        write_guard(f"run record temporary write {path.name}")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(record, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if json.loads(temporary.read_text(encoding="utf-8")) != record:
+            raise ValueError("run record temporary reopen mismatch")
+        write_guard(f"run record publish {path.name}")
+        os.replace(temporary, path)
+        temporary = None
+        published = True
+        if json.loads(path.read_text(encoding="utf-8")) != record:
+            raise ValueError("run record final reopen mismatch")
+    except Exception:
+        if published:
+            write_guard(f"run record restore previous {path.name}")
+            if previous_bytes is None:
+                path.unlink(missing_ok=True)
+            else:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{path.name}.restore.",
+                    suffix=".tmp",
+                    dir=path.parent,
+                    delete=False,
+                ) as handle:
+                    restore = Path(handle.name)
+                    handle.write(previous_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.replace(restore, path)
+                    if path.read_bytes() != previous_bytes:
+                        raise ValueError("run record previous-version restore failed")
+                finally:
+                    restore.unlink(missing_ok=True)
+        raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -862,6 +986,7 @@ def _copy_file_with_progress(
     destination: str | Path,
     *,
     phase: str,
+    write_guard: Callable[[str], Any] | None = None,
 ) -> None:
     source = Path(source)
     destination = Path(destination)
@@ -873,11 +998,15 @@ def _copy_file_with_progress(
         f"[{phase}] START file={source.name} bytes_total={total}",
         flush=True,
     )
+    if write_guard is not None:
+        write_guard(f"{phase} destination create")
     with source.open("rb") as reader, destination.open("xb") as writer:
         while True:
             chunk = reader.read(8 * 1024 * 1024)
             if not chunk:
                 break
+            if write_guard is not None:
+                write_guard(f"{phase} chunk {copied}")
             writer.write(chunk)
             copied += len(chunk)
             now = time.perf_counter()
@@ -954,6 +1083,7 @@ def build_validation_archive_cache(
     expected_train_rows: int = EXPECTED_SPLIT_COUNTS["train"],
     expected_val_rows: int = EXPECTED_SPLIT_COUNTS["val"],
     expected_unique_images: int = EXPECTED_VALIDATION_IMAGE_COUNT,
+    write_guard: Callable[[str], Any],
 ) -> dict[str, Any]:
     """Build and verify one immutable train/val-only tar, then write READY last."""
     approved_content_sha256 = require_approved_content_identity(
@@ -961,6 +1091,8 @@ def build_validation_archive_cache(
     )
     cache_directory = Path(cache_directory)
     runtime_temporary_root = Path(runtime_temporary_root).resolve(strict=True)
+    if not callable(write_guard):
+        raise ValueError("archive build requires an active-session write_guard")
     if cache_directory.exists():
         raise FileExistsError(
             f"refusing to overwrite existing validation archive cache: "
@@ -969,6 +1101,14 @@ def build_validation_archive_cache(
     if not cache_directory.parent.is_dir():
         raise FileNotFoundError(
             f"validation archive cache parent is missing: {cache_directory.parent}"
+        )
+    stale_staging = sorted(
+        cache_directory.parent.glob(f".{cache_directory.name}.*.staging")
+    )
+    if stale_staging:
+        raise FileExistsError(
+            "incomplete validation archive staging requires manual review: "
+            f"{stale_staging}"
         )
     inventory = validation_source_inventory(
         shared_data_root,
@@ -1001,6 +1141,10 @@ def build_validation_archive_cache(
             for index, member_name in enumerate(
                 inventory["member_names"], start=1
             ):
+                if index == 1 or index % 250 == 0 or index == total:
+                    write_guard(
+                        f"archive runtime build progress {index}/{total}"
+                    )
                 source = inventory["member_sources"][member_name]
                 info = tarfile.TarInfo(member_name)
                 info.size = source.stat().st_size
@@ -1077,15 +1221,22 @@ def build_validation_archive_cache(
             identity,
             approved_file_content_identity_sha256=approved_content_sha256,
         )
-        cache_directory.mkdir()
-        cached_archive = cache_directory / VALIDATION_ARCHIVE_FILENAME
+        write_guard("archive durable staging directory create")
+        staging_directory = cache_directory.parent / (
+            f".{cache_directory.name}.{uuid.uuid4().hex}.staging"
+        )
+        staging_directory.mkdir()
+        cached_archive = staging_directory / VALIDATION_ARCHIVE_FILENAME
         _copy_file_with_progress(
-            temporary_archive, cached_archive, phase="archive-publish"
+            temporary_archive,
+            cached_archive,
+            phase="archive durable staging",
+            write_guard=write_guard,
         )
         if sha256_file(cached_archive) != archive_sha256:
             raise ValueError("published validation archive SHA-256 mismatch")
-        identity_path = cache_directory / VALIDATION_ARCHIVE_IDENTITY_FILENAME
-        write_json_atomic(identity_path, identity)
+        identity_path = staging_directory / VALIDATION_ARCHIVE_IDENTITY_FILENAME
+        write_json_atomic(identity_path, identity, write_guard=write_guard)
         ready = {
             "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
             "cache_format_identity": VALIDATION_ARCHIVE_CACHE_FORMAT,
@@ -1096,8 +1247,20 @@ def build_validation_archive_cache(
             "archive_identity_sha256": _canonical_mapping_sha256(identity),
         }
         write_json_atomic(
-            cache_directory / VALIDATION_ARCHIVE_READY_FILENAME, ready
+            staging_directory / VALIDATION_ARCHIVE_READY_FILENAME,
+            ready,
+            write_guard=write_guard,
         )
+        validate_validation_archive_cache(
+            staging_directory,
+            expected_file_content_identity_sha256=approved_content_sha256,
+            expected_fixed_split_identity=source_fixed_split_identity,
+            expected_manifest_sha256=inventory["manifest_sha256"],
+            expected_class_mapping_sha256=inventory["class_mapping_sha256"],
+            write_guard=write_guard,
+        )
+        write_guard("archive cache directory publish")
+        os.replace(staging_directory, cache_directory)
     return identity
 
 
@@ -1108,11 +1271,14 @@ def validate_validation_archive_cache(
     expected_fixed_split_identity: str,
     expected_manifest_sha256: Mapping[str, str],
     expected_class_mapping_sha256: str,
+    write_guard: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Fail loud on any incomplete, drifted, or tampered durable cache."""
     approved_content_sha256 = require_approved_content_identity(
         expected_file_content_identity_sha256
     )
+    if write_guard is not None:
+        write_guard("archive cache validation start")
     cache_directory = Path(cache_directory)
     ready_path = cache_directory / VALIDATION_ARCHIVE_READY_FILENAME
     identity_path = cache_directory / VALIDATION_ARCHIVE_IDENTITY_FILENAME
@@ -1209,6 +1375,8 @@ def validate_validation_archive_cache(
         approved_content_sha256,
         witness="reopened validation archive tar",
     )
+    if write_guard is not None:
+        write_guard("archive cache validation completion")
     return identity
 
 
@@ -1221,11 +1389,15 @@ def reuse_validation_archive_cache(
     expected_fixed_split_identity: str,
     expected_manifest_sha256: Mapping[str, str],
     expected_class_mapping_sha256: str,
+    write_guard: Callable[[str], Any],
 ) -> dict[str, Any]:
     """Copy one verified tar to runtime, safely extract, then publish atomically."""
     approved_content_sha256 = require_approved_content_identity(
         expected_file_content_identity_sha256
     )
+    if not callable(write_guard):
+        raise ValueError("archive reuse requires an active-session write_guard")
+    write_guard("archive reuse start")
     runtime_temporary_root = Path(runtime_temporary_root).resolve(strict=True)
     local_data_root = Path(local_data_root)
     if local_data_root.exists():
@@ -1240,7 +1412,9 @@ def reuse_validation_archive_cache(
         expected_fixed_split_identity=expected_fixed_split_identity,
         expected_manifest_sha256=expected_manifest_sha256,
         expected_class_mapping_sha256=expected_class_mapping_sha256,
+        write_guard=write_guard,
     )
+    write_guard("archive reuse cache validation complete")
     source_archive = Path(cache_directory) / VALIDATION_ARCHIVE_FILENAME
     with tempfile.TemporaryDirectory(
         prefix=".panderm-validation-reuse.",
@@ -1251,6 +1425,7 @@ def reuse_validation_archive_cache(
         _copy_file_with_progress(
             source_archive, runtime_archive, phase="archive-runtime-copy"
         )
+        write_guard("archive reuse runtime copy complete")
         if sha256_file(runtime_archive) != identity["archive_sha256"]:
             raise ValueError("runtime validation archive SHA-256 mismatch")
         members = _validated_tar_members(runtime_archive)
@@ -1262,11 +1437,13 @@ def reuse_validation_archive_cache(
             expected_members=member_names,
             phase="archive-reuse-extract",
         )
+        write_guard("archive reuse extraction complete")
         inventory = _validate_extracted_validation_data(
             extracted,
             identity,
             approved_file_content_identity_sha256=approved_content_sha256,
         )
+        write_guard("archive reuse local publish")
         os.replace(extracted, local_data_root)
     return {
         "archive_files_copied": 1,
@@ -1959,9 +2136,19 @@ def require_shared_root_sentinel_identity(
     return shared_root_uuid
 
 
-VALIDATION_RUN_LOCK_FILENAME = "validation_run.lock.json"
-VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION = "CLEAR STALE PANDERM VALIDATION LOCK"
-VALIDATION_RUN_LOCK_FIELDS = (
+ACTIVE_SESSION_FILENAME = "active_session.json"
+SESSION_HISTORY_DIRECTORY = "session_history"
+TAKEOVER_AUDIT_SUFFIX = ".takeover.json"
+MANUAL_TAKEOVER_CONFIRMATION = "I CONFIRM THE PREVIOUS RUNTIME IS STOPPED"
+DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+DRIVE_JSON_MIME_TYPE = "application/json"
+DRIVE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
+VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE = "shared_drive"
+VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE = "shared_my_drive"
+# Compatibility alias for older local callers; the value is deliberately no
+# longer root-owner-only.
+VALIDATION_LOCK_TOPOLOGY_OWNED_MY_DRIVE = VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE
+ACTIVE_SESSION_FIELDS = (
     "schema_version",
     "session_id",
     "run_version",
@@ -1970,155 +2157,1109 @@ VALIDATION_RUN_LOCK_FIELDS = (
     "evaluation_scope",
     "account_label",
     "hostname",
-    "acquired_utc",
+    "started_utc",
+    "run_identity_sha256",
+    "checkpoint_cadence",
+    "maximum_quota_loss",
+)
+GRACEFUL_HANDOFF_EVENT = "graceful_handoff_complete"
+MANUAL_TAKEOVER_EVENT = "manual_takeover"
+GRACEFUL_HANDOFF_STABLE_FIELDS = (
+    "schema_version",
+    "event",
+    "event_id",
+    "completed_utc",
+    "active_session",
+    "checkpoint_integrity",
+    "result_identity",
+)
+MANUAL_TAKEOVER_STABLE_FIELDS = (
+    "schema_version",
+    "event",
+    "event_id",
+    "confirmation",
+    "confirmed_utc",
+    "previous_active_session",
+    "replacement_session_id",
 )
 
 
-def validation_run_lock_path(
+def require_drive_shortcut_target(
+    records: Sequence[Mapping[str, Any]], *, expected_alias: str
+) -> dict[str, str]:
+    """Resolve one My Drive shortcut using provider metadata, never its hidden path."""
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise ValueError("shared run shortcut provider records must be a sequence")
+    normalized = [
+        _require_drive_provider_record(
+            record,
+            label="shared run shortcut",
+            expected_name=expected_alias,
+            expected_mime_type=DRIVE_SHORTCUT_MIME_TYPE,
+        )
+        for record in records
+    ]
+    if len(normalized) != 1:
+        raise ValueError(
+            "exactly one provider-visible shared run shortcut is required in "
+            f"My Drive: alias={expected_alias!r} count={len(normalized)}"
+        )
+    details = normalized[0].get("shortcutDetails")
+    if not isinstance(details, Mapping):
+        raise ValueError("shared run shortcut target metadata is missing")
+    target_id = details.get("targetId")
+    if type(target_id) is not str or not target_id:
+        raise ValueError("shared run shortcut target id is invalid")
+    if details.get("targetMimeType") != DRIVE_FOLDER_MIME_TYPE:
+        raise ValueError("shared run shortcut target must be a Drive folder")
+    target_resource_key = details.get("targetResourceKey")
+    if type(target_resource_key) is not str or not target_resource_key:
+        raise ValueError("shared run shortcut target resource key is missing or invalid")
+    return {
+        "target_id": target_id,
+        "target_resource_key": target_resource_key,
+    }
+
+
+def require_drive_shortcut_target_id(
+    records: Sequence[Mapping[str, Any]], *, expected_alias: str
+) -> str:
+    """Compatibility wrapper that still validates the target resource key."""
+    return require_drive_shortcut_target(
+        records, expected_alias=expected_alias
+    )["target_id"]
+
+
+def drive_resource_key_header(
+    resource_keys: Sequence[tuple[str, str]],
+) -> str:
+    """Build Google's X-Goog-Drive-Resource-Keys header without ambiguity."""
+    if not isinstance(resource_keys, Sequence) or isinstance(
+        resource_keys, (str, bytes)
+    ):
+        raise ValueError("Drive resource key pairs must be a sequence")
+    observed: dict[str, str] = {}
+    for pair in resource_keys:
+        if (
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or type(pair[0]) is not str
+            or not pair[0]
+            or type(pair[1]) is not str
+            or not pair[1]
+            or any(character in pair[0] + pair[1] for character in "/,\r\n")
+        ):
+            raise ValueError("Drive resource key pair is invalid")
+        file_id, resource_key = pair
+        previous = observed.get(file_id)
+        if previous is not None and previous != resource_key:
+            raise ValueError(
+                f"Drive resource key drift for file id {file_id!r}"
+            )
+        observed[file_id] = resource_key
+    return ",".join(
+        f"{file_id}/{observed[file_id]}" for file_id in sorted(observed)
+    )
+
+
+def drive_provider_list_request_kwargs(
+    *,
+    query: str,
+    fields: str,
+    drive_id: str | None,
+    page_token: str | None,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    """Return distinct My Drive and true Shared Drive request shapes."""
+    if type(query) is not str or not query:
+        raise ValueError("Drive provider query must be non-empty")
+    if type(fields) is not str or not fields:
+        raise ValueError("Drive provider fields must be non-empty")
+    if type(page_size) is not int or not 1 <= page_size <= 1000:
+        raise ValueError("Drive provider page size is invalid")
+    if page_token is not None and (type(page_token) is not str or not page_token):
+        raise ValueError("Drive provider page token is invalid")
+    kwargs: dict[str, Any] = {
+        "q": query,
+        "spaces": "drive",
+        "pageSize": page_size,
+        "fields": fields,
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+        "corpora": "user",
+    }
+    if page_token is not None:
+        kwargs["pageToken"] = page_token
+    if drive_id is not None:
+        if type(drive_id) is not str or not drive_id:
+            raise ValueError("Shared Drive drive_id is invalid")
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    return kwargs
+
+
+def collect_drive_provider_pages(
+    fetch_page: Callable[[str | None], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collect a complete provider namespace or fail loud."""
+    if not callable(fetch_page):
+        raise ValueError("Drive provider page fetcher must be callable")
+    records: list[dict[str, Any]] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    while True:
+        response = fetch_page(page_token)
+        if not isinstance(response, Mapping):
+            raise ValueError("Drive provider list response must be a mapping")
+        if response.get("incompleteSearch") is not False:
+            raise ValueError(
+                "Drive provider namespace is incomplete; never infer unlocked"
+            )
+        files = response.get("files")
+        if not isinstance(files, list) or any(
+            not isinstance(record, Mapping) for record in files
+        ):
+            raise ValueError("Drive provider list files are invalid")
+        records.extend(dict(record) for record in files)
+        next_token = response.get("nextPageToken")
+        if next_token in (None, ""):
+            return records
+        if type(next_token) is not str or next_token in seen_tokens:
+            raise ValueError("Drive provider pagination token is invalid or repeated")
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+def _require_drive_provider_record(
+    record: Mapping[str, Any],
+    *,
+    label: str,
+    expected_name: str | None = None,
+    expected_mime_type: str | None = None,
+    expected_parent_id: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(record, Mapping):
+        raise ValueError(f"{label} provider metadata must be a mapping")
+    normalized = dict(record)
+    for field in ("id", "name", "mimeType"):
+        if type(normalized.get(field)) is not str or not normalized[field]:
+            raise ValueError(f"{label} provider metadata {field} must be non-empty")
+    if normalized.get("trashed") is not False:
+        raise ValueError(f"{label} provider metadata must prove trashed=false")
+    if expected_name is not None and normalized["name"] != expected_name:
+        raise ValueError(
+            f"{label} provider name drift: saved={normalized['name']!r} "
+            f"expected={expected_name!r}"
+        )
+    if (
+        expected_mime_type is not None
+        and normalized["mimeType"] != expected_mime_type
+    ):
+        raise ValueError(
+            f"{label} provider MIME drift: saved={normalized['mimeType']!r} "
+            f"expected={expected_mime_type!r}"
+        )
+    if expected_parent_id is not None:
+        parents = normalized.get("parents")
+        if (
+            not isinstance(parents, list)
+            or len(parents) != 1
+            or parents[0] != expected_parent_id
+        ):
+            raise ValueError(
+                f"{label} provider parent identity drift: "
+                f"saved={parents!r} expected={[expected_parent_id]!r}"
+            )
+    return normalized
+
+
+def require_validation_lock_storage_topology(
+    root_metadata: Mapping[str, Any],
+    probe_metadata: Mapping[str, Any],
+    *,
+    expected_root_id: str,
+    expected_probe_name: str,
+) -> dict[str, Any]:
+    """Require owner-stable lock descendants before any expensive phase.
+
+    A true Shared Drive has one provider-owned namespace. A shared My Drive
+    folder has per-creator descendants, so the API account only needs to own
+    the FUSE-created probe (proving API/mount account alignment). Cross-account
+    descendant visibility must be established by the sequential handoff's
+    shared-root sentinel and reopen checks; root ownership is account-neutral.
+    """
+    root = _require_drive_provider_record(
+        root_metadata,
+        label="shared run root",
+        expected_mime_type=DRIVE_FOLDER_MIME_TYPE,
+    )
+    if root["id"] != expected_root_id:
+        raise ValueError(
+            "shared run root provider id drift: "
+            f"saved={root['id']!r} expected={expected_root_id!r}"
+        )
+    probe = _require_drive_provider_record(
+        probe_metadata,
+        label="lock topology probe",
+        expected_name=expected_probe_name,
+        expected_parent_id=expected_root_id,
+    )
+    root_drive_id = root.get("driveId")
+    probe_drive_id = probe.get("driveId")
+    if type(root_drive_id) is str and root_drive_id:
+        if probe_drive_id != root_drive_id:
+            raise ValueError(
+                "lock topology probe escaped the root Shared Drive: "
+                f"root_drive_id={root_drive_id!r} "
+                f"probe_drive_id={probe_drive_id!r}"
+            )
+        mode = VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE
+    else:
+        if probe_drive_id not in (None, ""):
+            raise ValueError(
+                "shared My Drive root and lock topology probe disagree on driveId"
+            )
+        if probe.get("ownedByMe") is not True:
+            raise ValueError(
+                "Drive API/FUSE account mismatch: the authenticated API account "
+                "must own the uniquely named child created through the public "
+                "MyDrive alias"
+            )
+        mode = VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE
+    return {
+        "status": "passed",
+        "mode": mode,
+        "folder_id": expected_root_id,
+        "drive_id": root_drive_id,
+    }
+
+
+def require_drive_api_fuse_account_alignment(
+    probe_metadata: Mapping[str, Any], *, expected_probe_name: str
+) -> dict[str, str]:
+    """Prove the Drive API account owns a FUSE-created private My Drive probe."""
+    probe = _require_drive_provider_record(
+        probe_metadata,
+        label="Drive API/FUSE account probe",
+        expected_name=expected_probe_name,
+        expected_parent_id="root",
+    )
+    if probe.get("ownedByMe") is not True:
+        raise ValueError(
+            "Drive API/FUSE account mismatch: the API account does not own "
+            "the private My Drive probe created through FUSE"
+        )
+    if probe.get("driveId") not in (None, ""):
+        raise ValueError(
+            "Drive API/FUSE account probe must be in private My Drive, not a "
+            "Shared Drive"
+        )
+    return {"file_id": probe["id"], "status": "passed"}
+
+
+def build_durable_root_provider_identity(
+    root_metadata: Mapping[str, Any],
+    *,
+    expected_root_id: str,
+    shortcut_target_resource_key: str,
+    shared_root_uuid: str,
+    topology: Mapping[str, Any],
+) -> dict[str, str]:
+    """Bind the qualified artifact root to provider and shortcut identity."""
+    root = _require_drive_provider_record(
+        root_metadata,
+        label="shared run root",
+        expected_mime_type=DRIVE_FOLDER_MIME_TYPE,
+    )
+    normalized_topology = _require_provider_topology_mapping(topology)
+    if root["id"] != expected_root_id:
+        raise ValueError("shared run root provider id drift")
+    root_resource_key = root.get("resourceKey")
+    if type(root_resource_key) is not str or not root_resource_key:
+        raise ValueError("shared run root provider resource key is missing")
+    if (
+        type(shortcut_target_resource_key) is not str
+        or not shortcut_target_resource_key
+        or root_resource_key != shortcut_target_resource_key
+    ):
+        raise ValueError(
+            "shared run shortcut target and provider resource key drift"
+        )
+    try:
+        parsed_uuid = uuid.UUID(shared_root_uuid)
+    except (TypeError, ValueError) as error:
+        raise ValueError("shared_root_uuid is invalid") from error
+    if str(parsed_uuid) != shared_root_uuid or parsed_uuid.version != 4:
+        raise ValueError("shared_root_uuid must be a canonical UUIDv4")
+    drive_id = normalized_topology.get("drive_id") or ""
+    provider_projection = {
+        "drive_id": drive_id,
+        "mime_type": root["mimeType"],
+        "name": root["name"],
+        "parents": root.get("parents"),
+        "root_file_id": root["id"],
+        "root_resource_key": root_resource_key,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            provider_projection,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "drive_id": drive_id,
+        "provider_fingerprint": fingerprint,
+        "root_file_id": root["id"],
+        "root_resource_key": root_resource_key,
+        "run_version": RUN_VERSION,
+        "shared_root_uuid": shared_root_uuid,
+        "topology_mode": normalized_topology["mode"],
+    }
+
+
+def _require_provider_topology_mapping(
+    topology: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(topology, Mapping):
+        raise ValueError("validation lock storage topology must be a mapping")
+    normalized = dict(topology)
+    if normalized.get("status") != "passed":
+        raise ValueError("validation lock storage topology did not pass")
+    mode = normalized.get("mode")
+    if mode not in {
+        VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE,
+        VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE,
+    }:
+        raise ValueError("validation lock storage topology mode is invalid")
+    if type(normalized.get("folder_id")) is not str or not normalized["folder_id"]:
+        raise ValueError("validation lock storage topology folder_id is invalid")
+    if mode == VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE:
+        if type(normalized.get("drive_id")) is not str or not normalized["drive_id"]:
+            raise ValueError("Shared Drive topology must carry a drive_id")
+    elif normalized.get("drive_id") not in (None, ""):
+        raise ValueError("shared My Drive topology must not carry a drive_id")
+    return normalized
+
+
+def _require_provider_child_topology(
+    record: Mapping[str, Any],
+    *,
+    label: str,
+    expected_name: str,
+    expected_mime_type: str,
+    expected_parent_id: str,
+    topology: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized_topology = _require_provider_topology_mapping(topology)
+    child = _require_drive_provider_record(
+        record,
+        label=label,
+        expected_name=expected_name,
+        expected_mime_type=expected_mime_type,
+        expected_parent_id=expected_parent_id,
+    )
+    if normalized_topology["mode"] == VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE:
+        if child.get("driveId") != normalized_topology["drive_id"]:
+            raise ValueError(f"{label} provider Shared Drive identity drift")
+    else:
+        if child.get("driveId") not in (None, ""):
+            raise ValueError(f"{label} unexpectedly belongs to a Shared Drive")
+    return child
+
+
+def require_validation_version_provider_state(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_parent_id: str,
+    run_version: str,
+    topology: Mapping[str, Any],
+    local_version_exists: bool,
+) -> dict[str, Any] | None:
+    """Reconcile the FUSE version directory with the provider namespace."""
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise ValueError("validation version provider records must be a sequence")
+    normalized = [
+        _require_provider_child_topology(
+            record,
+            label="validation version directory",
+            expected_name=run_version,
+            expected_mime_type=DRIVE_FOLDER_MIME_TYPE,
+            expected_parent_id=expected_parent_id,
+            topology=topology,
+        )
+        for record in records
+    ]
+    if len(normalized) > 1:
+        raise ValueError(
+            "ambiguous duplicate validation version directories exist in the "
+            "provider namespace; inspect manually"
+        )
+    if local_version_exists:
+        if not normalized:
+            raise FileNotFoundError(
+                "validation version directory is visible through FUSE but absent "
+                "from the Drive provider namespace"
+            )
+        return normalized[0]
+    if normalized:
+        raise ValueError(
+            "validation version directory exists in the Drive provider namespace "
+            "but is invisible through FUSE; refusing to create a duplicate"
+        )
+    return None
+
+
+def require_active_session_provider_state(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_parent_id: str,
+    topology: Mapping[str, Any],
+    expected_present: bool,
+    expected_file_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Require one provider-visible active marker or prove that none exists."""
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise ValueError("active session provider records must be a sequence")
+    normalized = [
+        _require_provider_child_topology(
+            record,
+            label="active session marker",
+            expected_name=ACTIVE_SESSION_FILENAME,
+            expected_mime_type=DRIVE_JSON_MIME_TYPE,
+            expected_parent_id=expected_parent_id,
+            topology=topology,
+        )
+        for record in records
+    ]
+    if len(normalized) > 1:
+        raise ValueError(
+            "ambiguous duplicate active session markers exist in the provider "
+            "namespace; no staging, attempt, runner, or automatic cleanup is allowed"
+        )
+    if expected_present:
+        if not normalized:
+            raise FileNotFoundError(
+                "active session marker is absent from the Drive provider namespace"
+            )
+        observed = normalized[0]
+        if expected_file_id is not None and observed["id"] != expected_file_id:
+            raise ValueError(
+                "active session provider file identity drift: "
+                f"saved={observed['id']!r} expected={expected_file_id!r}"
+            )
+        return observed
+    if normalized:
+        raise FileExistsError(
+            "the Drive provider namespace already contains an active session "
+            "marker, even if the FUSE alias cannot see it; do not create a "
+            "replacement without explicit manual takeover"
+        )
+    return None
+
+
+def active_session_path(
     shared_run_root: str | Path, *, run_version: str = RUN_VERSION
 ) -> Path:
-    """The one durable lock for a run version.
-
-    Deliberately fixed per run version and *outside* any timestamped attempt
-    directory: a lock that lived inside ``validation_runs/<timestamp>/`` would be
-    a different path for every attempt, so two accounts would each create their
-    own and never collide.
-    """
-    return Path(shared_run_root) / run_version / VALIDATION_RUN_LOCK_FILENAME
+    """Return the fixed operational marker for one sequential run version."""
+    return Path(shared_run_root) / run_version / ACTIVE_SESSION_FILENAME
 
 
-def _read_validation_run_lock(lock_path: str | Path) -> dict[str, Any]:
-    marker = json.loads(Path(lock_path).read_text(encoding="utf-8"))
-    if not isinstance(marker, dict) or set(marker) != set(VALIDATION_RUN_LOCK_FIELDS):
+def _validate_active_session_marker(
+    marker: Mapping[str, Any], *, marker_path: str | Path
+) -> dict[str, Any]:
+    if not isinstance(marker, dict) or set(marker) != set(ACTIVE_SESSION_FIELDS):
         raise ValueError(
-            f"validation run lock schema mismatch at {lock_path}; inspect manually"
+            f"active session schema mismatch at {marker_path}; inspect manually"
         )
-    for field in VALIDATION_RUN_LOCK_FIELDS:
+    for field in ACTIVE_SESSION_FIELDS:
         if field == "schema_version":
-            if type(marker[field]) is not int:
-                raise ValueError("validation run lock schema_version must be int")
+            if marker[field] != 1:
+                raise ValueError(
+                    "active session schema_version mismatch: "
+                    f"saved={marker[field]!r} expected=1"
+                )
             continue
         if type(marker[field]) is not str or not marker[field]:
-            raise ValueError(f"validation run lock {field} must be a non-empty string")
-    return marker
+            raise ValueError(f"active session {field} must be a non-empty string")
+    for field in ("session_id", "shared_root_uuid"):
+        try:
+            parsed = uuid.UUID(marker[field])
+        except ValueError as error:
+            raise ValueError(
+                f"active session {field} must be a canonical UUID"
+            ) from error
+        if str(parsed) != marker[field]:
+            raise ValueError(
+                f"active session {field} must be a canonical UUID"
+            )
+    commit = marker["git_commit"]
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise ValueError(
+            "active session git_commit must be a full lowercase commit SHA"
+        )
+    if not is_pinned_sha256(marker["run_identity_sha256"]):
+        raise ValueError("active session run identity SHA-256 is invalid")
+    if marker["account_label"] not in {"A", "B", "C"}:
+        raise ValueError("active session account label must be A, B, or C")
+    if marker["evaluation_scope"] != VALIDATION_ONLY:
+        raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
+    if marker["checkpoint_cadence"] != "every_epoch":
+        raise ValueError("active session checkpoint cadence must be every_epoch")
+    if marker["maximum_quota_loss"] != "one_incomplete_epoch":
+        raise ValueError(
+            "active session maximum quota loss must be one_incomplete_epoch"
+        )
+    return dict(marker)
 
 
-def acquire_validation_run_lock(
-    lock_path: str | Path,
+def _read_active_session(marker_path: str | Path) -> dict[str, Any]:
+    marker = json.loads(Path(marker_path).read_text(encoding="utf-8"))
+    return _validate_active_session_marker(marker, marker_path=marker_path)
+
+
+def require_active_session_identity(
+    marker: Mapping[str, Any],
+    *,
+    session_id: str,
+    run_version: str,
+    git_commit: str,
+    shared_root_uuid: str,
+    run_identity_sha256: str,
+    evaluation_scope: str = VALIDATION_ONLY,
+    marker_path: str | Path = "<provider>",
+) -> dict[str, Any]:
+    """Require the exact active session before a durable publish boundary."""
+    observed = _validate_active_session_marker(marker, marker_path=marker_path)
+    expected = {
+        "session_id": str(session_id),
+        "run_version": str(run_version),
+        "git_commit": str(git_commit),
+        "shared_root_uuid": str(shared_root_uuid),
+        "run_identity_sha256": str(run_identity_sha256),
+        "evaluation_scope": str(evaluation_scope),
+    }
+    mismatches = [
+        f"{field}: saved={observed[field]!r} expected={value!r}"
+        for field, value in expected.items()
+        if observed[field] != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "active session identity drift; refusing durable work: "
+            + "; ".join(mismatches)
+        )
+    return observed
+
+
+def canonical_identity_sha256(value: Mapping[str, Any]) -> str:
+    require_primitive_identity(dict(value))
+    encoded = json.dumps(
+        dict(value),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _replace_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    canonical = json.dumps(
+        dict(value), allow_nan=False, ensure_ascii=True, sort_keys=True
+    ) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(canonical)
+            handle.flush()
+            os.fsync(handle.fileno())
+        reopened = json.loads(temporary.read_text(encoding="ascii"))
+        if reopened != dict(value):
+            raise ValueError(f"temporary JSON reopen mismatch: {path.name}")
+        os.replace(temporary, path)
+        temporary = None
+        if json.loads(path.read_text(encoding="ascii")) != dict(value):
+            raise ValueError(f"published JSON reopen mismatch: {path.name}")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write_json_once_or_identical(path: Path, value: Mapping[str, Any]) -> None:
+    if path.exists():
+        observed = json.loads(path.read_text(encoding="utf-8"))
+        if observed != dict(value):
+            raise FileExistsError(
+                f"existing audit record differs; refusing overwrite: {path}"
+            )
+        return
+    write_json_atomic(path, value)
+
+
+def audit_event_id(event: str, *, run_version: str, subject_session_id: str) -> str:
+    """Deterministic identity for one handoff/takeover event.
+
+    The identity never contains a timestamp, hostname or account label, so a
+    crashed session that retries the same event produces the same identity
+    instead of a second, drifted audit payload.
+    """
+    if type(event) is not str or not event:
+        raise ValueError("audit event name must be a non-empty string")
+    return f"{event}:{run_version}:{subject_session_id}"
+
+
+def _read_existing_audit_event(path: Path) -> dict[str, Any] | None:
+    """Return an already published audit payload, or None when absent."""
+    if not path.exists():
+        return None
+    try:
+        observed = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"existing audit record is unreadable: {path}") from error
+    if not isinstance(observed, dict):
+        raise ValueError(f"existing audit record is not a mapping: {path}")
+    return observed
+
+
+def _reused_audit_timestamp(
+    published: Mapping[str, Any] | None, field: str, path: Path
+) -> str:
+    """Reuse the first published timestamp so retries stay byte-identical."""
+    if published is None:
+        return utc_now()
+    saved = published.get(field)
+    if type(saved) is not str or not saved:
+        raise ValueError(
+            f"existing audit record has no usable {field}; inspect manually: {path}"
+        )
+    return saved
+
+
+def _publish_audit_event_once(
+    path: Path, value: Mapping[str, Any], *, stable_fields: Sequence[str]
+) -> dict[str, Any]:
+    """Publish one deterministic audit event or accept the identical retry."""
+    published = _read_existing_audit_event(path)
+    if published is None:
+        write_json_atomic(path, value)
+        return json.loads(path.read_text(encoding="utf-8"))
+    mismatches = [
+        f"{field}: saved={published.get(field)!r} retry={value[field]!r}"
+        for field in stable_fields
+        if published.get(field) != value[field]
+    ]
+    if mismatches or published != dict(value):
+        raise FileExistsError(
+            "existing audit record differs; refusing overwrite: "
+            f"{path}" + ("" if not mismatches else ": " + "; ".join(mismatches))
+        )
+    return published
+
+
+def _read_takeover_audit_history(
+    history_directory: Path,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Read every published takeover audit or fail loud on an unusable one."""
+    history: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(history_directory.glob(f"*{TAKEOVER_AUDIT_SUFFIX}")):
+        record = _read_existing_audit_event(path)
+        if record is None:
+            continue
+        if set(record) != set(MANUAL_TAKEOVER_STABLE_FIELDS):
+            raise ValueError(
+                f"takeover audit schema mismatch at {path}; inspect manually"
+            )
+        if record["schema_version"] != 1:
+            raise ValueError(
+                "takeover audit schema_version mismatch: "
+                f"saved={record['schema_version']!r} expected=1: {path}"
+            )
+        subject = record.get("previous_active_session")
+        subject_id = (
+            subject.get("session_id") if isinstance(subject, Mapping) else None
+        )
+        if type(subject_id) is not str or not subject_id:
+            raise ValueError(
+                f"takeover audit has no usable previous session id: {path}"
+            )
+        if path.name != f"{subject_id}{TAKEOVER_AUDIT_SUFFIX}":
+            raise ValueError(
+                f"takeover audit name disagrees with its retired session: {path}"
+            )
+        # The graceful path revalidates its retired marker through
+        # _read_active_session, so the takeover path must hold the retired
+        # snapshot to the same schema instead of trusting the stored JSON.
+        try:
+            _validate_active_session_marker(subject, marker_path=path)
+        except ValueError as error:
+            raise ValueError(
+                f"takeover audit retired session is unusable: {path}: {error}"
+            ) from error
+        history.append((path, record))
+    return history
+
+
+def _adopt_published_takeover_replacement(
+    history_directory: Path,
+    *,
+    current: Mapping[str, Any],
+    run_version: str,
+    git_commit: str,
+    shared_root_uuid: str,
+    account_label: str,
+    run_identity_sha256: str,
+    evaluation_scope: str,
+    marker_path: Path,
+) -> dict[str, Any] | None:
+    """Recognise a lost response after an already completed takeover.
+
+    A restarted runtime mints a new candidate UUID, so a lost response cannot be
+    detected by comparing UUIDs. The published audit answers it instead: the
+    active marker is this operator's own replacement when exactly one audit
+    names it and no stable field drifted. Returns ``None`` when the caller is a
+    genuinely different operator, which is the next real takeover.
+    """
+    current_session_id = current["session_id"]
+    history = _read_takeover_audit_history(history_directory)
+    retired = {
+        record["previous_active_session"]["session_id"] for _, record in history
+    }
+    replacements: list[tuple[Path, dict[str, Any]]] = []
+    for path, record in history:
+        if record["previous_active_session"]["session_id"] == current_session_id:
+            # This audit retires the active marker, so it belongs to the crashed
+            # takeover the caller completes instead of to an adoption.
+            continue
+        replacement = record.get("replacement_session_id")
+        if type(replacement) is not str or not replacement:
+            raise ValueError(
+                f"takeover audit has no usable replacement_session_id: {path}"
+            )
+        if replacement == current_session_id:
+            replacements.append((path, record))
+        elif replacement not in retired:
+            raise ValueError(
+                "takeover audit history contradicts the active session marker: "
+                f"{path} names replacement {replacement!r}, which is neither the "
+                f"active session {current_session_id!r} nor retired by a later "
+                "audit; inspect manually"
+            )
+    if not replacements:
+        return None
+    if len(replacements) > 1:
+        raise ValueError(
+            "ambiguous takeover audits name the same replacement session; "
+            "inspect manually: "
+            + ", ".join(str(path) for path, _ in replacements)
+        )
+    audit_path, audit = replacements[0]
+    missing = [
+        field for field in MANUAL_TAKEOVER_STABLE_FIELDS if field not in audit
+    ]
+    if missing:
+        raise ValueError(
+            f"takeover audit is missing stable fields {missing}: {audit_path}"
+        )
+    retired_session = audit["previous_active_session"]
+    expected_event_id = audit_event_id(
+        MANUAL_TAKEOVER_EVENT,
+        run_version=str(run_version),
+        subject_session_id=retired_session["session_id"],
+    )
+    if (
+        audit["event"] != MANUAL_TAKEOVER_EVENT
+        or audit["event_id"] != expected_event_id
+        or audit["confirmation"] != MANUAL_TAKEOVER_CONFIRMATION
+    ):
+        raise ValueError(
+            "takeover audit event identity drift; refusing to adopt the active "
+            f"session: {audit_path}"
+        )
+    drift = [
+        f"{field}: audit={retired_session.get(field)!r} expected={value!r}"
+        for field, value in (
+            ("run_version", str(run_version)),
+            ("git_commit", str(git_commit)),
+            ("shared_root_uuid", str(shared_root_uuid)),
+            ("run_identity_sha256", str(run_identity_sha256)),
+            ("evaluation_scope", str(evaluation_scope)),
+        )
+        if retired_session.get(field) != value
+    ]
+    if drift:
+        raise ValueError(
+            "takeover audit identity drift; refusing to adopt the active "
+            f"session: {audit_path}: " + "; ".join(drift)
+        )
+    if current["account_label"] != str(account_label):
+        # A different confirmed operator is the next real takeover, so the
+        # caller must retire this marker instead of adopting it.
+        return None
+    return require_active_session_identity(
+        current,
+        session_id=current_session_id,
+        run_version=run_version,
+        git_commit=git_commit,
+        shared_root_uuid=shared_root_uuid,
+        run_identity_sha256=run_identity_sha256,
+        evaluation_scope=evaluation_scope,
+        marker_path=marker_path,
+    )
+
+
+def start_sequential_session(
+    marker_path: str | Path,
     *,
     session_id: str,
     run_version: str,
     git_commit: str,
     shared_root_uuid: str,
     account_label: str,
+    run_identity_sha256: str,
+    manual_takeover_confirmed: bool = False,
+    history_directory: str | Path | None = None,
     evaluation_scope: str = VALIDATION_ONLY,
 ) -> dict[str, Any]:
-    """Atomically take the single validation run lock, or fail loud.
-
-    Acquisition is a single exclusive create (``open("x")`` inside
-    ``create_running_marker``), never ``exists()`` then write: two accounts that
-    both see "no attempt yet" must not both proceed. The marker is re-read after
-    creation so a caller only continues if it still owns the lock it just took.
-    """
-    if evaluation_scope != VALIDATION_ONLY:
-        raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
-    try:
-        uuid.UUID(str(session_id))
-    except ValueError as error:
-        raise ValueError("validation run lock session_id must be a UUID") from error
-    lock_path = Path(lock_path)
-    if not lock_path.parent.is_dir():
+    """Start one manually serialized session; this is deliberately not a CAS."""
+    marker_path = Path(marker_path)
+    if not marker_path.parent.is_dir():
         raise FileNotFoundError(
-            f"validation run lock directory is missing: {lock_path.parent}"
+            f"run-version directory is missing: {marker_path.parent}"
         )
-    marker = {
-        "schema_version": VALIDATION_ARCHIVE_SCHEMA_VERSION,
-        "session_id": str(session_id),
-        "run_version": str(run_version),
-        "git_commit": str(git_commit),
-        "shared_root_uuid": str(shared_root_uuid),
-        "evaluation_scope": evaluation_scope,
-        "account_label": str(account_label),
-        "hostname": socket.gethostname(),
-        "acquired_utc": utc_now(),
-    }
-    try:
-        create_running_marker(lock_path, marker)
-    except FileExistsError as error:
-        try:
-            holder = _read_validation_run_lock(lock_path)
-            detail = (
-                f"session_id={holder['session_id']} "
-                f"account_label={holder['account_label']} "
-                f"hostname={holder['hostname']} "
-                f"acquired_utc={holder['acquired_utc']} "
-                f"run_version={holder['run_version']}"
-            )
-        except (OSError, ValueError) as read_error:
-            detail = f"existing lock could not be parsed: {read_error}"
+    def build_marker(effective_session_id: str) -> dict[str, Any]:
+        return _validate_active_session_marker(
+            {
+                "schema_version": 1,
+                "session_id": str(effective_session_id),
+                "run_version": str(run_version),
+                "git_commit": str(git_commit),
+                "shared_root_uuid": str(shared_root_uuid),
+                "evaluation_scope": str(evaluation_scope),
+                "account_label": str(account_label),
+                "hostname": socket.gethostname(),
+                "started_utc": utc_now(),
+                "run_identity_sha256": str(run_identity_sha256),
+                "checkpoint_cadence": "every_epoch",
+                "maximum_quota_loss": "one_incomplete_epoch",
+            },
+            marker_path=marker_path,
+        )
+
+    if not marker_path.exists():
+        write_json_atomic(marker_path, build_marker(session_id))
+        return require_active_session_identity(
+            _read_active_session(marker_path),
+            session_id=session_id,
+            run_version=run_version,
+            git_commit=git_commit,
+            shared_root_uuid=shared_root_uuid,
+            run_identity_sha256=run_identity_sha256,
+            marker_path=marker_path,
+        )
+    previous = _read_active_session(marker_path)
+    if manual_takeover_confirmed is not True:
         raise FileExistsError(
-            "another PanDerm validation session already holds the run lock; "
-            "no staging, attempt or runner may start. Existing owner: "
-            f"{detail}. Lock: {lock_path}. If that runtime is definitely stopped, "
-            "clear it manually with clear_stale_validation_run_lock; Run all must "
-            "never clear it automatically."
-        ) from error
-    # Re-read: only continue while we still own what we just created.
-    observed = _read_validation_run_lock(lock_path)
-    if observed != marker:
-        raise ValueError(
-            "validation run lock changed between create and re-read; refusing to "
-            f"proceed. Lock: {lock_path}"
+            "an active session already exists; confirm the previous runtime is "
+            "stopped before an explicit manual takeover"
         )
-    return observed
-
-
-def release_validation_run_lock(
-    lock_path: str | Path, *, session_id: str
-) -> dict[str, Any]:
-    """Release only a lock this session owns; a wrong owner never deletes it."""
-    lock_path = Path(lock_path)
-    if not lock_path.is_file():
+    if history_directory is None:
+        raise ValueError("manual takeover requires an existing history directory")
+    history_directory = Path(history_directory)
+    if not history_directory.is_dir():
         raise FileNotFoundError(
-            f"validation run lock is not present to release: {lock_path}"
+            f"session history directory is missing: {history_directory}"
         )
-    holder = _read_validation_run_lock(lock_path)
-    if holder["session_id"] != str(session_id):
-        raise PermissionError(
-            "refusing to release a validation run lock owned by another session: "
-            f"owner={holder['session_id']} caller={session_id} lock={lock_path}"
+    if previous["session_id"] == str(session_id):
+        # The replacement marker was already published and only the response was
+        # lost; re-publishing it would drift hostname/started_utc for no reason.
+        return require_active_session_identity(
+            previous,
+            session_id=session_id,
+            run_version=run_version,
+            git_commit=git_commit,
+            shared_root_uuid=shared_root_uuid,
+            run_identity_sha256=run_identity_sha256,
+            marker_path=marker_path,
         )
-    lock_path.unlink()
-    return holder
+    adopted = _adopt_published_takeover_replacement(
+        history_directory,
+        current=previous,
+        run_version=run_version,
+        git_commit=git_commit,
+        shared_root_uuid=shared_root_uuid,
+        account_label=account_label,
+        run_identity_sha256=run_identity_sha256,
+        evaluation_scope=evaluation_scope,
+        marker_path=marker_path,
+    )
+    if adopted is not None:
+        # The previous takeover already published this marker and only the
+        # response was lost; a restarted runtime must not mint a second
+        # transition just because it generated a new candidate id.
+        return adopted
+    # The audit is keyed on the retired session only, so a crashed takeover
+    # retries the same event instead of minting a second replacement id.
+    audit_path = history_directory / f"{previous['session_id']}{TAKEOVER_AUDIT_SUFFIX}"
+    published = _read_existing_audit_event(audit_path)
+    replacement_session_id = str(session_id)
+    if published is not None:
+        saved_replacement = published.get("replacement_session_id")
+        if type(saved_replacement) is not str or not saved_replacement:
+            raise ValueError(
+                "existing takeover audit has no usable replacement_session_id; "
+                f"inspect manually: {audit_path}"
+            )
+        replacement_session_id = saved_replacement
+    marker = build_marker(replacement_session_id)
+    audit = {
+        "schema_version": 1,
+        "event": MANUAL_TAKEOVER_EVENT,
+        "event_id": audit_event_id(
+            MANUAL_TAKEOVER_EVENT,
+            run_version=str(run_version),
+            subject_session_id=previous["session_id"],
+        ),
+        "confirmation": MANUAL_TAKEOVER_CONFIRMATION,
+        "confirmed_utc": _reused_audit_timestamp(
+            published, "confirmed_utc", audit_path
+        ),
+        "previous_active_session": previous,
+        "replacement_session_id": replacement_session_id,
+    }
+    _publish_audit_event_once(
+        audit_path, audit, stable_fields=MANUAL_TAKEOVER_STABLE_FIELDS
+    )
+    _replace_json_atomic(marker_path, marker)
+    return _read_active_session(marker_path)
 
 
-def clear_stale_validation_run_lock(
-    lock_path: str | Path,
+def complete_sequential_session(
+    marker_path: str | Path,
     *,
-    stale_session_id: str,
-    confirmation: str,
+    session_id: str,
+    history_directory: str | Path,
+    checkpoint_integrity: Mapping[str, Any],
+    result_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Manual, human-confirmed recovery only.
+    """Record a verified graceful handoff, then atomically retire the marker."""
+    marker_path = Path(marker_path)
+    history_directory = Path(history_directory)
+    if not history_directory.is_dir():
+        raise FileNotFoundError(
+            f"session history directory is missing: {history_directory}"
+        )
+    completion_path = history_directory / f"{session_id}.completed.json"
+    snapshot_path = history_directory / f"{session_id}.active.json"
+    published = _read_existing_audit_event(completion_path)
 
-    Never called by Run all and never time-based: an abruptly killed runtime must
-    leave the lock behind so the next run fails loud, and the operator must first
-    confirm the old Colab runtime really is stopped. Switching account A/B/C is
-    not by itself a reason to clear.
+    def build_completion(marker: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "event": GRACEFUL_HANDOFF_EVENT,
+            "event_id": audit_event_id(
+                GRACEFUL_HANDOFF_EVENT,
+                run_version=marker["run_version"],
+                subject_session_id=marker["session_id"],
+            ),
+            "completed_utc": _reused_audit_timestamp(
+                published, "completed_utc", completion_path
+            ),
+            "active_session": dict(marker),
+            "checkpoint_integrity": dict(checkpoint_integrity),
+            "result_identity": dict(result_identity),
+        }
+
+    if not marker_path.exists():
+        # The marker already transitioned; only a lost response is retryable and
+        # it must reproduce the published payload exactly.
+        if published is None or not snapshot_path.is_file():
+            raise FileNotFoundError(
+                "active session marker is missing without a completed graceful "
+                f"handoff: {marker_path}"
+            )
+        retired = _read_active_session(snapshot_path)
+        if retired["session_id"] != session_id:
+            raise PermissionError("retired active session belongs to another session")
+        return _publish_audit_event_once(
+            completion_path,
+            build_completion(retired),
+            stable_fields=GRACEFUL_HANDOFF_STABLE_FIELDS,
+        )
+    marker = _read_active_session(marker_path)
+    if marker["session_id"] != session_id:
+        raise PermissionError("active session belongs to another session")
+    if snapshot_path.exists():
+        raise FileExistsError(
+            f"active-session audit snapshot already exists: {snapshot_path}"
+        )
+    completion = build_completion(marker)
+    _publish_audit_event_once(
+        completion_path, completion, stable_fields=GRACEFUL_HANDOFF_STABLE_FIELDS
+    )
+    os.replace(marker_path, snapshot_path)
+    if _read_active_session(snapshot_path) != marker or marker_path.exists():
+        raise ValueError("graceful handoff marker transition failed reopen validation")
+    return completion
+
+
+class SequentialSessionWriteGuard:
+    """Re-open the active marker at durable publish boundaries.
+
+    This enforces the declared manual-serialization contract in this process; it
+    is not a cross-client compare-and-swap primitive.
     """
-    lock_path = Path(lock_path)
-    if confirmation != VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION:
-        raise ValueError(
-            "stale validation run lock confirmation text did not match "
-            f"{VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION!r}"
+
+    ENV_KEYS = {
+        "marker_path": "PANDERM_ACTIVE_SESSION_PATH",
+        "session_id": "PANDERM_ACTIVE_SESSION_ID",
+        "run_version": "PANDERM_ACTIVE_RUN_VERSION",
+        "git_commit": "PANDERM_ACTIVE_GIT_COMMIT",
+        "shared_root_uuid": "PANDERM_ACTIVE_SHARED_ROOT_UUID",
+        "run_identity_sha256": "PANDERM_ACTIVE_RUN_IDENTITY_SHA256",
+    }
+
+    def __init__(self, **values):
+        self._values = values
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str] | None = None):
+        source = os.environ if environment is None else environment
+        values = {}
+        for field, key in cls.ENV_KEYS.items():
+            value = source.get(key)
+            if type(value) is not str or not value:
+                raise RuntimeError(f"missing sequential session environment: {key}")
+            values[field] = value
+        return cls(**values)
+
+    def require(self, phase: str) -> dict[str, Any]:
+        if type(phase) is not str or not phase:
+            raise ValueError("sequential session phase must be non-empty")
+        marker = _read_active_session(self._values["marker_path"])
+        return require_active_session_identity(
+            marker,
+            session_id=self._values["session_id"],
+            run_version=self._values["run_version"],
+            git_commit=self._values["git_commit"],
+            shared_root_uuid=self._values["shared_root_uuid"],
+            run_identity_sha256=self._values["run_identity_sha256"],
+            marker_path=self._values["marker_path"],
         )
-    holder = _read_validation_run_lock(lock_path)
-    if holder["session_id"] != str(stale_session_id):
-        raise PermissionError(
-            "stale validation run lock owner mismatch; refusing to clear: "
-            f"owner={holder['session_id']} supplied={stale_session_id}"
-        )
-    clear_stale_marker(lock_path, "CLEAR STALE MARKER")
-    return holder
+
+    def bind_run_identity(self, run_identity: Mapping[str, Any]) -> None:
+        observed = canonical_identity_sha256(run_identity)
+        if observed != self._values["run_identity_sha256"]:
+            raise ValueError("active session run identity does not match this process")
+        self.require("bind immutable run identity")
 
 
 def probe_shared_drive(root: str | Path) -> dict[str, str]:

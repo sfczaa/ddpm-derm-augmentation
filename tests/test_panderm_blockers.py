@@ -23,7 +23,10 @@ from unittest import mock
 import numpy as np
 import torch
 
-from tests.test_panderm_base_c1_finetune import build_mock_model
+from tests.test_panderm_base_c1_finetune import (
+    AllowDurableWriteGuard,
+    build_mock_model,
+)
 
 from ddpm_derm import panderm, panderm_run, train_panderm
 
@@ -397,6 +400,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                 expected_train_rows=1,
                 expected_val_rows=1,
                 expected_unique_images=2,
+                write_guard=AllowDurableWriteGuard().require,
             )
             self.assertTrue(
                 (cache / panderm_run.VALIDATION_ARCHIVE_READY_FILENAME).is_file()
@@ -433,6 +437,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                     expected_manifest_sha256=inventory["manifest_sha256"],
                     expected_class_mapping_sha256=
                         inventory["class_mapping_sha256"],
+                    write_guard=AllowDurableWriteGuard().require,
                 )
             self.assertEqual(copy_mock.call_count, 1)
             self.assertEqual(report["archive_files_copied"], 1)
@@ -473,7 +478,117 @@ class ValidationDataStagingTests(unittest.TestCase):
                     expected_train_rows=1,
                     expected_val_rows=1,
                     expected_unique_images=2,
+                    write_guard=AllowDurableWriteGuard().require,
                 )
+
+    def test_archive_build_fence_loss_never_publishes_final_cache(self):
+        failure_phases = (
+            "archive runtime build progress 5/5",
+            "JSON temporary write archive_identity.json",
+            "archive cache directory publish",
+        )
+        for failure_phase in failure_phases:
+            with self.subTest(failure_phase=failure_phase):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shared = self._fixture(root)
+                    cache_parent = root / "cache_parent"
+                    cache_parent.mkdir()
+                    cache = cache_parent / "cache"
+                    runtime = root / "runtime"
+                    runtime.mkdir()
+                    calls = []
+
+                    def reject(phase):
+                        calls.append(phase)
+                        if failure_phase in phase:
+                            raise RuntimeError("stale archive fence")
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stale archive fence"
+                    ):
+                        panderm_run.build_validation_archive_cache(
+                            shared,
+                            cache,
+                            runtime,
+                            expected_file_content_identity_sha256=(
+                                self._approved_content_identity(shared)
+                            ),
+                            source_fixed_split_identity="fixed-split",
+                            expected_train_rows=1,
+                            expected_val_rows=1,
+                            expected_unique_images=2,
+                            write_guard=reject,
+                        )
+                    self.assertFalse(cache.exists())
+                    self.assertEqual(list(runtime.iterdir()), [])
+                    self.assertTrue(
+                        any(failure_phase in phase for phase in calls)
+                    )
+
+    def test_archive_reuse_fence_loss_cleans_runtime_and_never_publishes(self):
+        failure_phases = (
+            "archive cache validation completion",
+            "archive reuse extraction complete",
+            "archive reuse local publish",
+        )
+        for failure_phase in failure_phases:
+            with self.subTest(failure_phase=failure_phase):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shared = self._fixture(root)
+                    inventory = panderm_run.validation_source_inventory(
+                        shared,
+                        expected_train_rows=1,
+                        expected_val_rows=1,
+                        expected_unique_images=2,
+                    )
+                    cache_parent = root / "cache_parent"
+                    cache_parent.mkdir()
+                    cache = cache_parent / "cache"
+                    runtime = root / "runtime"
+                    runtime.mkdir()
+                    panderm_run.build_validation_archive_cache(
+                        shared,
+                        cache,
+                        runtime,
+                        expected_file_content_identity_sha256=(
+                            self._approved_content_identity(shared)
+                        ),
+                        source_fixed_split_identity="fixed-split",
+                        expected_train_rows=1,
+                        expected_val_rows=1,
+                        expected_unique_images=2,
+                        write_guard=AllowDurableWriteGuard().require,
+                    )
+                    local = runtime / "data"
+                    calls = []
+
+                    def reject(phase):
+                        calls.append(phase)
+                        if failure_phase == phase:
+                            raise RuntimeError("stale archive fence")
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stale archive fence"
+                    ):
+                        panderm_run.reuse_validation_archive_cache(
+                            cache,
+                            runtime,
+                            local,
+                            expected_file_content_identity_sha256=(
+                                self._approved_content_identity(shared)
+                            ),
+                            expected_fixed_split_identity="fixed-split",
+                            expected_manifest_sha256=inventory["manifest_sha256"],
+                            expected_class_mapping_sha256=(
+                                inventory["class_mapping_sha256"]
+                            ),
+                            write_guard=reject,
+                        )
+                    self.assertFalse(local.exists())
+                    self.assertEqual(list(runtime.iterdir()), [])
+                    self.assertIn(failure_phase, calls)
 
     def test_extracted_image_content_tamper_matrix_is_rejected(self):
         def one_byte(train, _val):
@@ -513,6 +628,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                         expected_train_rows=1,
                         expected_val_rows=1,
                         expected_unique_images=2,
+                        write_guard=AllowDurableWriteGuard().require,
                     )
                     local = runtime / "data"
                     panderm_run.reuse_validation_archive_cache(
@@ -527,6 +643,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                         },
                         expected_class_mapping_sha256=
                             identity_record["class_mapping_sha256"],
+                        write_guard=AllowDurableWriteGuard().require,
                     )
                     mutate(
                         local / "raw" / "mixed" / "train_a.jpg",
@@ -559,6 +676,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                 expected_train_rows=1,
                 expected_val_rows=1,
                 expected_unique_images=2,
+                write_guard=AllowDurableWriteGuard().require,
             )
             local = runtime / "data"
             panderm_run.reuse_validation_archive_cache(
@@ -573,6 +691,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                 },
                 expected_class_mapping_sha256=
                     identity_record["class_mapping_sha256"],
+                write_guard=AllowDurableWriteGuard().require,
             )
             for name, mutate in {
                 "missing": lambda candidate: (
@@ -624,6 +743,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                 expected_train_rows=1,
                 expected_val_rows=1,
                 expected_unique_images=2,
+                write_guard=AllowDurableWriteGuard().require,
             )
             real_extract = panderm_run._safe_extract_validation_archive
 
@@ -647,6 +767,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                     expected_manifest_sha256=inventory["manifest_sha256"],
                     expected_class_mapping_sha256=
                         inventory["class_mapping_sha256"],
+                    write_guard=AllowDurableWriteGuard().require,
                 )
                 runner(report)
 
@@ -695,6 +816,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                     expected_train_rows=1,
                     expected_val_rows=1,
                     expected_unique_images=2,
+                    write_guard=AllowDurableWriteGuard().require,
                 )
             self.assertFalse(cache.exists())
 
@@ -751,6 +873,7 @@ class ValidationDataStagingTests(unittest.TestCase):
                 expected_train_rows=1,
                 expected_val_rows=1,
                 expected_unique_images=2,
+                write_guard=AllowDurableWriteGuard().require,
             )
 
             mutations = {
@@ -968,11 +1091,18 @@ class ValidationDataStagingTests(unittest.TestCase):
                         expected_train_rows=1,
                         expected_val_rows=1,
                         expected_unique_images=2,
+                        write_guard=AllowDurableWriteGuard().require,
                     )
-            self.assertTrue(cache.is_dir())
+            self.assertFalse(cache.exists())
+            staging = list(cache_parent.glob(".cache.*.staging"))
+            self.assertEqual(len(staging), 1)
             self.assertFalse(
-                (cache / panderm_run.VALIDATION_ARCHIVE_READY_FILENAME).exists()
+                (
+                    staging[0]
+                    / panderm_run.VALIDATION_ARCHIVE_READY_FILENAME
+                ).exists()
             )
+            self.assertEqual(list(runtime.iterdir()), [])
 
     def test_archive_copy_heartbeat_reports_real_bytes_and_elapsed_time(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1059,6 +1189,7 @@ class ApprovedContentIdentityTests(unittest.TestCase):
             expected_file_content_identity_sha256=approved,
             source_fixed_split_identity="fixed-split",
             expected_train_rows=1, expected_val_rows=1, expected_unique_images=2,
+            write_guard=AllowDurableWriteGuard().require,
         )
 
     def _validate(self, cache, identity, approved):
@@ -1158,6 +1289,7 @@ class ApprovedContentIdentityTests(unittest.TestCase):
                     "val": identity["val_manifest_sha256"],
                 },
                 expected_class_mapping_sha256=identity["class_mapping_sha256"],
+                write_guard=AllowDurableWriteGuard().require,
             )
             self.assertEqual(report["archive_files_copied"], 1)
             self.assertEqual(
@@ -1216,6 +1348,7 @@ class ApprovedContentIdentityTests(unittest.TestCase):
                     },
                     expected_class_mapping_sha256=
                         evil_identity["class_mapping_sha256"],
+                    write_guard=AllowDurableWriteGuard().require,
                 )
             # Rejected before anything was published to the runtime data root.
             self.assertFalse(local.exists())
@@ -1293,336 +1426,1431 @@ class ApprovedContentIdentityTests(unittest.TestCase):
                         "val": identity["val_manifest_sha256"],
                     },
                     expected_class_mapping_sha256=identity["class_mapping_sha256"],
+                    write_guard=AllowDurableWriteGuard().require,
                 )
             self.assertFalse((runtime / "data").exists())
 
 
-RACE_WORKER = r'''
-import json, os, sys, time
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from ddpm_derm import panderm_run
+class ValidationLockProviderTopologyTests(unittest.TestCase):
+    def test_private_my_drive_probe_proves_api_and_fuse_account_alignment(self):
+        probe = {
+            "id": "private-probe-id",
+            "name": "private-probe.json",
+            "mimeType": panderm_run.DRIVE_JSON_MIME_TYPE,
+            "parents": ["root"],
+            "ownedByMe": True,
+            "trashed": False,
+        }
+        accepted = panderm_run.require_drive_api_fuse_account_alignment(
+            probe, expected_probe_name="private-probe.json"
+        )
+        self.assertEqual(accepted["status"], "passed")
+        for mutation in (
+            {**probe, "ownedByMe": False},
+            {**probe, "driveId": "shared-drive-id"},
+            {**probe, "parents": ["different-root"]},
+        ):
+            with self.assertRaises(ValueError):
+                panderm_run.require_drive_api_fuse_account_alignment(
+                    mutation, expected_probe_name="private-probe.json"
+                )
 
-lock_path = Path(sys.argv[2])
-session_id = sys.argv[3]
-start_at = float(sys.argv[4])
-calls = {"staging": 0, "attempt": 0, "runner": 0}
-# Spin to the shared wall-clock instant so both processes contend at once.
-while time.time() < start_at:
-    pass
-try:
-    marker = panderm_run.acquire_validation_run_lock(
-        lock_path,
-        session_id=session_id,
-        run_version=panderm_run.RUN_VERSION,
-        git_commit="c" * 40,
-        shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
-        account_label="A",
-    )
-    # Only a winner may do any of these.
-    calls["staging"] += 1
-    calls["attempt"] += 1
-    calls["runner"] += 1
-    print(json.dumps({"acquired": True, "session_id": session_id,
-                      "owner": marker["session_id"], "calls": calls}))
-except FileExistsError as error:
-    print(json.dumps({"acquired": False, "session_id": session_id,
-                      "calls": calls, "error": str(error)[:200]}))
-'''
+    ROOT_ID = "root-folder-id"
+    DRIVE_ID = "shared-drive-id"
+    RUN_UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
+
+    def _root_metadata(self, **overrides):
+        value = {
+            "id": self.ROOT_ID,
+            "name": "ddpm-derm-panderm-runs",
+            "mimeType": panderm_run.DRIVE_FOLDER_MIME_TYPE,
+            "parents": ["my-drive-root"],
+            "driveId": None,
+            "ownedByMe": True,
+            "trashed": False,
+        }
+        value.update(overrides)
+        return value
+
+    def _child_metadata(self, name, mime_type, **overrides):
+        value = {
+            "id": f"{name}-id",
+            "name": name,
+            "mimeType": mime_type,
+            "parents": [self.ROOT_ID],
+            "driveId": None,
+            "ownedByMe": True,
+            "trashed": False,
+        }
+        value.update(overrides)
+        return value
+
+    def _owned_topology(self):
+        return panderm_run.require_validation_lock_storage_topology(
+            self._root_metadata(),
+            self._child_metadata("probe.json", panderm_run.DRIVE_JSON_MIME_TYPE),
+            expected_root_id=self.ROOT_ID,
+            expected_probe_name="probe.json",
+        )
+
+    def _shared_topology(self):
+        return panderm_run.require_validation_lock_storage_topology(
+            self._root_metadata(driveId=self.DRIVE_ID, ownedByMe=False),
+            self._child_metadata(
+                "probe.json",
+                panderm_run.DRIVE_JSON_MIME_TYPE,
+                driveId=self.DRIVE_ID,
+                ownedByMe=False,
+            ),
+            expected_root_id=self.ROOT_ID,
+            expected_probe_name="probe.json",
+        )
+
+    def _active_metadata(self, parent_id="version-id", **overrides):
+        value = {
+            "id": "active-session-id",
+            "name": panderm_run.ACTIVE_SESSION_FILENAME,
+            "mimeType": panderm_run.DRIVE_JSON_MIME_TYPE,
+            "parents": [parent_id],
+            "driveId": None,
+            "ownedByMe": True,
+            "trashed": False,
+        }
+        value.update(overrides)
+        return value
+
+    def _marker(self, session_id, **overrides):
+        value = {
+            "schema_version": panderm_run.VALIDATION_ARCHIVE_SCHEMA_VERSION,
+            "session_id": session_id,
+            "run_version": panderm_run.RUN_VERSION,
+            "git_commit": "c" * 40,
+            "shared_root_uuid": self.RUN_UUID,
+            "evaluation_scope": panderm_run.VALIDATION_ONLY,
+            "account_label": "A",
+            "hostname": "runtime",
+            "acquired_utc": "2026-07-29T07:35:20+00:00",
+        }
+        value.update(overrides)
+        return value
+
+    def test_provider_shortcut_target_id_is_required_and_exact(self):
+        shortcut = self._child_metadata(
+            "ddpm-derm-panderm-runs",
+            panderm_run.DRIVE_SHORTCUT_MIME_TYPE,
+            shortcutDetails={
+                "targetId": self.ROOT_ID,
+                "targetMimeType": panderm_run.DRIVE_FOLDER_MIME_TYPE,
+                "targetResourceKey": "target-resource-key",
+            },
+        )
+        target = panderm_run.require_drive_shortcut_target(
+            [shortcut], expected_alias="ddpm-derm-panderm-runs"
+        )
+        self.assertEqual(
+            target,
+            {
+                "target_id": self.ROOT_ID,
+                "target_resource_key": "target-resource-key",
+            },
+        )
+        self.assertEqual(
+            panderm_run.require_drive_shortcut_target_id(
+                [shortcut], expected_alias="ddpm-derm-panderm-runs"
+            ),
+            self.ROOT_ID,
+        )
+        for records in (
+            [],
+            [shortcut, dict(shortcut, id="duplicate-shortcut")],
+            [dict(shortcut, name="wrong-alias")],
+            [dict(shortcut, shortcutDetails={})],
+            [
+                dict(
+                    shortcut,
+                    shortcutDetails={
+                        "targetId": self.ROOT_ID,
+                        "targetMimeType": panderm_run.DRIVE_JSON_MIME_TYPE,
+                        "targetResourceKey": "target-resource-key",
+                    },
+                )
+            ],
+        ):
+            with self.subTest(records=records):
+                with self.assertRaises(ValueError):
+                    panderm_run.require_drive_shortcut_target_id(
+                        records, expected_alias="ddpm-derm-panderm-runs"
+                    )
+
+    def test_shortcut_resource_key_missing_and_drift_are_distinguishable(self):
+        shortcut = self._child_metadata(
+            "ddpm-derm-panderm-runs",
+            panderm_run.DRIVE_SHORTCUT_MIME_TYPE,
+            shortcutDetails={
+                "targetId": self.ROOT_ID,
+                "targetMimeType": panderm_run.DRIVE_FOLDER_MIME_TYPE,
+                "targetResourceKey": "first-resource-key",
+            },
+        )
+        missing = copy.deepcopy(shortcut)
+        missing["shortcutDetails"].pop("targetResourceKey")
+        with self.assertRaisesRegex(ValueError, "resource key is missing"):
+            panderm_run.require_drive_shortcut_target(
+                [missing], expected_alias="ddpm-derm-panderm-runs"
+            )
+        self.assertNotEqual(
+            panderm_run.require_drive_shortcut_target(
+                [shortcut], expected_alias="ddpm-derm-panderm-runs"
+            )["target_resource_key"],
+            panderm_run.require_drive_shortcut_target(
+                [
+                    {
+                        **shortcut,
+                        "shortcutDetails": {
+                            **shortcut["shortcutDetails"],
+                            "targetResourceKey": "second-resource-key",
+                        },
+                    }
+                ],
+                expected_alias="ddpm-derm-panderm-runs",
+            )["target_resource_key"],
+        )
+        with self.assertRaisesRegex(ValueError, "resource key drift"):
+            panderm_run.drive_resource_key_header(
+                [
+                    (self.ROOT_ID, "first-resource-key"),
+                    (self.ROOT_ID, "second-resource-key"),
+                ]
+            )
+
+    def test_true_shared_drive_and_account_neutral_shared_my_drive_are_supported(self):
+        owned = self._owned_topology()
+        shared = self._shared_topology()
+        self.assertEqual(
+            owned["mode"],
+            panderm_run.VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE,
+        )
+        self.assertEqual(
+            shared["mode"],
+            panderm_run.VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE,
+        )
+        self.assertIsNone(owned["drive_id"])
+        self.assertEqual(shared["drive_id"], self.DRIVE_ID)
+
+    def test_shared_my_drive_root_owner_is_neutral_but_api_fuse_probe_must_align(self):
+        account_neutral = panderm_run.require_validation_lock_storage_topology(
+            self._root_metadata(ownedByMe=False),
+            self._child_metadata(
+                "probe.json",
+                panderm_run.DRIVE_JSON_MIME_TYPE,
+                ownedByMe=True,
+            ),
+            expected_root_id=self.ROOT_ID,
+            expected_probe_name="probe.json",
+        )
+        self.assertEqual(
+            account_neutral["mode"],
+            panderm_run.VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE,
+        )
+        cases = {
+            "probe_not_owned": (
+                self._root_metadata(),
+                self._child_metadata(
+                    "probe.json",
+                    panderm_run.DRIVE_JSON_MIME_TYPE,
+                    ownedByMe=False,
+                ),
+            ),
+            "probe_drive_mismatch": (
+                self._root_metadata(),
+                self._child_metadata(
+                    "probe.json",
+                    panderm_run.DRIVE_JSON_MIME_TYPE,
+                    driveId=self.DRIVE_ID,
+                ),
+            ),
+        }
+        for name, (root, probe) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(
+                    ValueError, "API/FUSE account mismatch|disagree"
+                ):
+                    panderm_run.require_validation_lock_storage_topology(
+                        root,
+                        probe,
+                        expected_root_id=self.ROOT_ID,
+                        expected_probe_name="probe.json",
+                    )
+
+    def test_root_probe_and_shared_drive_identity_drift_are_rejected(self):
+        cases = {
+            "root_id": (
+                self._root_metadata(id="other-root"),
+                self._child_metadata(
+                    "probe.json",
+                    panderm_run.DRIVE_JSON_MIME_TYPE,
+                ),
+                "root provider id drift",
+            ),
+            "probe_parent": (
+                self._root_metadata(),
+                self._child_metadata(
+                    "probe.json",
+                    panderm_run.DRIVE_JSON_MIME_TYPE,
+                    parents=["other-root"],
+                ),
+                "parent identity drift",
+            ),
+            "shared_drive": (
+                self._root_metadata(driveId=self.DRIVE_ID, ownedByMe=False),
+                self._child_metadata(
+                    "probe.json",
+                    panderm_run.DRIVE_JSON_MIME_TYPE,
+                    driveId="other-drive",
+                    ownedByMe=False,
+                ),
+                "escaped",
+            ),
+        }
+        for name, (root, probe, message) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    panderm_run.require_validation_lock_storage_topology(
+                        root,
+                        probe,
+                        expected_root_id=self.ROOT_ID,
+                        expected_probe_name="probe.json",
+                    )
+
+    def test_drive_list_request_shape_is_dynamic_and_shared_drive_scoped(self):
+        common = {
+            "query": "'root' in parents",
+            "fields": "nextPageToken,incompleteSearch,files(id)",
+            "page_token": None,
+        }
+        my_drive = panderm_run.drive_provider_list_request_kwargs(
+            **common, drive_id=None
+        )
+        shared_drive = panderm_run.drive_provider_list_request_kwargs(
+            **common, drive_id=self.DRIVE_ID
+        )
+        self.assertEqual(my_drive["corpora"], "user")
+        self.assertNotIn("driveId", my_drive)
+        self.assertEqual(shared_drive["corpora"], "drive")
+        self.assertEqual(shared_drive["driveId"], self.DRIVE_ID)
+        for request in (my_drive, shared_drive):
+            self.assertIs(request["supportsAllDrives"], True)
+            self.assertIs(request["includeItemsFromAllDrives"], True)
+
+    def test_drive_list_paginates_and_incomplete_namespace_fails_loud(self):
+        pages = {
+            None: {
+                "files": [{"id": "first"}],
+                "incompleteSearch": False,
+                "nextPageToken": "page-2",
+            },
+            "page-2": {
+                "files": [{"id": "second"}],
+                "incompleteSearch": False,
+            },
+        }
+        calls = []
+        records = panderm_run.collect_drive_provider_pages(
+            lambda token: calls.append(token) or pages[token]
+        )
+        self.assertEqual([record["id"] for record in records], ["first", "second"])
+        self.assertEqual(calls, [None, "page-2"])
+        for response in (
+            {"files": [], "incompleteSearch": True},
+            {"files": []},
+        ):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    panderm_run.collect_drive_provider_pages(
+                        lambda token, response=response: response
+                    )
+
+    def test_root_provider_identity_binds_shortcut_resource_key(self):
+        topology = self._owned_topology()
+        root = self._root_metadata(
+            ownedByMe=False, resourceKey="target-resource-key"
+        )
+        identity = panderm_run.build_durable_root_provider_identity(
+            root,
+            expected_root_id=self.ROOT_ID,
+            shortcut_target_resource_key="target-resource-key",
+            shared_root_uuid=self.RUN_UUID,
+            topology=topology,
+        )
+        self.assertEqual(identity["root_file_id"], self.ROOT_ID)
+        self.assertEqual(identity["root_resource_key"], "target-resource-key")
+        self.assertEqual(
+            identity["topology_mode"],
+            panderm_run.VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE,
+        )
+        with self.assertRaisesRegex(ValueError, "resource key drift"):
+            panderm_run.build_durable_root_provider_identity(
+                root,
+                expected_root_id=self.ROOT_ID,
+                shortcut_target_resource_key="different-resource-key",
+                shared_root_uuid=self.RUN_UUID,
+                topology=topology,
+            )
+
+    def test_provider_version_visibility_and_identity_are_reconciled(self):
+        topology = self._owned_topology()
+        version = self._child_metadata(
+            panderm_run.RUN_VERSION,
+            panderm_run.DRIVE_FOLDER_MIME_TYPE,
+        )
+        observed = panderm_run.require_validation_version_provider_state(
+            [version],
+            expected_parent_id=self.ROOT_ID,
+            run_version=panderm_run.RUN_VERSION,
+            topology=topology,
+            local_version_exists=True,
+        )
+        self.assertEqual(observed["id"], version["id"])
+        self.assertIsNone(
+            panderm_run.require_validation_version_provider_state(
+                [],
+                expected_parent_id=self.ROOT_ID,
+                run_version=panderm_run.RUN_VERSION,
+                topology=topology,
+                local_version_exists=False,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "invisible through FUSE"):
+            panderm_run.require_validation_version_provider_state(
+                [version],
+                expected_parent_id=self.ROOT_ID,
+                run_version=panderm_run.RUN_VERSION,
+                topology=topology,
+                local_version_exists=False,
+            )
+        with self.assertRaisesRegex(ValueError, "ambiguous duplicate"):
+            panderm_run.require_validation_version_provider_state(
+                [version, dict(version, id="duplicate-version")],
+                expected_parent_id=self.ROOT_ID,
+                run_version=panderm_run.RUN_VERSION,
+                topology=topology,
+                local_version_exists=True,
+            )
+
+    def test_provider_visible_but_fuse_invisible_active_marker_blocks_new_session(self):
+        topology = self._owned_topology()
+        active = self._active_metadata()
+        with self.assertRaisesRegex(
+            FileExistsError,
+            "even if the FUSE alias cannot see it",
+        ):
+            panderm_run.require_active_session_provider_state(
+                [active],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=False,
+            )
+        self.assertIsNone(
+            panderm_run.require_active_session_provider_state(
+                [],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=False,
+            )
+        )
+
+    def test_provider_active_marker_missing_duplicate_parent_and_id_drift_reject(self):
+        topology = self._owned_topology()
+        active = self._active_metadata()
+        with self.assertRaises(FileNotFoundError):
+            panderm_run.require_active_session_provider_state(
+                [],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=True,
+            )
+        with self.assertRaisesRegex(ValueError, "ambiguous duplicate"):
+            panderm_run.require_active_session_provider_state(
+                [active, dict(active, id="duplicate-active")],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=True,
+            )
+        with self.assertRaisesRegex(ValueError, "parent identity drift"):
+            panderm_run.require_active_session_provider_state(
+                [dict(active, parents=["other-version"])],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=True,
+            )
+        with self.assertRaisesRegex(ValueError, "file identity drift"):
+            panderm_run.require_active_session_provider_state(
+                [active],
+                expected_parent_id="version-id",
+                topology=topology,
+                expected_present=True,
+                expected_file_id="other-active-id",
+            )
+        cross_owner = panderm_run.require_active_session_provider_state(
+            [dict(active, ownedByMe=False)],
+            expected_parent_id="version-id",
+            topology=topology,
+            expected_present=True,
+        )
+        self.assertEqual(cross_owner["id"], active["id"])
 
 
-class AtomicValidationRunLockTests(unittest.TestCase):
-    """One validation per run version, enforced atomically across accounts.
+class SequentialHandoffTests(unittest.TestCase):
+    ROOT_UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
+    COMMIT = "c" * 40
 
-    The previous guard only listed existing attempt directories, which is a
-    TOCTOU: account A and account B can both observe "no attempt yet" and both
-    proceed. These tests use two genuinely concurrent OS processes rather than
-    sequential mocks, because a sequential test cannot distinguish an atomic
-    exclusive create from a check-then-write.
+    def test_concurrent_candidate_files_are_absent(self):
+        root = Path(__file__).resolve().parents[1]
+        removed = (
+            "apps_script/panderm_coordinator/Code.gs",
+            "apps_script/panderm_coordinator/appsscript.json",
+            "docs/panderm_coordinator_deployment.md",
+            "scripts/panderm_coordinator_release.py",
+            "src/ddpm_derm/panderm_coordinator.py",
+            "tests/js/test_panderm_coordinator.js",
+            "tests/test_panderm_coordinator.py",
+        )
+        self.assertEqual(
+            [relative for relative in removed if (root / relative).exists()],
+            [],
+        )
+
+    def _paths(self, base):
+        version = Path(base) / panderm_run.RUN_VERSION
+        version.mkdir()
+        history = version / panderm_run.SESSION_HISTORY_DIRECTORY
+        history.mkdir()
+        return (
+            panderm_run.active_session_path(base),
+            history,
+            panderm_run.canonical_identity_sha256(identity()),
+        )
+
+    def _start(self, marker, history, run_hash, account, session, *, takeover=False):
+        return panderm_run.start_sequential_session(
+            marker,
+            session_id=session,
+            run_version=panderm_run.RUN_VERSION,
+            git_commit=self.COMMIT,
+            shared_root_uuid=self.ROOT_UUID,
+            account_label=account,
+            run_identity_sha256=run_hash,
+            manual_takeover_confirmed=takeover,
+            history_directory=history,
+        )
+
+    def test_graceful_a_to_b_preserves_audit_and_same_run_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._paths(temporary)
+            session_a = str(uuid.uuid4())
+            session_b = str(uuid.uuid4())
+            active_a = self._start(marker, history, run_hash, "A", session_a)
+            completion = panderm_run.complete_sequential_session(
+                marker,
+                session_id=session_a,
+                history_directory=history,
+                checkpoint_integrity={"epoch": 2, "global_step": 16, "sha256": "a" * 64},
+                result_identity={"epoch": 2, "global_step": 16, "run_identity_sha256": run_hash},
+            )
+            self.assertEqual(completion["active_session"], active_a)
+            self.assertFalse(marker.exists())
+            self.assertTrue((history / f"{session_a}.active.json").is_file())
+            self.assertTrue((history / f"{session_a}.completed.json").is_file())
+            active_b = self._start(marker, history, run_hash, "B", session_b)
+            self.assertEqual(active_b["run_identity_sha256"], run_hash)
+            self.assertEqual(active_b["shared_root_uuid"], self.ROOT_UUID)
+            self.assertEqual(active_b["checkpoint_cadence"], "every_epoch")
+            self.assertEqual(active_b["maximum_quota_loss"], "one_incomplete_epoch")
+
+    def test_abrupt_stop_requires_explicit_manual_takeover_and_preserves_old_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._paths(temporary)
+            session_a = str(uuid.uuid4())
+            session_b = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_a)
+            before = marker.read_bytes()
+            abandoned_temp = marker.parent / ".last.pt.interrupted.tmp"
+            abandoned_temp.write_bytes(b"partial")
+            with self.assertRaisesRegex(FileExistsError, "confirm"):
+                self._start(marker, history, run_hash, "B", session_b)
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertEqual(list(history.iterdir()), [])
+            active_b = self._start(
+                marker, history, run_hash, "B", session_b, takeover=True
+            )
+            audit = history / f"{session_a}.takeover.json"
+            self.assertTrue(audit.is_file())
+            recorded = json.loads(audit.read_text(encoding="utf-8"))
+            self.assertEqual(
+                recorded["previous_active_session"]["session_id"], session_a
+            )
+            self.assertEqual(
+                recorded["event_id"],
+                panderm_run.audit_event_id(
+                    panderm_run.MANUAL_TAKEOVER_EVENT,
+                    run_version=panderm_run.RUN_VERSION,
+                    subject_session_id=session_a,
+                ),
+            )
+            self.assertEqual(active_b["session_id"], session_b)
+            self.assertTrue(abandoned_temp.is_file())
+
+    def test_conflicting_audit_blocks_takeover_without_replacing_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._paths(temporary)
+            session_a = str(uuid.uuid4())
+            session_b = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_a)
+            before = marker.read_bytes()
+            audit = history / f"{session_a}.takeover.json"
+            # A well-formed audit whose stable fields disagree must never be
+            # silently replaced, even though its replacement id is reusable.
+            audit.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event": panderm_run.MANUAL_TAKEOVER_EVENT,
+                        "event_id": panderm_run.audit_event_id(
+                            panderm_run.MANUAL_TAKEOVER_EVENT,
+                            run_version=panderm_run.RUN_VERSION,
+                            subject_session_id=session_a,
+                        ),
+                        "confirmation": "SOMETHING ELSE",
+                        "confirmed_utc": "2026-01-01T00:00:00Z",
+                        # The retired snapshot must be the real marker so this
+                        # stays a stable-field conflict rather than a record the
+                        # schema guard rejects before the conflict is reached.
+                        "previous_active_session": json.loads(
+                            before.decode("utf-8")
+                        ),
+                        "replacement_session_id": session_b,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(FileExistsError):
+                self._start(
+                    marker, history, run_hash, "B", session_b, takeover=True
+                )
+            self.assertEqual(marker.read_bytes(), before)
+
+    def test_active_session_guard_rejects_identity_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._paths(temporary)
+            session = str(uuid.uuid4())
+            active = self._start(marker, history, run_hash, "A", session)
+            accepted = panderm_run.require_active_session_identity(
+                active,
+                session_id=session,
+                run_version=panderm_run.RUN_VERSION,
+                git_commit=self.COMMIT,
+                shared_root_uuid=self.ROOT_UUID,
+                run_identity_sha256=run_hash,
+            )
+            self.assertEqual(accepted, active)
+            for field, value in (
+                ("session_id", str(uuid.uuid4())),
+                ("run_version", "other-version"),
+                ("git_commit", "d" * 40),
+                ("shared_root_uuid", str(uuid.uuid4())),
+                ("run_identity_sha256", "e" * 64),
+            ):
+                kwargs = {
+                    "session_id": session,
+                    "run_version": panderm_run.RUN_VERSION,
+                    "git_commit": self.COMMIT,
+                    "shared_root_uuid": self.ROOT_UUID,
+                    "run_identity_sha256": run_hash,
+                }
+                kwargs[field] = value
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, "identity drift"
+                ):
+                    panderm_run.require_active_session_identity(active, **kwargs)
+
+
+class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
+    """Direct regressions for the five reviewed sequential-handoff blockers.
+
+    Each test names the reviewer probe it decides so a failure states which
+    blocker regressed rather than only which assertion tripped.
     """
 
-    def _root(self, base):
-        root = Path(base) / panderm_run.RUN_VERSION
-        root.mkdir(parents=True)
-        return Path(base)
+    ROOT_UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
+    COMMIT = "c" * 40
 
-    def _acquire(self, lock_path, session_id, **overrides):
-        kwargs = dict(
-            session_id=session_id,
-            run_version=panderm_run.RUN_VERSION,
-            git_commit="c" * 40,
-            shared_root_uuid="765b971f-d148-4960-a77d-b73f28fc013c",
-            account_label="A",
+    # --- shared fixtures ---------------------------------------------------
+    def _session_paths(self, base):
+        version = Path(base) / panderm_run.RUN_VERSION
+        version.mkdir()
+        history = version / panderm_run.SESSION_HISTORY_DIRECTORY
+        history.mkdir()
+        return (
+            panderm_run.active_session_path(base),
+            history,
+            panderm_run.canonical_identity_sha256(identity()),
         )
-        kwargs.update(overrides)
-        return panderm_run.acquire_validation_run_lock(lock_path, **kwargs)
 
-    def test_lock_path_is_fixed_per_run_version_not_per_attempt(self):
-        path = panderm_run.validation_run_lock_path(Path("/shared"))
-        self.assertEqual(path.name, panderm_run.VALIDATION_RUN_LOCK_FILENAME)
-        self.assertEqual(path.parent.name, panderm_run.RUN_VERSION)
-        # Never nested under a timestamped attempt directory.
-        self.assertNotIn("validation_runs", path.parts)
-        other = panderm_run.validation_run_lock_path(Path("/shared"))
-        self.assertEqual(path, other)
+    def _start(self, marker, history, run_hash, account, session, *, takeover=False):
+        return panderm_run.start_sequential_session(
+            marker,
+            session_id=session,
+            run_version=panderm_run.RUN_VERSION,
+            git_commit=self.COMMIT,
+            shared_root_uuid=self.ROOT_UUID,
+            account_label=account,
+            run_identity_sha256=run_hash,
+            manual_takeover_confirmed=takeover,
+            history_directory=history,
+        )
 
-    def test_two_concurrent_processes_yield_exactly_one_winner(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            worker = Path(temporary) / "worker.py"
-            worker.write_text(RACE_WORKER, encoding="utf-8")
-            src = str(Path(panderm_run.__file__).resolve().parents[1])
-            start_at = time.time() + 1.5
-            sessions = [str(uuid.uuid4()), str(uuid.uuid4())]
-            processes = [
-                subprocess.Popen(
-                    [sys.executable, "-B", "-u", str(worker), src,
-                     str(lock_path), session, str(start_at)],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    def _components(self):
+        model = build_mock_model()
+        optimizer = panderm.build_optimizer(model, num_layers=4)
+        schedule = panderm.WarmupCosineSchedule(
+            optimizer, warmup_epochs=1, epochs=2, steps_per_epoch=2
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+        return model, optimizer, schedule, scaler
+
+    def _write_checkpoint_pair(self, directory, run_identity, *, epoch, perturb=0.0):
+        """Save one production checkpoint named ``last.pt`` with a real sidecar."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        model, optimizer, schedule, scaler = self._components()
+        if perturb:
+            with torch.no_grad():
+                next(model.parameters()).add_(perturb)
+        path = directory / "last.pt"
+        train_panderm.save_checkpoint(
+            path,
+            model,
+            optimizer,
+            schedule,
+            scaler,
+            epoch,
+            0.5,
+            [
+                {"epoch": completed, "optimizer_steps": schedule.step_count}
+                for completed in range(1, epoch + 1)
+            ],
+            type("A", (), {"seed": 0, "epochs": 5})(),
+            run_identity,
+            write_guard=AllowDurableWriteGuard(),
+        )
+        return path, train_panderm.checkpoint_integrity_path(path)
+
+    def _install_backup(self, final_path, source_pair, previous_id, *, sidecar_edit=None):
+        """Copy a saved pair into ``final_path``'s directory as a predecessor."""
+        source_checkpoint, source_sidecar = source_pair
+        prefix = f".{final_path.name}.previous.{previous_id}"
+        backup = final_path.parent / f"{prefix}.pt"
+        backup_sidecar = final_path.parent / f"{prefix}.integrity.json"
+        shutil.copy2(source_checkpoint, backup)
+        record = json.loads(source_sidecar.read_text(encoding="utf-8"))
+        if sidecar_edit is not None:
+            record = sidecar_edit(record)
+        backup_sidecar.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return backup, backup_sidecar
+
+    def _corrupt_final(self, final_path):
+        final_path.write_bytes(b"interrupted-publish")
+        train_panderm.checkpoint_integrity_path(final_path).write_text(
+            '{"partial":true}\n', encoding="utf-8"
+        )
+
+    class _MutationRecorder:
+        """Fail the test if any resumable component state is touched."""
+
+        def __init__(self, model, optimizer, schedule, scaler):
+            self.mutations = []
+            self._patches = [
+                mock.patch.object(
+                    component,
+                    "load_state_dict",
+                    side_effect=lambda *a, **k: self.mutations.append(name),
                 )
-                for session in sessions
+                for name, component in (
+                    ("model", model),
+                    ("optimizer", optimizer),
+                    ("scheduler", schedule),
+                    ("scaler", scaler),
+                )
             ]
-            outputs = [process.communicate()[0] for process in processes]
-            results = []
-            for output in outputs:
-                line = [l for l in output.strip().splitlines() if l.startswith("{")]
-                self.assertTrue(line, output)
-                results.append(json.loads(line[-1]))
-
-            winners = [r for r in results if r["acquired"]]
-            losers = [r for r in results if not r["acquired"]]
-            self.assertEqual(len(winners), 1, results)
-            self.assertEqual(len(losers), 1, results)
-            # The loser did no staging, created no attempt, started no runner.
-            self.assertEqual(
-                losers[0]["calls"], {"staging": 0, "attempt": 0, "runner": 0}
-            )
-            self.assertIn("already holds the run lock", losers[0]["error"])
-            # The surviving marker belongs to the winner.
-            holder = panderm_run._read_validation_run_lock(lock_path)
-            self.assertEqual(holder["session_id"], winners[0]["session_id"])
-
-    def test_second_sequential_account_is_refused_and_lock_untouched(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            first = str(uuid.uuid4())
-            marker = self._acquire(lock_path, first)
-            before = lock_path.read_bytes()
-            with self.assertRaisesRegex(FileExistsError, "already holds the run lock"):
-                self._acquire(lock_path, str(uuid.uuid4()), account_label="B")
-            self.assertEqual(lock_path.read_bytes(), before)
-            self.assertEqual(
-                panderm_run._read_validation_run_lock(lock_path)["session_id"],
-                marker["session_id"],
+            self._patches.append(
+                mock.patch.object(
+                    train_panderm.random,
+                    "setstate",
+                    side_effect=lambda *a, **k: self.mutations.append("rng"),
+                )
             )
 
-    def test_lock_identity_carries_the_required_fields(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            marker = self._acquire(lock_path, str(uuid.uuid4()))
-            self.assertEqual(
-                set(marker), set(panderm_run.VALIDATION_RUN_LOCK_FIELDS)
-            )
-            self.assertEqual(marker["run_version"], panderm_run.RUN_VERSION)
-            self.assertEqual(marker["evaluation_scope"], panderm_run.VALIDATION_ONLY)
-            self.assertEqual(len(marker["git_commit"]), 40)
-            uuid.UUID(marker["session_id"])
-            uuid.UUID(marker["shared_root_uuid"])
-            self.assertTrue(marker["acquired_utc"])
-            self.assertTrue(marker["hostname"])
+        def __enter__(self):
+            for patch in self._patches:
+                patch.start()
+            return self
 
-    def test_formal_or_test_scope_is_refused(self):
+        def __exit__(self, *exc_info):
+            for patch in self._patches:
+                patch.stop()
+            return False
+
+    # --- blocker 3 ---------------------------------------------------------
+    def test_three_way_same_step_backup_divergence_is_never_ignored(self):
+        """probe three_way_same_step_ambiguity_accepted must be False.
+
+        Comparing only the first two candidates let a third divergent backup at
+        the same (epoch, global_step) be silently restored, so a resume could
+        continue from bytes that were never the published state.
+        """
+        run_identity = identity()
         with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            for scope in (panderm_run.FORMAL_TRAINING, panderm_run.TEST_ACCESS):
-                with self.subTest(scope=scope):
-                    with self.assertRaises(ValueError):
-                        self._acquire(
-                            lock_path, str(uuid.uuid4()), evaluation_scope=scope
+            root = Path(temporary)
+            final_path, final_sidecar = self._write_checkpoint_pair(
+                root / "run", run_identity, epoch=1
+            )
+            divergent = self._write_checkpoint_pair(
+                root / "divergent", run_identity, epoch=1, perturb=1.5
+            )
+            self.assertNotEqual(
+                train_panderm.sha256_file(final_path),
+                train_panderm.sha256_file(divergent[0]),
+            )
+            # The two candidates a same-step comparison reaches first agree, so
+            # only a comparison across every candidate can see the third.
+            self._install_backup(final_path, (final_path, final_sidecar), "a" * 32)
+            self._install_backup(final_path, (final_path, final_sidecar), "b" * 32)
+            self._install_backup(final_path, divergent, "c" * 32)
+            self._corrupt_final(final_path)
+
+            model, optimizer, schedule, scaler = self._components()
+            ambiguity_accepted = True
+            with self._MutationRecorder(
+                model, optimizer, schedule, scaler
+            ) as recorder:
+                with self.assertRaisesRegex(
+                    ValueError, "ambiguous preserved checkpoints"
+                ):
+                    train_panderm.load_checkpoint_for_resume(
+                        final_path,
+                        map_location="cpu",
+                        model=model,
+                        expected_identity=run_identity,
+                        write_guard=AllowDurableWriteGuard(),
+                    )
+                ambiguity_accepted = False
+            self.assertFalse(
+                ambiguity_accepted,
+                "three_way_same_step_ambiguity_accepted must be False",
+            )
+            self.assertEqual(recorder.mutations, [])
+
+    def test_same_step_backups_that_all_agree_still_recover_deterministically(self):
+        """Full agreement must still resume; the gate rejects only real drift."""
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            final_path, final_sidecar = self._write_checkpoint_pair(
+                root / "run", run_identity, epoch=1
+            )
+            expected_bytes = final_path.read_bytes()
+            for previous_id in ("a" * 32, "b" * 32, "c" * 32):
+                self._install_backup(
+                    final_path, (final_path, final_sidecar), previous_id
+                )
+            self._corrupt_final(final_path)
+            model, _, _, _ = self._components()
+            recovered = train_panderm.load_checkpoint_for_resume(
+                final_path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            self.assertEqual(recovered["epoch"], 1)
+            self.assertEqual(final_path.read_bytes(), expected_bytes)
+
+    # --- blocker 4 ---------------------------------------------------------
+    def test_invalid_highest_recovery_candidate_falls_back_to_valid_lower(self):
+        """probe invalid_highest_falls_back_to_valid_lower must be True.
+
+        The old inline candidate check never verified schema_version, so a
+        sidecar the production validator rejects could still win the ranking and
+        then blow up after the final path had already been overwritten.
+        """
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            final_path, final_sidecar = self._write_checkpoint_pair(
+                root / "run", run_identity, epoch=1
+            )
+            valid_lower_bytes = final_path.read_bytes()
+            newer = self._write_checkpoint_pair(
+                root / "newer", run_identity, epoch=2
+            )
+            self._install_backup(
+                final_path, (final_path, final_sidecar), "a" * 32
+            )
+            self._install_backup(
+                final_path,
+                newer,
+                "b" * 32,
+                sidecar_edit=lambda record: {**record, "schema_version": 2},
+            )
+            self._corrupt_final(final_path)
+
+            model, _, _, _ = self._components()
+            recovered = train_panderm.load_checkpoint_for_resume(
+                final_path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            self.assertEqual(
+                recovered["epoch"],
+                1,
+                "invalid_highest_falls_back_to_valid_lower must be True",
+            )
+            self.assertEqual(final_path.read_bytes(), valid_lower_bytes)
+
+    def test_recovery_candidates_are_validated_by_the_production_validator(self):
+        """Every authoritative sidecar field must disqualify a candidate."""
+        run_identity = identity()
+        edits = {
+            "schema_version": lambda record: {**record, "schema_version": 2},
+            "checkpoint_format": lambda record: {
+                **record,
+                "checkpoint_format": "other_format_v1",
+            },
+            "checkpoint_filename": lambda record: {
+                **record,
+                "checkpoint_filename": "best.pt",
+            },
+            "sha256": lambda record: {**record, "sha256": "0" * 64},
+            "byte_size": lambda record: {**record, "byte_size": record["byte_size"] + 1},
+            "run_identity_sha256": lambda record: {
+                **record,
+                "run_identity_sha256": "1" * 64,
+            },
+            "epoch": lambda record: {**record, "epoch": record["epoch"] + 1},
+            "global_step": lambda record: {
+                **record,
+                "global_step": record["global_step"] + 1,
+            },
+            "extra_key": lambda record: {**record, "unexpected": True},
+            "missing_key": lambda record: {
+                key: value for key, value in record.items() if key != "epoch"
+            },
+        }
+        for field, edit in edits.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                final_path, final_sidecar = self._write_checkpoint_pair(
+                    root / "run", run_identity, epoch=1
+                )
+                self._install_backup(
+                    final_path, (final_path, final_sidecar), "a" * 32,
+                    sidecar_edit=edit,
+                )
+                self._corrupt_final(final_path)
+                interrupted = final_path.read_bytes()
+                model, optimizer, schedule, scaler = self._components()
+                with self._MutationRecorder(
+                    model, optimizer, schedule, scaler
+                ) as recorder:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        train_panderm.load_checkpoint_for_resume(
+                            final_path,
+                            map_location="cpu",
+                            model=model,
+                            expected_identity=run_identity,
+                            write_guard=AllowDurableWriteGuard(),
                         )
-            self.assertFalse(lock_path.exists())
+                self.assertEqual(recorder.mutations, [])
+                # A candidate the authoritative validator rejects must never be
+                # promoted onto the final path before the failure is raised.
+                self.assertEqual(final_path.read_bytes(), interrupted)
 
-    def test_owner_can_release_and_next_session_can_acquire(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            first = str(uuid.uuid4())
-            self._acquire(lock_path, first)
-            panderm_run.release_validation_run_lock(lock_path, session_id=first)
-            self.assertFalse(lock_path.exists())
-            second = str(uuid.uuid4())
-            self._acquire(lock_path, second, account_label="B")
-            self.assertEqual(
-                panderm_run._read_validation_run_lock(lock_path)["session_id"], second
-            )
+    # --- blocker 5 ---------------------------------------------------------
+    def test_graceful_completion_is_idempotent_after_a_crash(self):
+        """probe graceful_completion_retry_after_crash must be True.
 
-    def test_wrong_owner_cannot_release(self):
+        A fresh ``completed_utc`` on every retry made the already published
+        audit payload drift, so a crashed handoff could never be finished.
+        """
+        run_identity_sha256_integrity = {"epoch": 5, "global_step": 40, "sha256": "a" * 64}
         with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            owner = str(uuid.uuid4())
-            self._acquire(lock_path, owner)
-            with self.assertRaisesRegex(PermissionError, "owned by another session"):
-                panderm_run.release_validation_run_lock(
-                    lock_path, session_id=str(uuid.uuid4())
-                )
-            self.assertTrue(lock_path.exists())
-            self.assertEqual(
-                panderm_run._read_validation_run_lock(lock_path)["session_id"], owner
-            )
-
-    def test_caught_failure_releases_only_its_own_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            owner = str(uuid.uuid4())
-            self._acquire(lock_path, owner)
-            released = False
-            try:
-                raise RuntimeError("validation failed")
-            except RuntimeError:
-                panderm_run.release_validation_run_lock(lock_path, session_id=owner)
-                released = True
-            self.assertTrue(released)
-            self.assertFalse(lock_path.exists())
-
-    def test_abrupt_termination_leaves_the_marker_for_the_next_run(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            worker = Path(temporary) / "worker.py"
-            worker.write_text(RACE_WORKER, encoding="utf-8")
-            src = str(Path(panderm_run.__file__).resolve().parents[1])
-            dead = str(uuid.uuid4())
-            process = subprocess.Popen(
-                [sys.executable, "-B", "-u", str(worker), src, str(lock_path),
-                 dead, str(time.time())],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            )
-            process.communicate()
-            # The process is gone; nothing time-based may reclaim its lock.
-            self.assertTrue(lock_path.exists())
-            with self.assertRaisesRegex(FileExistsError, "already holds the run lock"):
-                self._acquire(lock_path, str(uuid.uuid4()), account_label="B")
-            self.assertEqual(
-                panderm_run._read_validation_run_lock(lock_path)["session_id"], dead
-            )
-
-    def test_stale_lock_is_never_cleared_automatically(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            dead = str(uuid.uuid4())
-            self._acquire(lock_path, dead)
-            for _ in range(3):
-                with self.assertRaises(FileExistsError):
-                    self._acquire(lock_path, str(uuid.uuid4()))
-            self.assertTrue(lock_path.exists())
-
-    def test_manual_stale_clear_requires_confirmation_and_exact_owner(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            dead = str(uuid.uuid4())
-            self._acquire(lock_path, dead)
-            with self.assertRaisesRegex(ValueError, "confirmation text"):
-                panderm_run.clear_stale_validation_run_lock(
-                    lock_path, stale_session_id=dead, confirmation="yes"
-                )
-            self.assertTrue(lock_path.exists())
-            with self.assertRaisesRegex(PermissionError, "owner mismatch"):
-                panderm_run.clear_stale_validation_run_lock(
-                    lock_path,
-                    stale_session_id=str(uuid.uuid4()),
-                    confirmation=panderm_run.VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION,
-                )
-            self.assertTrue(lock_path.exists())
-            panderm_run.clear_stale_validation_run_lock(
-                lock_path,
-                stale_session_id=dead,
-                confirmation=panderm_run.VALIDATION_RUN_LOCK_CLEAR_CONFIRMATION,
-            )
-            self.assertFalse(lock_path.exists())
-
-    def test_account_label_is_operational_only_and_does_not_split_the_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            self._acquire(lock_path, str(uuid.uuid4()), account_label="A")
-            for label in ("B", "C"):
-                with self.subTest(account_label=label):
-                    with self.assertRaises(FileExistsError):
-                        self._acquire(
-                            lock_path, str(uuid.uuid4()), account_label=label
-                        )
-
-    def test_different_attempt_timestamps_share_one_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            runs = base / panderm_run.RUN_VERSION / "validation_runs"
-            (runs / "20260101T000000Z").mkdir(parents=True)
-            (runs / "20260102T000000Z").mkdir(parents=True)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            self._acquire(lock_path, str(uuid.uuid4()))
-            # A second attempt timestamp must not get its own lock.
-            with self.assertRaises(FileExistsError):
-                self._acquire(lock_path, str(uuid.uuid4()))
-            self.assertEqual(
-                len(list(panderm_run.validation_run_lock_path(base).parent.glob(
-                    "*.lock.json"))), 1
-            )
-
-    def test_a_different_run_version_uses_a_separate_lock(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            (base / panderm_run.RUN_VERSION).mkdir(parents=True)
-            (base / "v2_other_run").mkdir(parents=True)
-            first = panderm_run.validation_run_lock_path(base)
-            second = panderm_run.validation_run_lock_path(
-                base, run_version="v2_other_run"
-            )
-            self.assertNotEqual(first, second)
-            self._acquire(first, str(uuid.uuid4()))
-            # Holding v1 must not deadlock an unrelated version.
-            self._acquire(
-                second, str(uuid.uuid4()), run_version="v2_other_run"
-            )
-            self.assertTrue(first.exists() and second.exists())
-
-    def test_marker_tamper_and_drift_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = self._root(temporary)
-            lock_path = panderm_run.validation_run_lock_path(base)
-            owner = str(uuid.uuid4())
-            self._acquire(lock_path, owner)
-            good = json.loads(lock_path.read_text(encoding="utf-8"))
-            cases = {
-                "missing_field": {k: v for k, v in good.items() if k != "git_commit"},
-                "extra_field": {**good, "sneaky": "x"},
-                "empty_owner": {**good, "session_id": ""},
-                "wrong_type": {**good, "schema_version": "1"},
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_a)
+            snapshot_path = history / f"{session_a}.active.json"
+            completion_path = history / f"{session_a}.completed.json"
+            result_identity = {
+                "epoch": 5,
+                "global_step": 40,
+                "run_identity_sha256": run_hash,
             }
-            for name, tampered in cases.items():
-                with self.subTest(case=name):
-                    lock_path.write_text(json.dumps(tampered), encoding="utf-8")
-                    with self.assertRaises(ValueError):
-                        panderm_run._read_validation_run_lock(lock_path)
-                    with self.assertRaises(ValueError):
-                        panderm_run.release_validation_run_lock(
-                            lock_path, session_id=owner
-                        )
-            self.assertTrue(lock_path.exists())
+            real_replace = panderm_run.os.replace
 
-    def test_acquire_requires_an_existing_run_version_directory(self):
+            def crash_on_marker_transition(source, destination):
+                if Path(destination) == snapshot_path:
+                    raise OSError("simulated crash before the marker transition")
+                return real_replace(source, destination)
+
+            with mock.patch.object(
+                panderm_run.os, "replace", side_effect=crash_on_marker_transition
+            ):
+                with self.assertRaisesRegex(OSError, "simulated crash"):
+                    panderm_run.complete_sequential_session(
+                        marker,
+                        session_id=session_a,
+                        history_directory=history,
+                        checkpoint_integrity=run_identity_sha256_integrity,
+                        result_identity=result_identity,
+                    )
+            # Audit written, marker not yet transitioned.
+            self.assertTrue(completion_path.is_file())
+            self.assertTrue(marker.is_file())
+            self.assertFalse(snapshot_path.exists())
+            published_utc = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )["completed_utc"]
+
+            retried = panderm_run.complete_sequential_session(
+                marker,
+                session_id=session_a,
+                history_directory=history,
+                checkpoint_integrity=run_identity_sha256_integrity,
+                result_identity=result_identity,
+            )
+            self.assertEqual(retried["completed_utc"], published_utc)
+            self.assertFalse(marker.exists())
+            self.assertTrue(snapshot_path.is_file())
+
+            # Marker already transitioned and the response was lost.
+            again = panderm_run.complete_sequential_session(
+                marker,
+                session_id=session_a,
+                history_directory=history,
+                checkpoint_integrity=run_identity_sha256_integrity,
+                result_identity=result_identity,
+            )
+            self.assertEqual(again["completed_utc"], published_utc)
+            self.assertEqual(
+                again["event_id"],
+                panderm_run.audit_event_id(
+                    panderm_run.GRACEFUL_HANDOFF_EVENT,
+                    run_version=panderm_run.RUN_VERSION,
+                    subject_session_id=session_a,
+                ),
+            )
+            self.assertEqual(
+                sorted(path.name for path in history.iterdir()),
+                sorted([snapshot_path.name, completion_path.name]),
+            )
+
+    def test_graceful_completion_retry_rejects_drifted_stable_fields(self):
+        """A retry with different durable content must never overwrite the audit."""
         with tempfile.TemporaryDirectory() as temporary:
-            lock_path = panderm_run.validation_run_lock_path(Path(temporary))
-            with self.assertRaisesRegex(FileNotFoundError, "directory is missing"):
-                self._acquire(lock_path, str(uuid.uuid4()))
-            self.assertFalse(lock_path.exists())
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_a)
+            integrity = {"epoch": 5, "global_step": 40, "sha256": "a" * 64}
+            result_identity = {
+                "epoch": 5,
+                "global_step": 40,
+                "run_identity_sha256": run_hash,
+            }
+            panderm_run.complete_sequential_session(
+                marker,
+                session_id=session_a,
+                history_directory=history,
+                checkpoint_integrity=integrity,
+                result_identity=result_identity,
+            )
+            completion_path = history / f"{session_a}.completed.json"
+            before = completion_path.read_bytes()
+            with self.assertRaisesRegex(FileExistsError, "audit record differs"):
+                panderm_run.complete_sequential_session(
+                    marker,
+                    session_id=session_a,
+                    history_directory=history,
+                    checkpoint_integrity={**integrity, "sha256": "b" * 64},
+                    result_identity=result_identity,
+                )
+            self.assertEqual(completion_path.read_bytes(), before)
+
+    def test_manual_takeover_is_idempotent_after_a_crash(self):
+        """probe manual_takeover_retry_after_crash must be True.
+
+        The audit path used to embed the replacement session id, so every retry
+        minted a new id and a new audit file instead of finishing one event.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a = str(uuid.uuid4())
+            session_b = str(uuid.uuid4())
+            session_c = str(uuid.uuid4())
+            active_a = self._start(marker, history, run_hash, "A", session_a)
+            audit_path = history / f"{session_a}.takeover.json"
+
+            with mock.patch.object(
+                panderm_run,
+                "_replace_json_atomic",
+                side_effect=OSError("simulated crash before the marker replacement"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated crash"):
+                    self._start(
+                        marker, history, run_hash, "B", session_b, takeover=True
+                    )
+            # Audit written, replacement marker not yet created.
+            self.assertTrue(audit_path.is_file())
+            published = json.loads(audit_path.read_text(encoding="utf-8"))
+            self.assertEqual(published["replacement_session_id"], session_b)
+            self.assertEqual(
+                json.loads(marker.read_text(encoding="utf-8"))["session_id"],
+                session_a,
+            )
+
+            # A retry from a new runtime must reuse the published replacement id.
+            retried = self._start(
+                marker, history, run_hash, "C", session_c, takeover=True
+            )
+            self.assertEqual(
+                retried["session_id"],
+                session_b,
+                "manual_takeover_retry_after_crash must reuse the published id",
+            )
+            self.assertEqual(
+                json.loads(audit_path.read_text(encoding="utf-8")), published
+            )
+            self.assertEqual(
+                published["previous_active_session"]["session_id"],
+                active_a["session_id"],
+            )
+
+            # Replacement marker created and the response was lost.
+            again = self._start(
+                marker, history, run_hash, "C", session_b, takeover=True
+            )
+            self.assertEqual(again, retried)
+            self.assertEqual(
+                json.loads(audit_path.read_text(encoding="utf-8")), published
+            )
+            self.assertEqual(
+                [path.name for path in history.iterdir()], [audit_path.name]
+            )
+
+    def _completed_a_to_b_takeover(self, marker, history, run_hash):
+        """Return (session_a, session_b) after one finished A->B takeover."""
+        session_a = str(uuid.uuid4())
+        session_b = str(uuid.uuid4())
+        self._start(marker, history, run_hash, "A", session_a)
+        active_b = self._start(
+            marker, history, run_hash, "B", session_b, takeover=True
+        )
+        self.assertEqual(active_b["session_id"], session_b)
+        self.assertEqual(
+            [path.name for path in history.iterdir()],
+            [f"{session_a}.takeover.json"],
+        )
+        return session_a, session_b
+
+    def test_cross_runtime_lost_response_retry_adopts_the_published_marker(self):
+        """probe cross_runtime_lost_response_retry must be True.
+
+        B's runtime restart mints a brand new candidate UUID, so UUID equality
+        alone read the finished A->B transition as a fresh B takeover subject
+        and published a second transition for a response that was merely lost.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a, session_b = self._completed_a_to_b_takeover(
+                marker, history, run_hash
+            )
+            audit_path = history / f"{session_a}.takeover.json"
+            marker_before = marker.read_bytes()
+            audit_before = audit_path.read_bytes()
+
+            # Same operator B, new runtime, therefore a new candidate id.
+            restarted = self._start(
+                marker, history, run_hash, "B", str(uuid.uuid4()), takeover=True
+            )
+            self.assertEqual(
+                restarted["session_id"],
+                session_b,
+                "cross_runtime_lost_response_retry must return the B marker",
+            )
+            self.assertEqual(
+                [path.name for path in history.iterdir()],
+                [audit_path.name],
+                "second_transition_created_by_retry must be False",
+            )
+            self.assertEqual(marker.read_bytes(), marker_before)
+            self.assertEqual(audit_path.read_bytes(), audit_before)
+
+            # A second restarted candidate must stay equally idempotent.
+            again = self._start(
+                marker, history, run_hash, "B", str(uuid.uuid4()), takeover=True
+            )
+            self.assertEqual(again, restarted)
+            self.assertEqual(marker.read_bytes(), marker_before)
+            self.assertEqual(audit_path.read_bytes(), audit_before)
+            self.assertEqual(
+                [path.name for path in history.iterdir()], [audit_path.name]
+            )
+
+    def test_real_b_to_c_takeover_still_publishes_the_next_transition(self):
+        """Adoption must not disarm the next genuine confirmed takeover."""
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a, session_b = self._completed_a_to_b_takeover(
+                marker, history, run_hash
+            )
+            session_c = str(uuid.uuid4())
+            active_c = self._start(
+                marker, history, run_hash, "C", session_c, takeover=True
+            )
+            self.assertEqual(active_c["session_id"], session_c)
+            self.assertEqual(active_c["account_label"], "C")
+            self.assertEqual(
+                sorted(path.name for path in history.iterdir()),
+                sorted(
+                    [f"{session_a}.takeover.json", f"{session_b}.takeover.json"]
+                ),
+            )
+            published = json.loads(
+                (history / f"{session_b}.takeover.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                published["previous_active_session"]["session_id"], session_b
+            )
+            self.assertEqual(published["replacement_session_id"], session_c)
+            self.assertEqual(
+                published["event_id"],
+                panderm_run.audit_event_id(
+                    panderm_run.MANUAL_TAKEOVER_EVENT,
+                    run_version=panderm_run.RUN_VERSION,
+                    subject_session_id=session_b,
+                ),
+            )
+
+    def test_replacement_id_disagreeing_with_the_marker_blocks_every_mutation(self):
+        """A dangling replacement id must never be resolved by guessing."""
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a, _ = self._completed_a_to_b_takeover(
+                marker, history, run_hash
+            )
+            audit_path = history / f"{session_a}.takeover.json"
+            tampered = json.loads(audit_path.read_text(encoding="utf-8"))
+            tampered["replacement_session_id"] = str(uuid.uuid4())
+            audit_path.write_text(
+                json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            marker_before = marker.read_bytes()
+            audit_before = audit_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "contradicts"):
+                self._start(
+                    marker, history, run_hash, "B", str(uuid.uuid4()), takeover=True
+                )
+            self.assertEqual(marker.read_bytes(), marker_before)
+            self.assertEqual(audit_path.read_bytes(), audit_before)
+            self.assertEqual(
+                [path.name for path in history.iterdir()], [audit_path.name]
+            )
+
+    def test_audit_identity_drift_blocks_adoption_without_any_mutation(self):
+        """Adoption requires the retired session to belong to this same run."""
+        for field, value in (
+            ("shared_root_uuid", "8b0d4b25-1b6b-4a52-9f0f-6b9a3a5e2c11"),
+            ("run_version", "other-version"),
+            ("run_identity_sha256", "e" * 64),
+            # git_commit is hashed into run_identity_sha256, so a retired
+            # session naming a different commit cannot belong to this run even
+            # though every other identity field still agrees.
+            ("git_commit", "d" * 40),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                marker, history, run_hash = self._session_paths(temporary)
+                session_a, _ = self._completed_a_to_b_takeover(
+                    marker, history, run_hash
+                )
+                audit_path = history / f"{session_a}.takeover.json"
+                tampered = json.loads(audit_path.read_text(encoding="utf-8"))
+                tampered["previous_active_session"][field] = value
+                audit_path.write_text(
+                    json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker_before = marker.read_bytes()
+                audit_before = audit_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, "identity drift"):
+                    self._start(
+                        marker,
+                        history,
+                        run_hash,
+                        "B",
+                        str(uuid.uuid4()),
+                        takeover=True,
+                    )
+                self.assertEqual(marker.read_bytes(), marker_before)
+                self.assertEqual(audit_path.read_bytes(), audit_before)
+                self.assertEqual(
+                    [path.name for path in history.iterdir()], [audit_path.name]
+                )
+
+    def test_audit_record_schema_drift_blocks_adoption_without_any_mutation(self):
+        """Adoption evidence must match the published audit schema exactly.
+
+        Adoption resolves a lost response by trusting one stored record to
+        prove the active marker is this operator's own replacement. A record
+        carrying an unknown key or a schema_version this build cannot interpret
+        is unreadable evidence, so it must stop the takeover rather than be
+        read as a weaker yes.
+        """
+        for field, value, expected in (
+            ("schema_version", 2, "schema_version mismatch"),
+            ("unexpected", True, "schema mismatch"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                marker, history, run_hash = self._session_paths(temporary)
+                session_a, _ = self._completed_a_to_b_takeover(
+                    marker, history, run_hash
+                )
+                audit_path = history / f"{session_a}.takeover.json"
+                tampered = json.loads(audit_path.read_text(encoding="utf-8"))
+                tampered[field] = value
+                audit_path.write_text(
+                    json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker_before = marker.read_bytes()
+                audit_before = audit_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, expected):
+                    self._start(
+                        marker,
+                        history,
+                        run_hash,
+                        "B",
+                        str(uuid.uuid4()),
+                        takeover=True,
+                    )
+                self.assertEqual(marker.read_bytes(), marker_before)
+                self.assertEqual(audit_path.read_bytes(), audit_before)
+                self.assertEqual(
+                    [path.name for path in history.iterdir()], [audit_path.name]
+                )
+
+    def test_audit_retired_session_corruption_blocks_adoption_without_any_mutation(self):
+        """The retired snapshot inside an audit is held to the marker schema.
+
+        The graceful path revalidates its retired marker through
+        _read_active_session, so a takeover audit that stores an unusable
+        retired session must fail the same way. Otherwise a corrupted snapshot
+        still authorises adopting the active marker, which is the operator
+        deciding a real handoff on evidence nothing checked.
+        """
+        deleted = object()
+        for field, value, expected in (
+            ("account_label", "Z", "account label must be A, B, or C"),
+            ("hostname", "", "hostname must be a non-empty string"),
+            ("hostname", deleted, "schema mismatch"),
+            ("checkpoint_cadence", "monthly", "cadence must be every_epoch"),
+            (
+                "maximum_quota_loss",
+                "unbounded",
+                "maximum quota loss must be one_incomplete_epoch",
+            ),
+            ("evaluation_scope", "full", "prohibited"),
+        ):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temporary:
+                marker, history, run_hash = self._session_paths(temporary)
+                session_a, _ = self._completed_a_to_b_takeover(
+                    marker, history, run_hash
+                )
+                audit_path = history / f"{session_a}.takeover.json"
+                tampered = json.loads(audit_path.read_text(encoding="utf-8"))
+                if value is deleted:
+                    del tampered["previous_active_session"][field]
+                else:
+                    tampered["previous_active_session"][field] = value
+                audit_path.write_text(
+                    json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker_before = marker.read_bytes()
+                audit_before = audit_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, expected):
+                    self._start(
+                        marker,
+                        history,
+                        run_hash,
+                        "B",
+                        str(uuid.uuid4()),
+                        takeover=True,
+                    )
+                self.assertEqual(marker.read_bytes(), marker_before)
+                self.assertEqual(audit_path.read_bytes(), audit_before)
+                self.assertEqual(
+                    [path.name for path in history.iterdir()], [audit_path.name]
+                )
+
+    def test_manual_takeover_is_still_refused_without_confirmation(self):
+        """probe manual_takeover_forced_false must not become an auto-takeover."""
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a = str(uuid.uuid4())
+            session_b = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_a)
+            before = marker.read_bytes()
+            with self.assertRaisesRegex(FileExistsError, "confirm"):
+                self._start(marker, history, run_hash, "B", session_b)
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertEqual(list(history.iterdir()), [])
+            taken_over = self._start(
+                marker, history, run_hash, "B", session_b, takeover=True
+            )
+            self.assertEqual(taken_over["session_id"], session_b)
+            self.assertEqual(taken_over["account_label"], "B")
+
+    # --- blocker 1 (runner side) -------------------------------------------
+    def test_resume_survives_session_account_and_hostname_change(self):
+        """A different session/account/host must never block the same run resume."""
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            final_path, _ = self._write_checkpoint_pair(
+                root / "run", run_identity, epoch=1
+            )
+            model, optimizer, schedule, scaler = self._components()
+            checkpoint = train_panderm.load_checkpoint_for_resume(
+                final_path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            start_epoch, best, history = train_panderm.restore_checkpoint_state(
+                checkpoint,
+                model,
+                optimizer,
+                schedule,
+                scaler,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            self.assertEqual(start_epoch, 2)
+            self.assertEqual(best, 0.5)
+            self.assertEqual(len(history), 1)
+            self.assertNotIn("session_id", checkpoint["run_identity"])
+            self.assertNotIn("account_label", checkpoint["run_identity"])
+            self.assertNotIn("hostname", checkpoint["run_identity"])
 
 
 class IdentityAdversarialMatrixTests(unittest.TestCase):
@@ -1872,9 +3100,13 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
             scaler,
             epoch,
             0.5,
-            [{"epoch": epoch}],
+            [
+                {"epoch": completed_epoch, "optimizer_steps": schedule.step_count}
+                for completed_epoch in range(1, epoch + 1)
+            ],
             args,
             run_identity,
+            write_guard=AllowDurableWriteGuard(),
         )
         return model, optimizer, schedule, scaler
 
@@ -1980,6 +3212,7 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                     "byte_size",
                     "sha256",
                     "epoch",
+                    "global_step",
                     "checkpoint_format",
                     "run_identity_sha256",
                 },
@@ -1997,8 +3230,385 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 fresh_opt,
                 fresh_schedule,
                 fresh_scaler,
+                write_guard=AllowDurableWriteGuard(),
             )
-            self.assertEqual(resumed, (2, 0.5, [{"epoch": 1}]))
+            self.assertEqual(
+                resumed,
+                (2, 0.5, [{"epoch": 1, "optimizer_steps": 0}]),
+            )
+
+    def test_checkpoint_publish_rejects_rollback_and_same_step_drift(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "last.pt"
+            model, optimizer, schedule, scaler = self._save(
+                path, run_identity, epoch=2
+            )
+            sidecar_path = self._sidecar_path(path)
+            before = (path.read_bytes(), sidecar_path.read_bytes())
+            args = type("A", (), {"seed": 0, "epochs": 5})()
+            history = [
+                {"epoch": completed, "optimizer_steps": schedule.step_count}
+                for completed in (1, 2)
+            ]
+            train_panderm.save_checkpoint(
+                path,
+                model,
+                optimizer,
+                schedule,
+                scaler,
+                2,
+                0.5,
+                history,
+                args,
+                run_identity,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            self.assertEqual(
+                (path.read_bytes(), sidecar_path.read_bytes()),
+                before,
+            )
+            with self.assertRaisesRegex(ValueError, "rollback"):
+                self._save(path, run_identity, epoch=1)
+            self.assertEqual(
+                (path.read_bytes(), sidecar_path.read_bytes()),
+                before,
+            )
+
+            model, optimizer, schedule, scaler = self._components()
+            with torch.no_grad():
+                next(model.parameters()).add_(1.0)
+            history = [
+                {"epoch": completed, "optimizer_steps": schedule.step_count}
+                for completed in (1, 2)
+            ]
+            with self.assertRaisesRegex(ValueError, "same-step checkpoint differs"):
+                train_panderm.save_checkpoint(
+                    path,
+                    model,
+                    optimizer,
+                    schedule,
+                    scaler,
+                    2,
+                    0.5,
+                    history,
+                    args,
+                    run_identity,
+                    write_guard=AllowDurableWriteGuard(),
+                )
+            self.assertEqual(
+                (path.read_bytes(), sidecar_path.read_bytes()),
+                before,
+            )
+
+    def test_checkpoint_reopen_failure_restores_previous_complete_pair(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "last.pt"
+            self._save(path, run_identity, epoch=1)
+            sidecar_path = self._sidecar_path(path)
+            before = (path.read_bytes(), sidecar_path.read_bytes())
+            model, optimizer, schedule, scaler = self._components()
+            args = type("A", (), {"seed": 0, "epochs": 5})()
+            history = [
+                {"epoch": completed, "optimizer_steps": schedule.step_count}
+                for completed in (1, 2)
+            ]
+            real_load = train_panderm.load_checkpoint_safe
+            final_loads = []
+
+            def fail_first_post_replace(candidate, **kwargs):
+                reopened = real_load(candidate, **kwargs)
+                if Path(candidate) == path:
+                    final_loads.append(train_panderm.sha256_file(candidate))
+                    if len(final_loads) == 2:
+                        raise RuntimeError("simulated final reopen failure")
+                return reopened
+
+            with mock.patch.object(
+                train_panderm,
+                "load_checkpoint_safe",
+                side_effect=fail_first_post_replace,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "reopen failure"):
+                    train_panderm.save_checkpoint(
+                        path,
+                        model,
+                        optimizer,
+                        schedule,
+                        scaler,
+                        2,
+                        0.5,
+                        history,
+                        args,
+                        run_identity,
+                        write_guard=AllowDurableWriteGuard(),
+                    )
+            self.assertEqual(
+                (path.read_bytes(), sidecar_path.read_bytes()),
+                before,
+            )
+            self.assertEqual(
+                train_panderm.load_checkpoint_safe(
+                    path, expected_identity=run_identity
+                )["epoch"],
+                1,
+            )
+
+    def test_abrupt_publish_recovers_only_the_last_complete_predecessor(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "last.pt"
+            model, _, _, _ = self._save(path, run_identity, epoch=1)
+            sidecar_path = self._sidecar_path(path)
+            previous_id = "a" * 32
+            backup = path.parent / (
+                f".{path.name}.previous.{previous_id}.pt"
+            )
+            backup_sidecar = path.parent / (
+                f".{path.name}.previous.{previous_id}.integrity.json"
+            )
+            shutil.copy2(path, backup)
+            shutil.copy2(sidecar_path, backup_sidecar)
+            path.write_bytes(b"interrupted-new-checkpoint")
+            sidecar_path.write_text('{"partial":true}\n', encoding="utf-8")
+
+            recovered = train_panderm.load_checkpoint_for_resume(
+                path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+                write_guard=AllowDurableWriteGuard(),
+            )
+            self.assertEqual(recovered["epoch"], 1)
+            self.assertEqual(path.read_bytes(), backup.read_bytes())
+            self.assertEqual(
+                sidecar_path.read_bytes(),
+                backup_sidecar.read_bytes(),
+            )
+            self.assertTrue(backup.is_file())
+            self.assertTrue(backup_sidecar.is_file())
+
+    def test_monotonic_result_publish_allows_exact_retry_and_rejects_rollback(self):
+        run_identity = identity()
+        first = {
+            "epoch": 1,
+            "global_step": 2,
+            "history": [{"epoch": 1, "optimizer_steps": 2}],
+            "run_identity": run_identity,
+            "status": "complete",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "result.json"
+            guard = AllowDurableWriteGuard().require
+            panderm_run.write_monotonic_run_record_atomic(
+                path, first, write_guard=guard
+            )
+            before = path.read_bytes()
+            panderm_run.write_monotonic_run_record_atomic(
+                path, copy.deepcopy(first), write_guard=guard
+            )
+            self.assertEqual(path.read_bytes(), before)
+            with self.assertRaisesRegex(ValueError, "rollback"):
+                panderm_run.write_monotonic_run_record_atomic(
+                    path,
+                    {**first, "epoch": 0, "global_step": 0, "history": []},
+                    write_guard=guard,
+                )
+            with self.assertRaisesRegex(ValueError, "same-step"):
+                panderm_run.write_monotonic_run_record_atomic(
+                    path,
+                    {**first, "status": "different"},
+                    write_guard=guard,
+                )
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_result_reopen_failure_restores_previous_history(self):
+        run_identity = identity()
+        first = {
+            "epoch": 1,
+            "global_step": 2,
+            "history": [{"epoch": 1, "optimizer_steps": 2}],
+            "run_identity": run_identity,
+        }
+        second = {
+            "epoch": 2,
+            "global_step": 4,
+            "history": first["history"]
+            + [{"epoch": 2, "optimizer_steps": 4}],
+            "run_identity": run_identity,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "result.json"
+            guard = AllowDurableWriteGuard().require
+            panderm_run.write_monotonic_run_record_atomic(
+                path, first, write_guard=guard
+            )
+            before = path.read_bytes()
+            real_replace = panderm_run.os.replace
+            publishes = []
+
+            def replace_then_corrupt(source, destination):
+                real_replace(source, destination)
+                if Path(destination) == path and not publishes:
+                    publishes.append(True)
+                    path.write_text('{"corrupt":true}\n', encoding="utf-8")
+
+            with mock.patch.object(
+                panderm_run.os, "replace", side_effect=replace_then_corrupt
+            ):
+                with self.assertRaisesRegex(ValueError, "final reopen"):
+                    panderm_run.write_monotonic_run_record_atomic(
+                        path, second, write_guard=guard
+                    )
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_resume_loader_active_session_loss_rejects_before_any_restore(self):
+        class ExpiringGuard:
+            def __init__(self):
+                self.active = True
+                self.calls = []
+
+            def require(self, phase):
+                self.calls.append(phase)
+                if not self.active:
+                    raise RuntimeError("stale resume fence")
+
+        guard = ExpiringGuard()
+        restore = mock.Mock()
+
+        def expire_during_load(*args, **kwargs):
+            guard.active = False
+            return {"checkpoint_format": panderm_run.CHECKPOINT_FORMAT}
+
+        with mock.patch.object(
+            train_panderm,
+            "load_checkpoint_safe",
+            side_effect=expire_during_load,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stale resume fence"):
+                checkpoint = train_panderm.load_checkpoint_for_resume(
+                    "last.pt",
+                    map_location="cpu",
+                    model=mock.Mock(),
+                    expected_identity=identity(),
+                    write_guard=guard,
+                )
+                restore(checkpoint)
+        restore.assert_not_called()
+        self.assertEqual(
+            guard.calls,
+            [
+                "checkpoint resume before state load",
+                "checkpoint resume after state load",
+            ],
+        )
+
+    def test_resume_component_boundaries_block_all_stale_followup_mutations(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "last.pt"
+            model, _, _, _ = self._save(path, run_identity)
+            checkpoint = train_panderm.load_checkpoint_safe(
+                path,
+                map_location="cpu",
+                model=model,
+                expected_identity=run_identity,
+            )
+
+        phases = (
+            ("checkpoint resume model state", []),
+            ("checkpoint resume optimizer state", ["model"]),
+            (
+                "checkpoint resume scheduler state",
+                ["model", "optimizer"],
+            ),
+            (
+                "checkpoint resume scaler state",
+                ["model", "optimizer", "scheduler"],
+            ),
+        )
+        for failure_phase, expected_mutations in phases:
+            with self.subTest(failure_phase=failure_phase):
+                model, optimizer, schedule, scaler = self._components()
+                mutations = []
+                original_model = model.load_state_dict
+                original_optimizer = optimizer.load_state_dict
+                original_schedule = schedule.load_state_dict
+                original_scaler = scaler.load_state_dict
+
+                def guarded_call(name, function):
+                    def invoke(*args, **kwargs):
+                        mutations.append(name)
+                        return function(*args, **kwargs)
+
+                    return invoke
+
+                class RejectingGuard:
+                    def require(self, phase):
+                        if phase == failure_phase:
+                            raise RuntimeError("stale resume fence")
+
+                with (
+                    mock.patch.object(
+                        model,
+                        "load_state_dict",
+                        side_effect=guarded_call("model", original_model),
+                    ),
+                    mock.patch.object(
+                        optimizer,
+                        "load_state_dict",
+                        side_effect=guarded_call(
+                            "optimizer", original_optimizer
+                        ),
+                    ),
+                    mock.patch.object(
+                        schedule,
+                        "load_state_dict",
+                        side_effect=guarded_call(
+                            "scheduler", original_schedule
+                        ),
+                    ),
+                    mock.patch.object(
+                        scaler,
+                        "load_state_dict",
+                        side_effect=guarded_call("scaler", original_scaler),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "stale resume fence"
+                    ),
+                ):
+                    train_panderm.restore_checkpoint_state(
+                        checkpoint,
+                        model,
+                        optimizer,
+                        schedule,
+                        scaler,
+                        write_guard=RejectingGuard(),
+                    )
+                self.assertEqual(mutations, expected_mutations)
+
+    def test_resume_rng_boundaries_block_stale_followup_mutations(self):
+        state = train_panderm._get_rng_state()
+
+        class RejectingGuard:
+            def require(self, phase):
+                if phase == "checkpoint resume NumPy RNG state":
+                    raise RuntimeError("stale resume fence")
+
+        with (
+            mock.patch.object(train_panderm.random, "setstate") as python_rng,
+            mock.patch.object(train_panderm.np.random, "set_state") as numpy_rng,
+            mock.patch.object(train_panderm.torch, "set_rng_state") as torch_rng,
+            self.assertRaisesRegex(RuntimeError, "stale resume fence"),
+        ):
+            train_panderm._set_rng_state(
+                state,
+                write_guard=RejectingGuard(),
+            )
+        python_rng.assert_called_once()
+        numpy_rng.assert_not_called()
+        torch_rng.assert_not_called()
 
     def test_checkpoint_shape_dtype_value_and_byte_tamper_reject_before_load(self):
         run_identity = identity()
@@ -2112,7 +3722,11 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 side_effect=replace_then_tamper,
             ):
                 with self.assertRaisesRegex(ValueError, "sidecar reopen"):
-                    train_panderm._write_integrity_sidecar_atomic(path, value)
+                    train_panderm._write_integrity_sidecar_atomic(
+                        path,
+                        value,
+                        write_guard=AllowDurableWriteGuard(),
+                    )
 
     def test_result_checkpoint_relationship_rejects_stale_or_wrong_record(self):
         run_identity = identity()
@@ -2216,6 +3830,14 @@ class PanDermRunnerMockSmokeTests(unittest.TestCase):
                 "--device", "cpu",
             ]
             with contextlib.ExitStack() as stack:
+                runner_guard = AllowDurableWriteGuard()
+                stack.enter_context(
+                    mock.patch.object(
+                        train_panderm.panderm_run.SequentialSessionWriteGuard,
+                        "from_environment",
+                        return_value=runner_guard,
+                    )
+                )
                 stack.enter_context(
                     mock.patch.object(
                         train_panderm.panderm_run,
