@@ -45,6 +45,7 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
+PINNED_IMPLEMENTATION_COMMIT = "450c231dfb31749604d90a6452c53aa597224156"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -655,31 +656,34 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_requires_post_review_implementation_pin(self):
-        """An unreviewed candidate must never carry a runnable Colab pin.
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+        """A published notebook must name the exact reviewed commit.
 
-        Stage C pins the notebook only after an independent ACCEPT, so any
-        40-hex commit sitting here before that review would let a Colab
-        Run all execute code nobody accepted.
+        Colab clones the repository and checks this value out detached, so the
+        pin is the only thing tying a real run to code that passed review. The
+        placeholder must be gone rather than merely accompanied.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
+            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
             first,
         )
-        self.assertNotRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_placeholder_first_cell_fails_its_own_guard(self):
+    def test_pinned_first_cell_passes_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
-            exec(compile(first, "cell-0", "exec"), namespace)
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(
+            namespace["EXPECTED_GIT_COMMIT"],
+            PINNED_IMPLEMENTATION_COMMIT,
+        )
 
     def test_phase0_wires_the_resolved_root_id_and_both_shared_root_shapes(self):
         """Both Drive provider defects were wiring errors, not missing logic.
