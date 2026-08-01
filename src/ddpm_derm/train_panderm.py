@@ -1070,7 +1070,6 @@ def main(argv=None) -> None:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
-    write_guard = panderm_run.SequentialSessionWriteGuard.from_environment()
     set_seed(args.seed)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1098,6 +1097,10 @@ def main(argv=None) -> None:
         purpose=panderm_run.VALIDATION_ONLY,
     )
 
+    # Constructed only after every read-only validation above, so an illegal CLI
+    # invocation fails for its own reason instead of the generic missing-session
+    # error, and still before the first durable write below.
+    write_guard = panderm_run.SequentialSessionWriteGuard.from_environment()
     write_guard.require("durable output directory preparation")
     base_dir = _ensure_durable_directory(args.output_dir)
     checkpoint_root = _ensure_durable_directory(base_dir / "checkpoints")
