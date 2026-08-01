@@ -45,7 +45,6 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "450c231dfb31749604d90a6452c53aa597224156"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -639,6 +638,76 @@ class Phase2ManifestBindingTests(unittest.TestCase):
                     train_panderm.parse_args(base + extra)
                 self.assertIn(expected_error, stderr.getvalue())
 
+    def test_post_parse_cli_validations_are_reachable_from_the_real_cli(self):
+        """Every illegal CLI invocation must still fail for its own reason.
+
+        The Phase 2 safety matrix runs the real CLI as a subprocess precisely to
+        prove each rejection is diagnosed individually. A plain CLI run never
+        sets the sequential-session variables, so building the write guard ahead
+        of the post-parse validations replaced all of their messages with one
+        generic missing-session error and voided the matrix without failing it.
+        The matrix cases above cannot see that: they stop inside ``parse_args``
+        and never enter ``main``. Gating durable writes must never make a
+        validation unreachable from the entry point that depends on it.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "manifest-only"
+            self._prepare(root / "shared", data_root)
+            checkpoint = root / "weights.pth"
+            checkpoint.write_bytes(b"not the approved PanDerm checkpoint")
+            upstream = root / "upstream"
+            upstream.mkdir()
+            output_root = root / "illegal"
+            env = os.environ.copy()
+            for key in panderm_run.SequentialSessionWriteGuard.ENV_KEYS.values():
+                env.pop(key, None)
+            env["DDPM_DERM_DATA_DIR"] = str(data_root)
+            env["DDPM_DERM_OUTPUTS_DIR"] = str(root / "outputs")
+            env["PYTHONPATH"] = str(ROOT / "src")
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            base = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "ddpm_derm.train_panderm",
+                "--seed",
+                "0",
+                "--epochs",
+                "5",
+                "--warmup-epochs",
+                "5",
+                "--checkpoint",
+                str(checkpoint),
+                "--upstream-dir",
+                str(upstream),
+                "--output-dir",
+                str(output_root),
+            ]
+            cases = (
+                (["--checkpoint-sha256", "0" * 64], "SHA-256 mismatch"),
+                (["--upstream-commit", "0" * 40], "upstream commit mismatch"),
+            )
+            for extra, expected_error in cases:
+                with self.subTest(extra=extra):
+                    result = subprocess.run(
+                        base + extra,
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertNotIn(
+                        "missing sequential session environment", result.stdout
+                    )
+                    self.assertIn(expected_error, result.stdout)
+                    self.assertFalse(output_root.exists(), result.stdout)
+
     def test_manifest_only_root_is_removed_after_test_failure(self):
         temporary_path = None
         with self.assertRaisesRegex(RuntimeError, "forced Phase 2 failure"):
@@ -656,34 +725,31 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
-        """A published notebook must name the exact reviewed commit.
+    def test_first_cell_requires_post_review_implementation_pin(self):
+        """An unreviewed candidate must never carry a runnable Colab pin.
 
-        Colab clones the repository and checks this value out detached, so the
-        pin is the only thing tying a real run to code that passed review. The
-        placeholder must be gone rather than merely accompanied.
+        Stage C pins the notebook only after an independent ACCEPT, so any
+        40-hex commit sitting here before that review would let a Colab
+        Run all execute code nobody accepted.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertNotRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_placeholder_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
 
     def test_phase0_wires_the_resolved_root_id_and_both_shared_root_shapes(self):
         """Both Drive provider defects were wiring errors, not missing logic.
