@@ -45,7 +45,6 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "8207fce0df9fcda8ea5f6669f500a762155f7f92"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -656,28 +655,91 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_requires_post_review_implementation_pin(self):
+        """An unreviewed candidate must never carry a runnable Colab pin.
+
+        Stage C pins the notebook only after an independent ACCEPT, so any
+        40-hex commit sitting here before that review would let a Colab
+        Run all execute code nobody accepted.
+        """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertNotRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_placeholder_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
+        with self.assertRaisesRegex(AssertionError, "Pin the reviewed pushed commit"):
+            exec(compile(first, "cell-0", "exec"), namespace)
+
+    def test_phase0_wires_the_resolved_root_id_and_both_shared_root_shapes(self):
+        """Both Drive provider defects were wiring errors, not missing logic.
+
+        `panderm_run` cannot defend itself here: the alias "root" was handed to
+        an identity comparison that only ever receives real folder ids, and only
+        the shortcut shape was ever looked up, so the owner account had nothing
+        to resolve. Only the notebook decides what those checks are fed, so the
+        call structure is asserted rather than the presence of the names.
+        """
+        _, code = load(VALIDATION)
+        tree = ast.parse(code)
+        calls = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                calls.setdefault(ast.unparse(node.func), []).append(node)
+        assignments = {
+            target.id: ast.unparse(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
         self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
+            assignments.get("DRIVE_MY_DRIVE_ROOT_ID"),
+            "drive_api_execute(DRIVE_API.files().get(fileId='root', "
+            "fields='id'))['id']",
         )
+        self.assertEqual(
+            assignments.get("root_folder_records"),
+            "drive_api_list_children('root', SHARED_RUN_ROOT.name, "
+            "panderm_run.DRIVE_FOLDER_MIME_TYPE)",
+        )
+        resolution = calls["panderm_run.require_drive_shared_root_target"]
+        self.assertEqual(len(resolution), 1)
+        self.assertEqual(
+            [ast.unparse(argument) for argument in resolution[0].args],
+            ["shortcut_records", "root_folder_records"],
+        )
+        alignment = calls["panderm_run.require_drive_api_fuse_account_alignment"]
+        self.assertEqual(len(alignment), 1)
+        self.assertEqual(
+            {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in alignment[0].keywords
+            },
+            {
+                "expected_probe_name": "api_mount_probe_name",
+                "expected_root_id": "DRIVE_MY_DRIVE_ROOT_ID",
+            },
+        )
+        # The alias is only ever legitimate as a files.list parent, never as an
+        # identity a returned record could be compared against.
+        for name, nodes in calls.items():
+            for node in nodes:
+                for keyword in node.keywords:
+                    if keyword.arg in ("expected_root_id", "expected_parent_id"):
+                        with self.subTest(call=name, keyword=keyword.arg):
+                            self.assertNotIsInstance(keyword.value, ast.Constant)
+        self.assertNotIn("panderm_run.require_drive_shortcut_target", calls)
 
     def test_archive_expected_identity_comes_from_the_reviewed_constant(self):
         """The notebook must not carry its own copy of the approved digest."""

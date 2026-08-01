@@ -1432,32 +1432,87 @@ class ApprovedContentIdentityTests(unittest.TestCase):
 
 
 class ValidationLockProviderTopologyTests(unittest.TestCase):
-    def test_private_my_drive_probe_proves_api_and_fuse_account_alignment(self):
-        probe = {
+    def _probe(self, **overrides):
+        value = {
             "id": "private-probe-id",
             "name": "private-probe.json",
             "mimeType": panderm_run.DRIVE_JSON_MIME_TYPE,
-            "parents": ["root"],
+            "parents": [self.MY_DRIVE_ROOT_ID],
             "ownedByMe": True,
             "trashed": False,
         }
+        value.update(overrides)
+        return value
+
+    def test_private_my_drive_probe_proves_api_and_fuse_account_alignment(self):
+        probe = self._probe()
         accepted = panderm_run.require_drive_api_fuse_account_alignment(
-            probe, expected_probe_name="private-probe.json"
+            probe,
+            expected_probe_name="private-probe.json",
+            expected_root_id=self.MY_DRIVE_ROOT_ID,
         )
         self.assertEqual(accepted["status"], "passed")
         for mutation in (
-            {**probe, "ownedByMe": False},
-            {**probe, "driveId": "shared-drive-id"},
-            {**probe, "parents": ["different-root"]},
+            self._probe(ownedByMe=False),
+            self._probe(driveId="shared-drive-id"),
+            self._probe(parents=["different-root"]),
         ):
             with self.assertRaises(ValueError):
                 panderm_run.require_drive_api_fuse_account_alignment(
-                    mutation, expected_probe_name="private-probe.json"
+                    mutation,
+                    expected_probe_name="private-probe.json",
+                    expected_root_id=self.MY_DRIVE_ROOT_ID,
                 )
+
+    def test_api_fuse_probe_is_bound_to_the_resolved_my_drive_root_folder_id(self):
+        """The alias "root" is a query word, never an identity to compare against.
+
+        Drive accepts "root" only inside a files.list parent clause and always
+        answers with the account's real My Drive root folder id, so comparing a
+        returned `parents` entry against the alias can never succeed for any
+        account. Rejecting the alias outright is what stops that unpassable
+        gate from being reintroduced, and the probe must still be bound to a
+        concrete root so a probe created somewhere else is caught.
+        """
+        probe = self._probe()
+        before = copy.deepcopy(probe)
+        accepted = panderm_run.require_drive_api_fuse_account_alignment(
+            probe,
+            expected_probe_name="private-probe.json",
+            expected_root_id=self.MY_DRIVE_ROOT_ID,
+        )
+        self.assertEqual(accepted, {"file_id": "private-probe-id", "status": "passed"})
+        with self.assertRaisesRegex(ValueError, "query alias"):
+            panderm_run.require_drive_api_fuse_account_alignment(
+                probe,
+                expected_probe_name="private-probe.json",
+                expected_root_id="root",
+            )
+        # The literal alias never appears in a real provider record, so a probe
+        # claiming it must not be accepted as living in the real root either.
+        with self.assertRaisesRegex(ValueError, "parent identity drift"):
+            panderm_run.require_drive_api_fuse_account_alignment(
+                self._probe(parents=["root"]),
+                expected_probe_name="private-probe.json",
+                expected_root_id=self.MY_DRIVE_ROOT_ID,
+            )
+        for expected_root_id in ("", None, 0, b"root", ["root"]):
+            with self.subTest(expected_root_id=expected_root_id):
+                with self.assertRaisesRegex(ValueError, "must be non-empty"):
+                    panderm_run.require_drive_api_fuse_account_alignment(
+                        probe,
+                        expected_probe_name="private-probe.json",
+                        expected_root_id=expected_root_id,
+                    )
+        self.assertEqual(probe, before, "provider metadata must not be mutated")
 
     ROOT_ID = "root-folder-id"
     DRIVE_ID = "shared-drive-id"
     RUN_UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
+    # A real My Drive root folder id observed from a live Colab account; the
+    # API reports this shape, never the "root" alias that queries accept.
+    MY_DRIVE_ROOT_ID = "0AN3kCPQfWpI4Uk9PVA"
+    SHARED_ROOT_ALIAS = "ddpm-derm-panderm-runs"
 
     def _root_metadata(self, **overrides):
         value = {
@@ -1642,6 +1697,177 @@ class ValidationLockProviderTopologyTests(unittest.TestCase):
                     (self.ROOT_ID, "second-resource-key"),
                 ]
             )
+
+    def _granted_account_shortcut(self, **overrides):
+        """One granted account's My Drive entry: a shortcut, no resource key."""
+        value = self._child_metadata(
+            self.SHARED_ROOT_ALIAS,
+            panderm_run.DRIVE_SHORTCUT_MIME_TYPE,
+            id="granted-account-shortcut-id",
+            parents=[self.MY_DRIVE_ROOT_ID],
+            shortcutDetails={
+                "targetId": self.ROOT_ID,
+                "targetMimeType": panderm_run.DRIVE_FOLDER_MIME_TYPE,
+            },
+        )
+        value.update(overrides)
+        return value
+
+    def _owner_account_folder(self, **overrides):
+        """The owner account's My Drive entry: the folder itself, no shortcut."""
+        value = self._child_metadata(
+            self.SHARED_ROOT_ALIAS,
+            panderm_run.DRIVE_FOLDER_MIME_TYPE,
+            id=self.ROOT_ID,
+            parents=[self.MY_DRIVE_ROOT_ID],
+            ownedByMe=True,
+        )
+        value.update(overrides)
+        return value
+
+    def test_shared_run_root_resolves_from_either_my_drive_shape_to_one_id(self):
+        """The owner has no shortcut to its own folder, so demanding one locks it out.
+
+        This run version is designed to be handed between accounts A, B and C
+        against one physical folder. A granted account holds a shortcut, while
+        the account that owns the folder holds the folder itself and Drive will
+        never give it a shortcut to its own item. Requiring a shortcut makes the
+        workflow run only for the accounts that do not own the data, which is
+        the opposite of account-neutral. Both shapes must therefore resolve to
+        the same folder id, because that id is what every later provider check,
+        the sentinel binding and the durable identity all consume.
+        """
+        shortcut = self._granted_account_shortcut()
+        folder = self._owner_account_folder()
+        before = copy.deepcopy([shortcut, folder])
+        granted = panderm_run.require_drive_shared_root_target(
+            [shortcut], [], expected_alias=self.SHARED_ROOT_ALIAS
+        )
+        owner = panderm_run.require_drive_shared_root_target(
+            [], [folder], expected_alias=self.SHARED_ROOT_ALIAS
+        )
+        self.assertEqual(
+            granted,
+            {
+                "target_id": self.ROOT_ID,
+                "target_resource_key": "",
+                "source": panderm_run.DRIVE_SHARED_ROOT_SOURCE_SHORTCUT,
+            },
+        )
+        self.assertEqual(
+            owner,
+            {
+                "target_id": self.ROOT_ID,
+                "target_resource_key": "",
+                "source": panderm_run.DRIVE_SHARED_ROOT_SOURCE_OWNED_FOLDER,
+            },
+        )
+        self.assertEqual(granted["target_id"], owner["target_id"])
+        # The resolved pair must stay consumable by the durable identity, so a
+        # keyless owner-resolved root still binds without inventing a key.
+        identity = panderm_run.build_durable_root_provider_identity(
+            self._root_metadata(),
+            expected_root_id=owner["target_id"],
+            shortcut_target_resource_key=owner["target_resource_key"],
+            shared_root_uuid=self.RUN_UUID,
+            topology=self._owned_topology(),
+        )
+        self.assertEqual(identity["root_file_id"], self.ROOT_ID)
+        self.assertEqual(identity["root_resource_key"], "")
+        self.assertEqual([shortcut, folder], before)
+
+    def test_shared_run_root_rejects_ambiguous_missing_and_unowned_shapes(self):
+        """Relaxing the shape must not relax which folder is allowed to win.
+
+        Accepting a same-named My Drive folder is only safe while exactly one
+        candidate exists and the account owns it. A shortcut and a same-named
+        folder together is the private replacement folder the shared-root rules
+        forbid, and silently preferring either one would point a whole run at
+        the wrong physical root.
+        """
+        shortcut = self._granted_account_shortcut()
+        folder = self._owner_account_folder()
+        cases = {
+            "shortcut_and_folder": ([shortcut], [folder], "private replacement"),
+            "nothing_visible": ([], [], "exactly one"),
+            "duplicate_folders": (
+                [],
+                [folder, self._owner_account_folder(id="duplicate-folder-id")],
+                "exactly one",
+            ),
+            "folder_not_owned": (
+                [],
+                [self._owner_account_folder(ownedByMe=False)],
+                "account owns it",
+            ),
+            "folder_ownership_unknown": (
+                [],
+                [self._owner_account_folder(ownedByMe=None)],
+                "account owns it",
+            ),
+            "folder_alias_drift": (
+                [],
+                [self._owner_account_folder(name="ddpm-derm-panderm-runs-copy")],
+                "name drift",
+            ),
+            "folder_trashed": (
+                [],
+                [self._owner_account_folder(trashed=True)],
+                "trashed=false",
+            ),
+            "folder_resource_key_invalid": (
+                [],
+                [self._owner_account_folder(resourceKey="")],
+                "resource key is invalid",
+            ),
+            "duplicate_shortcuts": (
+                [shortcut, self._granted_account_shortcut(id="duplicate-shortcut")],
+                [],
+                "exactly one",
+            ),
+        }
+        before = copy.deepcopy([shortcut, folder])
+        for name, (shortcuts, folders, message) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    panderm_run.require_drive_shared_root_target(
+                        shortcuts, folders, expected_alias=self.SHARED_ROOT_ALIAS
+                    )
+        for shortcuts, folders in ((shortcut, []), ([], "folder"), (None, [])):
+            with self.subTest(shortcuts=shortcuts, folders=folders):
+                with self.assertRaisesRegex(ValueError, "must be a sequence"):
+                    panderm_run.require_drive_shared_root_target(
+                        shortcuts, folders, expected_alias=self.SHARED_ROOT_ALIAS
+                    )
+        self.assertEqual([shortcut, folder], before)
+
+    def test_durable_root_fingerprint_is_identical_across_accounts(self):
+        """One physical folder must fingerprint identically for every account.
+
+        Drive only reports the parents the calling account can itself see: the
+        owner sees its own My Drive root folder id, while a granted account is
+        given nothing because it cannot see the owner's root. Projecting that
+        field would make the same durable root fingerprint differently on every
+        account switch, which is unreadable evidence in a workflow whose whole
+        point is handing one run between accounts A, B and C.
+        """
+        topology = self._owned_topology()
+        owner_view = self._root_metadata(parents=[self.MY_DRIVE_ROOT_ID])
+        granted_view = self._root_metadata(ownedByMe=False)
+        granted_view.pop("parents")
+        fingerprints = set()
+        for label, root in (("owner", owner_view), ("granted", granted_view)):
+            with self.subTest(account=label):
+                identity = panderm_run.build_durable_root_provider_identity(
+                    root,
+                    expected_root_id=self.ROOT_ID,
+                    shortcut_target_resource_key="",
+                    shared_root_uuid=self.RUN_UUID,
+                    topology=topology,
+                )
+                self.assertEqual(identity["root_file_id"], self.ROOT_ID)
+                fingerprints.add(identity["provider_fingerprint"])
+        self.assertEqual(len(fingerprints), 1, "fingerprint drifted between accounts")
 
     def test_true_shared_drive_and_account_neutral_shared_my_drive_are_supported(self):
         owned = self._owned_topology()
