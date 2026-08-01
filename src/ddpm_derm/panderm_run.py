@@ -2143,6 +2143,12 @@ MANUAL_TAKEOVER_CONFIRMATION = "I CONFIRM THE PREVIOUS RUNTIME IS STOPPED"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DRIVE_JSON_MIME_TYPE = "application/json"
 DRIVE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
+# "root" is only valid inside a files.list `q` parent clause. The API never
+# echoes it back: every returned `parents` entry is the real My Drive root
+# folder id, so this alias must never be compared against provider metadata.
+DRIVE_ROOT_QUERY_ALIAS = "root"
+DRIVE_SHARED_ROOT_SOURCE_SHORTCUT = "my_drive_shortcut"
+DRIVE_SHARED_ROOT_SOURCE_OWNED_FOLDER = "owned_my_drive_folder"
 VALIDATION_LOCK_TOPOLOGY_SHARED_DRIVE = "shared_drive"
 VALIDATION_LOCK_TOPOLOGY_SHARED_MY_DRIVE = "shared_my_drive"
 # Compatibility alias for older local callers; the value is deliberately no
@@ -2234,6 +2240,91 @@ def require_drive_shortcut_target_id(
     return require_drive_shortcut_target(
         records, expected_alias=expected_alias
     )["target_id"]
+
+
+def require_drive_shared_root_target(
+    shortcut_records: Sequence[Mapping[str, Any]],
+    folder_records: Sequence[Mapping[str, Any]],
+    *,
+    expected_alias: str,
+) -> dict[str, str]:
+    """Resolve the shared run root id from whichever My Drive shape an account has.
+
+    An account that was granted access holds a shortcut; the account that owns
+    the folder holds the folder itself and never has a shortcut to its own
+    folder. Both shapes name the same physical folder id, and that id is what
+    every later provider check consumes, so demanding either shape alone locks
+    out the other accounts and defeats the A/B/C rotation this run version
+    exists for.
+
+    Both shapes present at once is the private same-named replacement folder
+    that the shared-root rules forbid, so it fails loud rather than silently
+    picking one. The remaining protection against resolving a private
+    replacement is unchanged and still mandatory: the caller must assert the
+    shared-root sentinel already exists and validate its UUID identity.
+    """
+    for records, label in (
+        (shortcut_records, "shortcut"),
+        (folder_records, "folder"),
+    ):
+        if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+            raise ValueError(
+                f"shared run root provider {label} records must be a sequence"
+            )
+    shortcuts = [
+        _require_drive_provider_record(
+            record,
+            label="shared run shortcut",
+            expected_name=expected_alias,
+            expected_mime_type=DRIVE_SHORTCUT_MIME_TYPE,
+        )
+        for record in shortcut_records
+    ]
+    folders = [
+        _require_drive_provider_record(
+            record,
+            label="shared run root folder",
+            expected_name=expected_alias,
+            expected_mime_type=DRIVE_FOLDER_MIME_TYPE,
+        )
+        for record in folder_records
+    ]
+    if shortcuts and folders:
+        raise ValueError(
+            "My Drive holds both a shared run shortcut and a same-named folder; "
+            "never resolve one of a private replacement pair: "
+            f"alias={expected_alias!r} shortcuts={len(shortcuts)} "
+            f"folders={len(folders)}"
+        )
+    if shortcuts:
+        target = require_drive_shortcut_target(
+            shortcut_records, expected_alias=expected_alias
+        )
+        return {**target, "source": DRIVE_SHARED_ROOT_SOURCE_SHORTCUT}
+    if len(folders) != 1:
+        raise ValueError(
+            "exactly one provider-visible shared run root is required in "
+            "My Drive, either a shortcut or a folder this account owns: "
+            f"alias={expected_alias!r} shortcuts=0 folders={len(folders)}"
+        )
+    folder = folders[0]
+    if folder.get("ownedByMe") is not True:
+        raise ValueError(
+            "a same-named My Drive folder may only stand in for the shared run "
+            "shortcut when the authenticated account owns it: "
+            f"alias={expected_alias!r} ownedByMe={folder.get('ownedByMe')!r}"
+        )
+    resource_key = folder.get("resourceKey")
+    if resource_key is None:
+        # Keyless roots are legitimate; see require_drive_shortcut_target.
+        resource_key = ""
+    elif type(resource_key) is not str or not resource_key:
+        raise ValueError("shared run root folder resource key is invalid")
+    return {
+        "target_id": folder["id"],
+        "target_resource_key": resource_key,
+        "source": DRIVE_SHARED_ROOT_SOURCE_OWNED_FOLDER,
+    }
 
 
 def drive_resource_key_header(
@@ -2441,14 +2532,32 @@ def require_validation_lock_storage_topology(
 
 
 def require_drive_api_fuse_account_alignment(
-    probe_metadata: Mapping[str, Any], *, expected_probe_name: str
+    probe_metadata: Mapping[str, Any],
+    *,
+    expected_probe_name: str,
+    expected_root_id: str,
 ) -> dict[str, str]:
-    """Prove the Drive API account owns a FUSE-created private My Drive probe."""
+    """Prove the Drive API account owns a FUSE-created private My Drive probe.
+
+    ``expected_root_id`` must be the caller's real My Drive root folder id,
+    resolved once with ``files().get(fileId="root", fields="id")``. Passing the
+    ``"root"`` query alias can never match, because the API returns the real
+    folder id in ``parents`` and never echoes the alias, so the alias is
+    rejected outright instead of turning this check into an unpassable gate.
+    """
+    if type(expected_root_id) is not str or not expected_root_id:
+        raise ValueError("Drive My Drive root folder id must be non-empty")
+    if expected_root_id == DRIVE_ROOT_QUERY_ALIAS:
+        raise ValueError(
+            "Drive My Drive root folder id must be the resolved folder id, not "
+            f"the {DRIVE_ROOT_QUERY_ALIAS!r} query alias; resolve it with "
+            'files().get(fileId="root", fields="id")'
+        )
     probe = _require_drive_provider_record(
         probe_metadata,
         label="Drive API/FUSE account probe",
         expected_name=expected_probe_name,
-        expected_parent_id="root",
+        expected_parent_id=expected_root_id,
     )
     if probe.get("ownedByMe") is not True:
         raise ValueError(
@@ -2501,11 +2610,15 @@ def build_durable_root_provider_identity(
     if str(parsed_uuid) != shared_root_uuid or parsed_uuid.version != 4:
         raise ValueError("shared_root_uuid must be a canonical UUIDv4")
     drive_id = normalized_topology.get("drive_id") or ""
+    # `parents` is deliberately excluded. Drive only reports the parents the
+    # calling account can itself see, so the owner observes its own My Drive
+    # root folder id while a granted account observes nothing, and the same
+    # physical folder would fingerprint differently per account. Every other
+    # projected field is account-neutral, and the folder id is the identity.
     provider_projection = {
         "drive_id": drive_id,
         "mime_type": root["mimeType"],
         "name": root["name"],
-        "parents": root.get("parents"),
         "root_file_id": root["id"],
         "root_resource_key": root_resource_key,
     }
