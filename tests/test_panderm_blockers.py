@@ -3375,6 +3375,136 @@ class PersistenceTamperMatrixTests(unittest.TestCase):
 
 
 class CheckpointIntegritySidecarTests(unittest.TestCase):
+    class _VisibilitySimulator:
+        def __init__(
+            self,
+            checkpoint,
+            *,
+            checkpoint_visible_after=0,
+            sidecar_visible_after=0,
+            checkpoint_mutation=None,
+            sidecar_mutation=None,
+        ):
+            self.checkpoint = Path(checkpoint)
+            self.sidecar = train_panderm.checkpoint_integrity_path(checkpoint)
+            self.checkpoint_visible_after = checkpoint_visible_after
+            self.sidecar_visible_after = sidecar_visible_after
+            self.checkpoint_mutation = checkpoint_mutation
+            self.sidecar_mutation = sidecar_mutation
+            self.pending = {}
+            self.now = 0.0
+            self.sleep_calls = 0
+            self.replace_calls = []
+            self.real_replace = train_panderm.os.replace
+
+        def replace(self, source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            self.replace_calls.append((source.name, destination.name))
+            if any(
+                marker in source.name
+                for marker in (
+                    ".previous.",
+                    ".restore.",
+                    ".restore-sidecar.",
+                )
+            ):
+                self.pending.pop(destination, None)
+                return self.real_replace(source, destination)
+            visible_after = None
+            mutation = None
+            if destination == self.checkpoint:
+                visible_after = self.checkpoint_visible_after
+                mutation = self.checkpoint_mutation
+            elif destination == self.sidecar:
+                visible_after = self.sidecar_visible_after
+                mutation = self.sidecar_mutation
+            if destination.exists() and visible_after != 0:
+                stale = destination.read_bytes()
+                self.real_replace(source, destination)
+                candidate = destination.read_bytes()
+                if mutation is not None:
+                    candidate = mutation(candidate)
+                self.pending[destination] = candidate
+                destination.write_bytes(stale)
+                return None
+            return self.real_replace(source, destination)
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            self.sleep_calls += 1
+            for path, visible_after in (
+                (self.checkpoint, self.checkpoint_visible_after),
+                (self.sidecar, self.sidecar_visible_after),
+            ):
+                if (
+                    visible_after is not None
+                    and self.sleep_calls >= visible_after
+                    and path in self.pending
+                ):
+                    path.write_bytes(self.pending.pop(path))
+
+    @staticmethod
+    def _same_size_byte_tamper(value):
+        tampered = bytearray(value)
+        tampered[len(tampered) // 2] ^= 1
+        return bytes(tampered)
+
+    @staticmethod
+    def _same_size_sidecar_tamper(value):
+        marker = b'"sha256": "'
+        index = value.index(marker) + len(marker)
+        replacement = b"0" if value[index:index + 1] != b"0" else b"1"
+        return value[:index] + replacement + value[index + 1:]
+
+    @contextlib.contextmanager
+    def _simulate_visibility(self, simulator):
+        with (
+            mock.patch.object(
+                train_panderm.os, "replace", side_effect=simulator.replace
+            ),
+            mock.patch.object(
+                train_panderm,
+                "_checkpoint_visibility_monotonic",
+                side_effect=simulator.monotonic,
+                create=True,
+            ),
+            mock.patch.object(
+                train_panderm,
+                "_checkpoint_visibility_sleep",
+                side_effect=simulator.sleep,
+                create=True,
+            ),
+            mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS",
+                6.0,
+                create=True,
+            ),
+            mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_VISIBILITY_POLL_SECONDS",
+                1.0,
+                create=True,
+            ),
+            mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_HASH_RETRY_SECONDS",
+                2.0,
+                create=True,
+            ),
+            mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS",
+                2.0,
+                create=True,
+            ),
+        ):
+            yield
+
     def _components(self):
         model = build_mock_model()
         optimizer = panderm.build_optimizer(model, num_layers=4)
@@ -3384,8 +3514,19 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
         scaler = torch.amp.GradScaler("cuda", enabled=False)
         return model, optimizer, schedule, scaler
 
-    def _save(self, path, run_identity, epoch=1):
-        model, optimizer, schedule, scaler = self._components()
+    def _visibility_components(self):
+        model = torch.nn.Linear(2, len(train_panderm.config.CLASS_NAMES))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        schedule = mock.Mock(step_count=0)
+        schedule.state_dict.return_value = {"step_count": 0}
+        scaler = mock.Mock()
+        scaler.state_dict.return_value = {}
+        return model, optimizer, schedule, scaler
+
+    def _save(self, path, run_identity, epoch=1, write_guard=None, components=None):
+        model, optimizer, schedule, scaler = (
+            self._components() if components is None else components
+        )
         args = type("A", (), {"seed": 0, "epochs": 5})()
         train_panderm.save_checkpoint(
             path,
@@ -3401,12 +3542,168 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
             ],
             args,
             run_identity,
-            write_guard=AllowDurableWriteGuard(),
+            write_guard=write_guard or AllowDurableWriteGuard(),
         )
         return model, optimizer, schedule, scaler
 
+    def _save_visibility(self, path, run_identity, epoch=1, write_guard=None):
+        return self._save(
+            path,
+            run_identity,
+            epoch=epoch,
+            write_guard=write_guard,
+            components=self._visibility_components(),
+        )
+
     def _sidecar_path(self, checkpoint):
         return checkpoint.with_name(checkpoint.name + ".integrity.json")
+
+    def test_overwrite_waits_for_stale_checkpoint_visibility(self):
+        run_identity = identity()
+        for filename in ("best.pt", "last.pt"):
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / filename
+                    self._save_visibility(path, run_identity, epoch=1)
+                    sidecar_path = self._sidecar_path(path)
+                    before = (path.read_bytes(), sidecar_path.read_bytes())
+                    simulator = self._VisibilitySimulator(
+                        path, checkpoint_visible_after=3
+                    )
+                    with self._simulate_visibility(simulator):
+                        self._save_visibility(path, run_identity, epoch=2)
+                    self.assertEqual(
+                        train_panderm.load_checkpoint_safe(
+                            path, expected_identity=run_identity
+                        )["epoch"],
+                        2,
+                    )
+                    self.assertNotEqual(
+                        (path.read_bytes(), sidecar_path.read_bytes()), before
+                    )
+                    self.assertFalse(simulator.pending)
+
+    def test_overwrite_waits_for_independently_stale_sidecar_visibility(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "best.pt"
+            self._save_visibility(path, run_identity, epoch=1)
+            simulator = self._VisibilitySimulator(
+                path, sidecar_visible_after=3
+            )
+            with self._simulate_visibility(simulator):
+                self._save_visibility(path, run_identity, epoch=2)
+            self.assertEqual(
+                train_panderm.load_checkpoint_safe(
+                    path, expected_identity=run_identity
+                )["epoch"],
+                2,
+            )
+            self.assertFalse(simulator.pending)
+
+    def test_visibility_timeout_restores_exact_pair_without_residue(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "last.pt"
+            self._save_visibility(path, run_identity, epoch=1)
+            sidecar_path = self._sidecar_path(path)
+            before = (path.read_bytes(), sidecar_path.read_bytes())
+            simulator = self._VisibilitySimulator(
+                path, checkpoint_visible_after=None
+            )
+            with self._simulate_visibility(simulator):
+                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
+                    self._save_visibility(path, run_identity, epoch=2)
+            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
+            self.assertEqual(
+                sorted(item.name for item in root.iterdir()),
+                ["last.pt", "last.pt.integrity.json"],
+            )
+
+    def test_same_size_tampered_candidate_never_bypasses_sha(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "last.pt"
+            self._save_visibility(path, run_identity, epoch=1)
+            sidecar_path = self._sidecar_path(path)
+            before = (path.read_bytes(), sidecar_path.read_bytes())
+            simulator = self._VisibilitySimulator(
+                path,
+                checkpoint_visible_after=2,
+                checkpoint_mutation=self._same_size_byte_tamper,
+            )
+            with self._simulate_visibility(simulator):
+                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
+                    self._save_visibility(path, run_identity, epoch=2)
+            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
+            self.assertEqual(
+                sorted(item.name for item in root.iterdir()),
+                ["last.pt", "last.pt.integrity.json"],
+            )
+
+    def test_wrong_sidecar_never_converges_or_survives_rollback(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "best.pt"
+            self._save_visibility(path, run_identity, epoch=1)
+            sidecar_path = self._sidecar_path(path)
+            before = (path.read_bytes(), sidecar_path.read_bytes())
+            simulator = self._VisibilitySimulator(
+                path,
+                sidecar_visible_after=2,
+                sidecar_mutation=self._same_size_sidecar_tamper,
+            )
+            with self._simulate_visibility(simulator):
+                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
+                    self._save_visibility(path, run_identity, epoch=2)
+            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
+            self.assertEqual(
+                sorted(item.name for item in root.iterdir()),
+                ["best.pt", "best.pt.integrity.json"],
+            )
+
+    def test_visibility_guard_loss_stops_before_rollback_mutation(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "last.pt"
+            self._save_visibility(path, run_identity, epoch=1)
+            simulator = self._VisibilitySimulator(
+                path, checkpoint_visible_after=None
+            )
+
+            class ExpiringGuard:
+                def __init__(self):
+                    self.lost = False
+                    self.replace_count_at_loss = None
+
+                def require(inner_self, phase):
+                    if "checkpoint publication visibility" in phase:
+                        inner_self.lost = True
+                        inner_self.replace_count_at_loss = len(
+                            simulator.replace_calls
+                        )
+                        raise RuntimeError("stale publication fence")
+                    if inner_self.lost:
+                        raise RuntimeError("stale publication fence")
+
+            guard = ExpiringGuard()
+            with self._simulate_visibility(simulator):
+                with self.assertRaisesRegex(
+                    RuntimeError, "stale publication fence|restoration"
+                ):
+                    self._save_visibility(
+                        path, run_identity, epoch=2, write_guard=guard
+                    )
+            self.assertTrue(guard.lost)
+            self.assertEqual(
+                len(simulator.replace_calls), guard.replace_count_at_loss
+            )
+            predecessor = sorted(root.glob(".last.pt.previous.*"))
+            self.assertEqual(len(predecessor), 2)
 
     def test_torch_version_subclass_is_normalized_to_exact_str(self):
         class TorchVersionLike(str):
@@ -3609,21 +3906,22 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 {"epoch": completed, "optimizer_steps": schedule.step_count}
                 for completed in (1, 2)
             ]
-            real_load = train_panderm.load_checkpoint_safe
-            final_loads = []
+            real_wait = train_panderm._wait_for_checkpoint_pair_visibility
+            publication_waits = []
 
-            def fail_first_post_replace(candidate, **kwargs):
-                reopened = real_load(candidate, **kwargs)
-                if Path(candidate) == path:
-                    final_loads.append(train_panderm.sha256_file(candidate))
-                    if len(final_loads) == 2:
-                        raise RuntimeError("simulated final reopen failure")
+            def fail_candidate_reopen(*args, phase, **kwargs):
+                reopened = real_wait(*args, phase=phase, **kwargs)
+                if phase == "checkpoint publication":
+                    publication_waits.append(
+                        train_panderm.sha256_file(args[0])
+                    )
+                    raise RuntimeError("simulated final reopen failure")
                 return reopened
 
             with mock.patch.object(
                 train_panderm,
-                "load_checkpoint_safe",
-                side_effect=fail_first_post_replace,
+                "_wait_for_checkpoint_pair_visibility",
+                side_effect=fail_candidate_reopen,
             ):
                 with self.assertRaisesRegex(RuntimeError, "reopen failure"):
                     train_panderm.save_checkpoint(
@@ -3649,6 +3947,7 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 )["epoch"],
                 1,
             )
+            self.assertEqual(len(publication_waits), 1)
 
     def test_abrupt_publish_recovers_only_the_last_complete_predecessor(self):
         run_identity = identity()
@@ -3683,6 +3982,139 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
             )
             self.assertTrue(backup.is_file())
             self.assertTrue(backup_sidecar.is_file())
+
+    def test_resume_recovery_waits_for_stale_checkpoint_and_sidecar_visibility(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "last.pt"
+            model, _, _, _ = self._save_visibility(
+                path, run_identity, epoch=1
+            )
+            sidecar_path = self._sidecar_path(path)
+            previous_id = "a" * 32
+            backup = root / f".last.pt.previous.{previous_id}.pt"
+            backup_sidecar = root / (
+                f".last.pt.previous.{previous_id}.integrity.json"
+            )
+            shutil.copy2(path, backup)
+            shutil.copy2(sidecar_path, backup_sidecar)
+            expected_pair = (
+                backup.read_bytes(),
+                backup_sidecar.read_bytes(),
+            )
+            path.write_bytes(b"interrupted-new-checkpoint")
+            sidecar_path.write_text('{"partial":true}\n', encoding="utf-8")
+            simulator = self._VisibilitySimulator(
+                path,
+                checkpoint_visible_after=3,
+                sidecar_visible_after=2,
+            )
+            with self._simulate_visibility(simulator):
+                recovered = train_panderm.load_checkpoint_for_resume(
+                    path,
+                    map_location="cpu",
+                    model=model,
+                    expected_identity=run_identity,
+                    write_guard=AllowDurableWriteGuard(),
+                )
+            self.assertEqual(recovered["epoch"], 1)
+            self.assertEqual(
+                (path.read_bytes(), sidecar_path.read_bytes()),
+                expected_pair,
+            )
+            self.assertFalse(simulator.pending)
+            self.assertTrue(backup.is_file())
+            self.assertTrue(backup_sidecar.is_file())
+
+    def test_resume_recovery_guard_loss_blocks_unauthorized_replace(self):
+        run_identity = identity()
+        cases = (
+            ("checkpoint resume recovery checkpoint staging", 0),
+            ("checkpoint resume recovery sidecar publish", 1),
+            ("checkpoint resume recovery publication visibility wait", 2),
+        )
+        for target_phase, expected_replace_count in cases:
+            with (
+                self.subTest(target_phase=target_phase),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                path = root / "last.pt"
+                model, _, _, _ = self._save_visibility(
+                    path, run_identity, epoch=1
+                )
+                sidecar_path = self._sidecar_path(path)
+                previous_id = "a" * 32
+                backup = root / f".last.pt.previous.{previous_id}.pt"
+                backup_sidecar = root / (
+                    f".last.pt.previous.{previous_id}.integrity.json"
+                )
+                shutil.copy2(path, backup)
+                shutil.copy2(sidecar_path, backup_sidecar)
+                predecessor_pair = (
+                    backup.read_bytes(),
+                    backup_sidecar.read_bytes(),
+                )
+                path.write_bytes(b"interrupted-new-checkpoint")
+                sidecar_path.write_text(
+                    '{"partial":true}\n', encoding="utf-8"
+                )
+                replace_calls = []
+                real_replace = train_panderm.os.replace
+
+                def observed_replace(source, destination):
+                    replace_calls.append(
+                        (Path(source).name, Path(destination).name)
+                    )
+                    return real_replace(source, destination)
+
+                class ExpiringGuard:
+                    def __init__(inner_self):
+                        inner_self.lost = False
+                        inner_self.replace_count_at_loss = None
+
+                    def require(inner_self, phase):
+                        if target_phase in phase:
+                            inner_self.lost = True
+                            inner_self.replace_count_at_loss = len(
+                                replace_calls
+                            )
+                            raise RuntimeError("stale recovery fence")
+                        if inner_self.lost:
+                            raise RuntimeError("stale recovery fence")
+
+                guard = ExpiringGuard()
+                with mock.patch.object(
+                    train_panderm.os,
+                    "replace",
+                    side_effect=observed_replace,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stale recovery fence"
+                    ):
+                        train_panderm.load_checkpoint_for_resume(
+                            path,
+                            map_location="cpu",
+                            model=model,
+                            expected_identity=run_identity,
+                            write_guard=guard,
+                        )
+                self.assertTrue(guard.lost)
+                self.assertEqual(
+                    len(replace_calls), guard.replace_count_at_loss
+                )
+                self.assertEqual(
+                    len(replace_calls), expected_replace_count
+                )
+                self.assertEqual(
+                    (backup.read_bytes(), backup_sidecar.read_bytes()),
+                    predecessor_pair,
+                )
+                self.assertTrue(backup.is_file())
+                self.assertTrue(backup_sidecar.is_file())
+                self.assertFalse(list(root.glob(".*.recovery.*")))
+                self.assertFalse(list(root.glob(".*.recovery-sidecar.*")))
 
     def test_monotonic_result_publish_allows_exact_retry_and_rejects_rollback(self):
         run_identity = identity()
@@ -3993,7 +4425,7 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                                 expected_identity=run_identity,
                             )
 
-    def test_sidecar_atomic_replace_reopens_exactly(self):
+    def test_sidecar_atomic_replace_fails_bounded_when_never_exact(self):
         value = {
             "schema_version": 1,
             "checkpoint_filename": "last.pt",
@@ -4004,6 +4436,14 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
             "run_identity_sha256": "b" * 64,
         }
         real_replace = train_panderm.os.replace
+        now = [0.0]
+
+        def monotonic():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "last.pt.integrity.json"
 
@@ -4015,8 +4455,31 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 train_panderm.os,
                 "replace",
                 side_effect=replace_then_tamper,
+            ), mock.patch.object(
+                train_panderm,
+                "_checkpoint_visibility_monotonic",
+                side_effect=monotonic,
+            ), mock.patch.object(
+                train_panderm,
+                "_checkpoint_visibility_sleep",
+                side_effect=sleep,
+            ), mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS",
+                2.0,
+            ), mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_VISIBILITY_POLL_SECONDS",
+                1.0,
+            ), mock.patch.object(
+                train_panderm,
+                "CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS",
+                1.0,
             ):
-                with self.assertRaisesRegex(ValueError, "sidecar reopen"):
+                with self.assertRaisesRegex(
+                    TimeoutError,
+                    "checkpoint integrity publication visibility timeout",
+                ):
                     train_panderm._write_integrity_sidecar_atomic(
                         path,
                         value,

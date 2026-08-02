@@ -20,6 +20,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -51,6 +52,21 @@ CHECKPOINT_INTEGRITY_KEYS = {
     "checkpoint_format",
     "run_identity_sha256",
 }
+CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS = 300.0
+CHECKPOINT_PUBLICATION_VISIBILITY_POLL_SECONDS = 2.0
+CHECKPOINT_PUBLICATION_HASH_RETRY_SECONDS = 30.0
+CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS = 30.0
+CHECKPOINT_PUBLICATION_HASH_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+def _checkpoint_visibility_monotonic() -> float:
+    return time.monotonic()
+
+
+def _checkpoint_visibility_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 
 
 def set_seed(seed: int) -> None:
@@ -179,6 +195,314 @@ def _require_durable_write_guard(write_guard, phase):
     return write_guard.require(phase)
 
 
+def _checkpoint_visibility_timeout(
+    *, phase, path, started, last_observation
+) -> TimeoutError:
+    elapsed = _checkpoint_visibility_monotonic() - started
+    return TimeoutError(
+        f"{phase} visibility timeout path={Path(path).name} "
+        f"elapsed={elapsed:.1f}s last_observation={last_observation}"
+    )
+
+
+def _sidecar_visibility_observation(record) -> str:
+    if not isinstance(record, dict):
+        return f"sidecar_type={type(record).__name__}"
+    return (
+        f"sidecar_keys={sorted(record)} "
+        f"epoch={record.get('epoch')!r} "
+        f"global_step={record.get('global_step')!r} "
+        f"byte_size={record.get('byte_size')!r} "
+        f"sha256={str(record.get('sha256', ''))[:12]}"
+    )
+
+
+def _read_sidecar_visibility(path):
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, "sidecar_missing"
+    except OSError as error:
+        return None, f"sidecar_read_error={type(error).__name__}:{error}"
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        return None, f"sidecar_invalid={type(error).__name__}:{error}"
+    return record, _sidecar_visibility_observation(record)
+
+
+def _wait_for_integrity_sidecar_visibility(
+    path, expected_record, *, write_guard, phase
+) -> None:
+    path = Path(path)
+    expected_record = dict(expected_record)
+    started = _checkpoint_visibility_monotonic()
+    deadline = started + CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS
+    next_heartbeat = started
+    waiting = False
+    last_observation = "not_observed"
+    while True:
+        _require_durable_write_guard(
+            write_guard, f"{phase} visibility wait {path.name}"
+        )
+        record, last_observation = _read_sidecar_visibility(path)
+        if record == expected_record:
+            if waiting:
+                elapsed = _checkpoint_visibility_monotonic() - started
+                print(
+                    f"[checkpoint-publication] {phase} COMPLETE "
+                    f"path={path.name} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+            return
+        now = _checkpoint_visibility_monotonic()
+        if now >= deadline:
+            raise _checkpoint_visibility_timeout(
+                phase=phase,
+                path=path,
+                started=started,
+                last_observation=last_observation,
+            )
+        if not waiting or now >= next_heartbeat:
+            print(
+                f"[checkpoint-publication] {phase} WAIT path={path.name} "
+                f"elapsed={now-started:.1f}s "
+                f"last_observation={last_observation} still_waiting=true",
+                flush=True,
+            )
+            waiting = True
+            next_heartbeat = now + CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS
+        _checkpoint_visibility_sleep(
+            min(
+                CHECKPOINT_PUBLICATION_VISIBILITY_POLL_SECONDS,
+                max(deadline - now, 0.0),
+            )
+        )
+
+
+def _sha256_checkpoint_visibility(
+    path,
+    *,
+    expected_bytes,
+    write_guard,
+    phase,
+    started,
+    deadline,
+) -> str:
+    path = Path(path)
+    _require_durable_write_guard(
+        write_guard, f"{phase} visibility SHA-256 start {path.name}"
+    )
+    now = _checkpoint_visibility_monotonic()
+    print(
+        f"[checkpoint-publication] {phase} SHA256_START path={path.name} "
+        f"bytes_total={expected_bytes} elapsed={now-started:.1f}s "
+        f"still_waiting=true",
+        flush=True,
+    )
+    digest = hashlib.sha256()
+    bytes_read = 0
+    next_heartbeat = now + CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(CHECKPOINT_PUBLICATION_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            now = _checkpoint_visibility_monotonic()
+            if now >= deadline:
+                raise _checkpoint_visibility_timeout(
+                    phase=phase,
+                    path=path,
+                    started=started,
+                    last_observation=(
+                        f"sha256_in_progress bytes={bytes_read}/{expected_bytes}"
+                    ),
+                )
+            if now >= next_heartbeat:
+                _require_durable_write_guard(
+                    write_guard,
+                    f"{phase} visibility SHA-256 wait {path.name}",
+                )
+                print(
+                    f"[checkpoint-publication] {phase} SHA256_WAIT "
+                    f"path={path.name} bytes={bytes_read}/{expected_bytes} "
+                    f"elapsed={now-started:.1f}s still_waiting=true",
+                    flush=True,
+                )
+                next_heartbeat = (
+                    now + CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS
+                )
+    _require_durable_write_guard(
+        write_guard, f"{phase} visibility SHA-256 complete {path.name}"
+    )
+    return digest.hexdigest()
+
+
+def _wait_for_checkpoint_pair_visibility(
+    path,
+    sidecar_path,
+    expected_record,
+    *,
+    expected_payload,
+    expected_identity,
+    model,
+    write_guard,
+    phase,
+    map_location="cpu",
+):
+    path = Path(path)
+    sidecar_path = Path(sidecar_path)
+    expected_record = dict(expected_record)
+    started = _checkpoint_visibility_monotonic()
+    deadline = started + CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS
+    next_heartbeat = started
+    next_hash_at = started
+    last_hashed_metadata = None
+    waiting = False
+    last_observation = "not_observed"
+    while True:
+        _require_durable_write_guard(
+            write_guard, f"{phase} visibility wait {path.name}"
+        )
+        sidecar, sidecar_observation = _read_sidecar_visibility(sidecar_path)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            stat = None
+            last_observation = (
+                f"checkpoint_missing {sidecar_observation}"
+            )
+        except OSError as error:
+            stat = None
+            last_observation = (
+                f"checkpoint_stat_error={type(error).__name__}:{error} "
+                f"{sidecar_observation}"
+            )
+        if stat is not None:
+            metadata = (
+                stat.st_size,
+                stat.st_mtime_ns,
+                getattr(stat, "st_ino", None),
+            )
+            last_observation = (
+                f"checkpoint_size={stat.st_size} "
+                f"checkpoint_mtime_ns={stat.st_mtime_ns} "
+                f"{sidecar_observation}"
+            )
+            now = _checkpoint_visibility_monotonic()
+            if (
+                sidecar == expected_record
+                and stat.st_size == expected_record["byte_size"]
+                and (
+                    metadata != last_hashed_metadata
+                    or now >= next_hash_at
+                )
+            ):
+                try:
+                    observed_sha256 = _sha256_checkpoint_visibility(
+                        path,
+                        expected_bytes=expected_record["byte_size"],
+                        write_guard=write_guard,
+                        phase=phase,
+                        started=started,
+                        deadline=deadline,
+                    )
+                except OSError as error:
+                    last_observation = (
+                        f"checkpoint_hash_error={type(error).__name__}:{error}"
+                    )
+                else:
+                    last_hashed_metadata = metadata
+                    next_hash_at = (
+                        _checkpoint_visibility_monotonic()
+                        + CHECKPOINT_PUBLICATION_HASH_RETRY_SECONDS
+                    )
+                    if observed_sha256 == expected_record["sha256"]:
+                        _require_durable_write_guard(
+                            write_guard,
+                            f"{phase} visibility payload reopen {path.name}",
+                        )
+                        reopened = require_verified_checkpoint_payload(
+                            path,
+                            expected_record,
+                            map_location=map_location,
+                            model=model,
+                            expected_identity=expected_identity,
+                        )
+                        validate_checkpoint_payload(
+                            reopened,
+                            model,
+                            expected_payload=expected_payload,
+                        )
+                        visible_sidecar, _ = _read_sidecar_visibility(
+                            sidecar_path
+                        )
+                        final_stat = path.stat()
+                        if visible_sidecar != expected_record:
+                            last_observation = (
+                                "sidecar_drifted_after_payload_validation"
+                            )
+                        elif (
+                            final_stat.st_size,
+                            final_stat.st_mtime_ns,
+                            getattr(final_stat, "st_ino", None),
+                        ) != metadata:
+                            last_observation = (
+                                "checkpoint_metadata_drifted_after_payload_validation"
+                            )
+                        elif _checkpoint_visibility_monotonic() >= deadline:
+                            last_observation = (
+                                "payload_validation_exceeded_deadline"
+                            )
+                        else:
+                            _require_durable_write_guard(
+                                write_guard,
+                                f"{phase} visibility complete {path.name}",
+                            )
+                            elapsed = (
+                                _checkpoint_visibility_monotonic() - started
+                            )
+                            print(
+                                f"[checkpoint-publication] {phase} COMPLETE "
+                                f"path={path.name} elapsed={elapsed:.1f}s "
+                                f"sha256={observed_sha256}",
+                                flush=True,
+                            )
+                            return reopened
+                    else:
+                        last_observation = (
+                            f"checkpoint_sha256_mismatch "
+                            f"observed={observed_sha256[:12]} "
+                            f"expected={expected_record['sha256'][:12]}"
+                        )
+        now = _checkpoint_visibility_monotonic()
+        if now >= deadline:
+            raise _checkpoint_visibility_timeout(
+                phase=phase,
+                path=path,
+                started=started,
+                last_observation=last_observation,
+            )
+        if not waiting or now >= next_heartbeat:
+            print(
+                f"[checkpoint-publication] {phase} WAIT path={path.name} "
+                f"elapsed={now-started:.1f}s "
+                f"last_observation={last_observation} still_waiting=true",
+                flush=True,
+            )
+            waiting = True
+            next_heartbeat = now + CHECKPOINT_PUBLICATION_HEARTBEAT_SECONDS
+        _checkpoint_visibility_sleep(
+            min(
+                CHECKPOINT_PUBLICATION_VISIBILITY_POLL_SECONDS,
+                max(deadline - now, 0.0),
+            )
+        )
+
+
 def _write_integrity_sidecar_atomic(path, value, *, write_guard) -> None:
     path = Path(path)
     canonical = json.loads(json.dumps(dict(value), sort_keys=True))
@@ -209,21 +533,27 @@ def _write_integrity_sidecar_atomic(path, value, *, write_guard) -> None:
         )
         os.replace(temporary, path)
         temporary = None
-        reopened = json.loads(path.read_text(encoding="utf-8"))
-        if reopened != canonical:
-            raise ValueError(f"checkpoint integrity sidecar reopen failed: {path}")
+        _wait_for_integrity_sidecar_visibility(
+            path,
+            canonical,
+            write_guard=write_guard,
+            phase="checkpoint integrity publication",
+        )
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
 
 
-def _build_checkpoint_integrity(path, *, epoch, global_step, run_identity) -> dict:
+def _build_checkpoint_integrity(
+    path, *, checkpoint_filename=None, byte_size=None, sha256=None,
+    epoch, global_step, run_identity,
+) -> dict:
     path = Path(path)
     return {
         "schema_version": CHECKPOINT_INTEGRITY_SCHEMA_VERSION,
-        "checkpoint_filename": path.name,
-        "byte_size": path.stat().st_size,
-        "sha256": sha256_file(path),
+        "checkpoint_filename": checkpoint_filename or path.name,
+        "byte_size": path.stat().st_size if byte_size is None else int(byte_size),
+        "sha256": sha256_file(path) if sha256 is None else str(sha256),
         "epoch": int(epoch),
         "global_step": int(global_step),
         "checkpoint_format": panderm_run.CHECKPOINT_FORMAT,
@@ -421,6 +751,101 @@ def checkpoint_serialization_preflight(
             temporary.unlink(missing_ok=True)
 
 
+def _restore_previous_checkpoint_pair(
+    path,
+    previous_checkpoint,
+    previous_sidecar,
+    previous_record,
+    previous_payload,
+    *,
+    model,
+    run_identity,
+    write_guard,
+) -> None:
+    path = Path(path)
+    previous_checkpoint = Path(previous_checkpoint)
+    previous_sidecar = Path(previous_sidecar)
+    _wait_for_checkpoint_pair_visibility(
+        previous_checkpoint,
+        previous_sidecar,
+        previous_record,
+        expected_payload=previous_payload,
+        expected_identity=run_identity,
+        model=model,
+        write_guard=write_guard,
+        phase="checkpoint restoration predecessor",
+    )
+    checkpoint_temporary: Path | None = None
+    sidecar_temporary: Path | None = None
+    try:
+        _require_durable_write_guard(
+            write_guard, f"checkpoint restore staging {path.name}"
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.restore.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            checkpoint_temporary = Path(handle.name)
+        shutil.copy2(previous_checkpoint, checkpoint_temporary)
+        if checkpoint_temporary.stat().st_size != previous_record["byte_size"]:
+            raise ValueError("checkpoint restore staging byte size mismatch")
+        started = _checkpoint_visibility_monotonic()
+        observed_sha256 = _sha256_checkpoint_visibility(
+            checkpoint_temporary,
+            expected_bytes=previous_record["byte_size"],
+            write_guard=write_guard,
+            phase="checkpoint restoration staging",
+            started=started,
+            deadline=(
+                started + CHECKPOINT_PUBLICATION_VISIBILITY_TIMEOUT_SECONDS
+            ),
+        )
+        if observed_sha256 != previous_record["sha256"]:
+            raise ValueError("checkpoint restore staging SHA-256 mismatch")
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.restore-sidecar.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            sidecar_temporary = Path(handle.name)
+        shutil.copy2(previous_sidecar, sidecar_temporary)
+        if sidecar_temporary.read_bytes() != previous_sidecar.read_bytes():
+            raise ValueError("checkpoint restore sidecar staging mismatch")
+        _require_durable_write_guard(
+            write_guard, f"checkpoint restore publish {path.name}"
+        )
+        os.replace(checkpoint_temporary, path)
+        checkpoint_temporary = None
+        _require_durable_write_guard(
+            write_guard, f"checkpoint restore sidecar publish {path.name}"
+        )
+        os.replace(sidecar_temporary, checkpoint_integrity_path(path))
+        sidecar_temporary = None
+        _wait_for_checkpoint_pair_visibility(
+            path,
+            checkpoint_integrity_path(path),
+            previous_record,
+            expected_payload=previous_payload,
+            expected_identity=run_identity,
+            model=model,
+            write_guard=write_guard,
+            phase="checkpoint restoration publication",
+        )
+        _require_durable_write_guard(
+            write_guard, f"checkpoint restore predecessor cleanup {path.name}"
+        )
+        previous_checkpoint.unlink()
+        previous_sidecar.unlink()
+    finally:
+        if checkpoint_temporary is not None:
+            checkpoint_temporary.unlink(missing_ok=True)
+        if sidecar_temporary is not None:
+            sidecar_temporary.unlink(missing_ok=True)
+
+
 def save_checkpoint(
     path, model, optimizer, schedule, scaler, epoch, best_val_f1, history,
     args, run_identity, val_metrics=None, *, write_guard,
@@ -447,7 +872,10 @@ def save_checkpoint(
     shared_temporary: Path | None = None
     previous_checkpoint: Path | None = None
     previous_sidecar: Path | None = None
+    previous_record: dict | None = None
+    previous_payload: dict | None = None
     final_replaced = False
+    publication_complete = False
     try:
         with tempfile.NamedTemporaryFile(
             prefix=f".{path.name}.runtime.",
@@ -477,10 +905,21 @@ def save_checkpoint(
             shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
             target.flush()
             os.fsync(target.fileno())
-        if sha256_file(local_temporary) != sha256_file(shared_temporary):
+        local_sha256 = sha256_file(local_temporary)
+        shared_sha256 = sha256_file(shared_temporary)
+        if local_sha256 != shared_sha256:
             raise ValueError("shared checkpoint staging copy hash mismatch")
         with shared_temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
+        candidate_record = _build_checkpoint_integrity(
+            shared_temporary,
+            checkpoint_filename=path.name,
+            byte_size=shared_temporary.stat().st_size,
+            sha256=shared_sha256,
+            epoch=epoch,
+            global_step=payload["global_step"],
+            run_identity=run_identity,
+        )
         staged = _load_staged_checkpoint_for_save(shared_temporary, map_location="cpu")
         validate_checkpoint_payload(staged, model, expected_payload=payload)
         if path.exists():
@@ -489,6 +928,10 @@ def save_checkpoint(
                 map_location="cpu",
                 model=model,
                 expected_identity=run_identity,
+            )
+            previous_payload = existing
+            previous_record = json.loads(
+                checkpoint_integrity_path(path).read_text(encoding="utf-8")
             )
             existing_position = (
                 int(existing["epoch"]),
@@ -526,7 +969,7 @@ def save_checkpoint(
             )
             shutil.copy2(path, previous_checkpoint)
             shutil.copy2(checkpoint_integrity_path(path), previous_sidecar)
-            if sha256_file(previous_checkpoint) != sha256_file(path):
+            if sha256_file(previous_checkpoint) != previous_record["sha256"]:
                 raise ValueError("previous checkpoint preservation hash mismatch")
             if (
                 previous_sidecar.read_bytes()
@@ -539,58 +982,67 @@ def save_checkpoint(
         os.replace(shared_temporary, path)
         shared_temporary = None
         final_replaced = True
-        sidecar = _build_checkpoint_integrity(
-            path,
-            epoch=epoch,
-            global_step=payload["global_step"],
-            run_identity=run_identity,
-        )
         _write_integrity_sidecar_atomic(
-            checkpoint_integrity_path(path), sidecar, write_guard=write_guard
+            checkpoint_integrity_path(path),
+            candidate_record,
+            write_guard=write_guard,
         )
-        checkpoint_integrity_record(path, expected_identity=run_identity)
-        reopened = load_checkpoint_safe(
+        _wait_for_checkpoint_pair_visibility(
             path,
-            map_location="cpu",
-            model=model,
+            checkpoint_integrity_path(path),
+            candidate_record,
+            expected_payload=payload,
             expected_identity=run_identity,
+            model=model,
+            write_guard=write_guard,
+            phase="checkpoint publication",
         )
-        validate_checkpoint_payload(reopened, model, expected_payload=payload)
-        if previous_checkpoint is not None:
-            previous_checkpoint.unlink(missing_ok=True)
+        publication_complete = True
+        if previous_checkpoint is not None and previous_sidecar is not None:
+            _require_durable_write_guard(
+                write_guard, f"checkpoint predecessor cleanup {path.name}"
+            )
+            previous_checkpoint.unlink()
+            previous_sidecar.unlink()
             previous_checkpoint = None
-        if previous_sidecar is not None:
-            previous_sidecar.unlink(missing_ok=True)
             previous_sidecar = None
-    except Exception:
+    except Exception as publication_error:
         if (
             final_replaced
+            and not publication_complete
             and previous_checkpoint is not None
             and previous_sidecar is not None
+            and previous_record is not None
+            and previous_payload is not None
         ):
-            _require_durable_write_guard(
-                write_guard, f"checkpoint restore previous {path.name}"
-            )
-            os.replace(previous_checkpoint, path)
+            try:
+                _restore_previous_checkpoint_pair(
+                    path,
+                    previous_checkpoint,
+                    previous_sidecar,
+                    previous_record,
+                    previous_payload,
+                    model=model,
+                    run_identity=run_identity,
+                    write_guard=write_guard,
+                )
+            except Exception as restoration_error:
+                raise RuntimeError(
+                    "checkpoint publication failed and previous complete pair "
+                    "restoration failed: "
+                    f"publication={type(publication_error).__name__}: "
+                    f"{publication_error}; "
+                    f"restoration={type(restoration_error).__name__}: "
+                    f"{restoration_error}"
+                ) from restoration_error
             previous_checkpoint = None
-            os.replace(previous_sidecar, checkpoint_integrity_path(path))
             previous_sidecar = None
-            load_checkpoint_safe(
-                path,
-                map_location="cpu",
-                model=model,
-                expected_identity=run_identity,
-            )
         raise
     finally:
         if local_temporary is not None:
             local_temporary.unlink(missing_ok=True)
         if shared_temporary is not None:
             shared_temporary.unlink(missing_ok=True)
-        if previous_checkpoint is not None:
-            previous_checkpoint.unlink(missing_ok=True)
-        if previous_sidecar is not None:
-            previous_sidecar.unlink(missing_ok=True)
 
 
 def load_checkpoint_safe(
@@ -721,7 +1173,7 @@ def load_checkpoint_for_resume(
                     backup,
                     sidecar,
                     record,
-                    payload["history"],
+                    payload,
                 )
             )
         if not candidates:
@@ -731,28 +1183,33 @@ def load_checkpoint_for_resume(
         newest_position = candidates[0][0]
         same_step = [item for item in candidates if item[0] == newest_position]
         canonical_record = same_step[0][3]
-        canonical_history = same_step[0][4]
+        canonical_payload = same_step[0][4]
+        canonical_history = canonical_payload["history"]
         canonical_sha256 = canonical_record["sha256"]
         # Every candidate at the newest position is compared, not only the first
         # two, so a third or Nth divergent backup can never be ignored.
-        for _, other, _, other_record, other_history in same_step[1:]:
+        for _, other, _, other_record, other_payload in same_step[1:]:
             if (
                 other_record != canonical_record
                 or sha256_file(other) != canonical_sha256
                 or other.stat().st_size != canonical_record["byte_size"]
-                or other_history != canonical_history
+                or other_payload["history"] != canonical_history
             ):
                 raise ValueError(
                     "ambiguous preserved checkpoints at the same epoch/global_step: "
                     f"{sorted(item[1].name for item in same_step)}"
                 )
-        _, backup, sidecar, _, _ = same_step[0]
+        _, backup, sidecar, record, payload = same_step[0]
         _require_durable_write_guard(
             write_guard, "checkpoint resume restore last complete predecessor"
         )
         checkpoint_temporary: Path | None = None
         sidecar_temporary: Path | None = None
         try:
+            _require_durable_write_guard(
+                write_guard,
+                "checkpoint resume recovery checkpoint staging",
+            )
             with tempfile.NamedTemporaryFile(
                 prefix=f".{path.name}.recovery.",
                 suffix=".tmp",
@@ -760,7 +1217,14 @@ def load_checkpoint_for_resume(
                 delete=False,
             ) as handle:
                 checkpoint_temporary = Path(handle.name)
+            _require_durable_write_guard(
+                write_guard, "checkpoint resume recovery checkpoint copy"
+            )
             shutil.copy2(backup, checkpoint_temporary)
+            _require_durable_write_guard(
+                write_guard,
+                "checkpoint resume recovery sidecar staging",
+            )
             with tempfile.NamedTemporaryFile(
                 prefix=f".{path.name}.recovery-sidecar.",
                 suffix=".tmp",
@@ -768,9 +1232,18 @@ def load_checkpoint_for_resume(
                 delete=False,
             ) as handle:
                 sidecar_temporary = Path(handle.name)
+            _require_durable_write_guard(
+                write_guard, "checkpoint resume recovery sidecar copy"
+            )
             shutil.copy2(sidecar, sidecar_temporary)
+            _require_durable_write_guard(
+                write_guard, "checkpoint resume recovery checkpoint publish"
+            )
             os.replace(checkpoint_temporary, path)
             checkpoint_temporary = None
+            _require_durable_write_guard(
+                write_guard, "checkpoint resume recovery sidecar publish"
+            )
             os.replace(sidecar_temporary, checkpoint_integrity_path(path))
             sidecar_temporary = None
         finally:
@@ -778,11 +1251,16 @@ def load_checkpoint_for_resume(
                 checkpoint_temporary.unlink(missing_ok=True)
             if sidecar_temporary is not None:
                 sidecar_temporary.unlink(missing_ok=True)
-        checkpoint = load_checkpoint_safe(
+        checkpoint = _wait_for_checkpoint_pair_visibility(
             path,
-            map_location=map_location,
-            model=model,
+            checkpoint_integrity_path(path),
+            record,
+            expected_payload=payload,
             expected_identity=expected_identity,
+            model=model,
+            write_guard=write_guard,
+            phase="checkpoint resume recovery publication",
+            map_location=map_location,
         )
     _require_durable_write_guard(
         write_guard, "checkpoint resume after state load"
