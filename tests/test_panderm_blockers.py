@@ -3599,6 +3599,100 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
                 self.assertIn(marker.name, call.args[0])
             self.assertIn("attempts=2", heartbeats[-1].args[0])
 
+    def _guard(self, marker, run_hash, session):
+        return panderm_run.SequentialSessionWriteGuard(
+            marker_path=str(marker),
+            session_id=session,
+            run_version=panderm_run.RUN_VERSION,
+            git_commit=self.COMMIT,
+            shared_root_uuid=self.ROOT_UUID,
+            run_identity_sha256=run_hash,
+        )
+
+    def test_durable_write_guard_survives_delayed_marker_visibility(self):
+        """probe delayed_guard_read must be tolerated.
+
+        A real Phase 5 published its marker, passed the guard twice, then was
+        refused its own session by an ENOENT for a record the shared root still
+        holds: Google Drive FUSE answered a lookup for an existing file while
+        the same mount had just streamed the 2.35 GB validation archive. Only
+        the publish readback was given the bounded wait, so a live session was
+        stopped before the five-epoch validation by an answer the cloud
+        contradicts moments later.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session = str(uuid.uuid4())
+            published = self._start(marker, history, run_hash, "B", session)
+            visible = marker.read_text(encoding="utf-8")
+            hidden = FileNotFoundError("simulated Drive FUSE delay")
+            guard = self._guard(marker, run_hash, session)
+            with self._drive_readback(marker, [hidden, hidden, visible]) as (
+                attempts,
+                printed,
+            ):
+                observed = guard.require("archive cache validation completion")
+            self.assertEqual(observed, published)
+            self.assertEqual(len(attempts), 3)
+            heartbeats = self._heartbeats(printed)
+            self.assertEqual(len(heartbeats), 2)
+            for call in heartbeats:
+                self.assertIs(call.kwargs.get("flush"), True)
+                self.assertIn(marker.name, call.args[0])
+
+    def test_durable_write_guard_fails_bounded_when_the_marker_never_appears(self):
+        """The wait is bounded: a marker that is really gone must fail loud.
+
+        Waiting must never become a way to keep writing without an owner.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "B", session)
+            guard = self._guard(marker, run_hash, session)
+            with self._drive_readback(
+                marker,
+                [FileNotFoundError("simulated Drive FUSE delay")],
+                timeout=0.05,
+                poll=0.02,
+                heartbeat=3600.0,
+            ) as (attempts, printed):
+                with self.assertRaises(TimeoutError) as raised:
+                    guard.require("archive cache validation completion")
+            self.assertIn(
+                "active session marker never became visible", str(raised.exception)
+            )
+            self.assertIn("FileNotFoundError", str(raised.exception))
+            self.assertIn(marker.name, str(raised.exception))
+            self.assertGreaterEqual(len(attempts), 1)
+            self.assertEqual(self._heartbeats(printed), [])
+
+    def test_visible_marker_owned_by_another_session_is_refused_without_retry(self):
+        """Late is retried; a different owner is an answer, not a delay.
+
+        Polling a takeover into the bounded wait would report a timeout for a
+        marker that is present and readable, naming the wrong fault and hiding
+        the identity drift the operator has to act on.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "B", session)
+            replacement = json.loads(marker.read_text(encoding="utf-8"))
+            replacement["session_id"] = str(uuid.uuid4())
+            guard = self._guard(marker, run_hash, session)
+            with self._drive_readback(
+                marker, [json.dumps(replacement, sort_keys=True) + "\n"]
+            ) as (attempts, printed):
+                with self.assertRaisesRegex(
+                    ValueError, "active session identity drift"
+                ):
+                    guard.require("archive cache validation completion")
+            self.assertEqual(
+                len(attempts), 1, "a visible answer must not be retried"
+            )
+            self.assertEqual(self._heartbeats(printed), [])
+
     def test_manual_takeover_is_still_refused_without_confirmation(self):
         """probe manual_takeover_forced_false must not become an auto-takeover."""
         with tempfile.TemporaryDirectory() as temporary:

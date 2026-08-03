@@ -2836,7 +2836,16 @@ def _validate_active_session_marker(
 
 
 def _read_active_session(marker_path: str | Path) -> dict[str, Any]:
-    marker = json.loads(Path(marker_path).read_text(encoding="utf-8"))
+    # The write guard re-reads this marker at every durable boundary, including
+    # while the same mount is streaming the validation archive, and Google Drive
+    # FUSE answers ENOENT for a record it proves moments later is there. A
+    # steady-state read therefore needs the same bounded wait as the publish
+    # readback; a marker that is really gone still fails loud.
+    marker = json.loads(
+        _read_text_awaiting_visibility(
+            Path(marker_path), encoding="utf-8", description="active session marker"
+        )
+    )
     return _validate_active_session_marker(marker, marker_path=marker_path)
 
 
@@ -2893,16 +2902,16 @@ DRIVE_VISIBILITY_POLL_SECONDS = 0.5
 DRIVE_VISIBILITY_HEARTBEAT_SECONDS = 60.0
 
 
-def _reopen_published_json(path: Path, value: Mapping[str, Any]) -> None:
-    """Re-open a just-replaced JSON record, tolerating delayed visibility.
+def _read_text_awaiting_visibility(
+    path: Path, *, encoding: str, description: str
+) -> str:
+    """Read a record that must exist, tolerating delayed visibility.
 
     Only an absent record is retried: once bytes are visible they are the
-    cloud's answer, so a record that decodes to something else, one that does
-    not decode at all, and a read the filesystem refuses all fail at once
-    instead of being polled. A missing record is never accepted, and the wait
-    is bounded.
+    cloud's answer, so a record that does not decode at all and a read the
+    filesystem refuses both fail at once instead of being polled. A missing
+    record is never accepted, and the wait is bounded.
     """
-    expected = dict(value)
     started = time.perf_counter()
     last_report = started
     attempts = 0
@@ -2910,18 +2919,14 @@ def _reopen_published_json(path: Path, value: Mapping[str, Any]) -> None:
     while True:
         attempts += 1
         try:
-            observed = json.loads(path.read_text(encoding="ascii"))
+            return path.read_text(encoding=encoding)
         except FileNotFoundError as error:
             last_error = f"{type(error).__name__}: {error}"
-        else:
-            if observed != expected:
-                raise ValueError(f"published JSON reopen mismatch: {path.name}")
-            return
         now = time.perf_counter()
         elapsed = now - started
         if elapsed >= DRIVE_VISIBILITY_TIMEOUT_SECONDS:
             raise TimeoutError(
-                f"published JSON never became visible: {path} "
+                f"{description} never became visible: {path} "
                 f"attempts={attempts} elapsed={elapsed:.1f}s "
                 f"last_error={last_error}"
             )
@@ -2935,6 +2940,21 @@ def _reopen_published_json(path: Path, value: Mapping[str, Any]) -> None:
             )
             last_report = now
         time.sleep(DRIVE_VISIBILITY_POLL_SECONDS)
+
+
+def _reopen_published_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Re-open a just-replaced JSON record, tolerating delayed visibility.
+
+    Bytes that are visible but decode to something else are a published-value
+    mismatch, not a delay, so they fail without being retried.
+    """
+    observed = json.loads(
+        _read_text_awaiting_visibility(
+            path, encoding="ascii", description="published JSON"
+        )
+    )
+    if observed != dict(value):
+        raise ValueError(f"published JSON reopen mismatch: {path.name}")
 
 
 def _replace_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
