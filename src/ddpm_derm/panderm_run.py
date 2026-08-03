@@ -2886,6 +2886,57 @@ def canonical_identity_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Google Drive FUSE can answer ENOENT for a path os.replace already published,
+# so the readback needs a bounded wait rather than a single attempt.
+DRIVE_VISIBILITY_TIMEOUT_SECONDS = 120.0
+DRIVE_VISIBILITY_POLL_SECONDS = 0.5
+DRIVE_VISIBILITY_HEARTBEAT_SECONDS = 60.0
+
+
+def _reopen_published_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Re-open a just-replaced JSON record, tolerating delayed visibility.
+
+    Only an absent record is retried: once bytes are visible they are the
+    cloud's answer, so a record that decodes to something else, one that does
+    not decode at all, and a read the filesystem refuses all fail at once
+    instead of being polled. A missing record is never accepted, and the wait
+    is bounded.
+    """
+    expected = dict(value)
+    started = time.perf_counter()
+    last_report = started
+    attempts = 0
+    last_error = "none"
+    while True:
+        attempts += 1
+        try:
+            observed = json.loads(path.read_text(encoding="ascii"))
+        except FileNotFoundError as error:
+            last_error = f"{type(error).__name__}: {error}"
+        else:
+            if observed != expected:
+                raise ValueError(f"published JSON reopen mismatch: {path.name}")
+            return
+        now = time.perf_counter()
+        elapsed = now - started
+        if elapsed >= DRIVE_VISIBILITY_TIMEOUT_SECONDS:
+            raise TimeoutError(
+                f"published JSON never became visible: {path} "
+                f"attempts={attempts} elapsed={elapsed:.1f}s "
+                f"last_error={last_error}"
+            )
+        if now - last_report >= DRIVE_VISIBILITY_HEARTBEAT_SECONDS:
+            print(
+                f"[drive-visibility] waiting for {path.name} "
+                f"attempts={attempts} elapsed={elapsed:.1f}s "
+                f"timeout={DRIVE_VISIBILITY_TIMEOUT_SECONDS:.1f}s "
+                f"last_error={last_error}",
+                flush=True,
+            )
+            last_report = now
+        time.sleep(DRIVE_VISIBILITY_POLL_SECONDS)
+
+
 def _replace_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     canonical = json.dumps(
         dict(value), allow_nan=False, ensure_ascii=True, sort_keys=True
@@ -2909,8 +2960,7 @@ def _replace_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
             raise ValueError(f"temporary JSON reopen mismatch: {path.name}")
         os.replace(temporary, path)
         temporary = None
-        if json.loads(path.read_text(encoding="ascii")) != dict(value):
-            raise ValueError(f"published JSON reopen mismatch: {path.name}")
+        _reopen_published_json(path, value)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -3047,10 +3097,45 @@ def _adopt_published_takeover_replacement(
     A restarted runtime mints a new candidate UUID, so a lost response cannot be
     detected by comparing UUIDs. The published audit answers it instead: the
     active marker is this operator's own replacement when exactly one audit
-    names it and no stable field drifted. Returns ``None`` when the caller is a
-    genuinely different operator, which is the next real takeover.
+    names it, no stable field drifted, and both the retired snapshot and the
+    marker carry the caller's own commit and run identity. Returns ``None``
+    when the caller is a genuinely different operator, or when the evidence is
+    cross-identity and therefore cannot tell an adoption from the next real
+    takeover.
     """
     current_session_id = current["session_id"]
+    # Adoption hands the active marker back as the caller's own session, so the
+    # marker has to belong to this run before anything in it is believed. This
+    # cannot be left to a later guard: the empty-history, different-account and
+    # cross-identity answers below all return without reaching one, so neither a
+    # changed account label nor a marker with no audit history yet must become a
+    # way past this validation.
+    current_drift = [
+        f"{field}: marker={current.get(field)!r} expected={value!r}"
+        for field, value in (
+            ("run_version", str(run_version)),
+            ("shared_root_uuid", str(shared_root_uuid)),
+            ("evaluation_scope", str(evaluation_scope)),
+        )
+        if current.get(field) != value
+    ]
+    current_same_commit = current.get("git_commit") == str(git_commit)
+    current_same_identity = (
+        current.get("run_identity_sha256") == str(run_identity_sha256)
+    )
+    if current_same_commit != current_same_identity:
+        current_drift.append(
+            "git_commit and run_identity_sha256 disagree about the active "
+            f"marker: git_commit: marker={current.get('git_commit')!r} "
+            f"expected={str(git_commit)!r}; run_identity_sha256: "
+            f"marker={current.get('run_identity_sha256')!r} "
+            f"expected={str(run_identity_sha256)!r}"
+        )
+    if current_drift:
+        raise ValueError(
+            "active session identity drift; refusing to adopt the active "
+            f"session: {marker_path}: " + "; ".join(current_drift)
+        )
     history = _read_takeover_audit_history(history_directory)
     retired = {
         record["previous_active_session"]["session_id"] for _, record in history
@@ -3110,13 +3195,29 @@ def _adopt_published_takeover_replacement(
         f"{field}: audit={retired_session.get(field)!r} expected={value!r}"
         for field, value in (
             ("run_version", str(run_version)),
-            ("git_commit", str(git_commit)),
             ("shared_root_uuid", str(shared_root_uuid)),
-            ("run_identity_sha256", str(run_identity_sha256)),
             ("evaluation_scope", str(evaluation_scope)),
         )
         if retired_session.get(field) != value
     ]
+    # The retired snapshot records the commit and identity that session really
+    # ran, and an explicitly confirmed takeover may cross commits, so equality
+    # with the caller would refuse the audit the takeover just published. What
+    # must still hold is self-agreement: git_commit is hashed into
+    # run_identity_sha256, so neither can match the caller while the other does
+    # not, and an edit to one alone is still caught.
+    retired_same_commit = retired_session.get("git_commit") == str(git_commit)
+    retired_same_identity = (
+        retired_session.get("run_identity_sha256") == str(run_identity_sha256)
+    )
+    if retired_same_commit != retired_same_identity:
+        drift.append(
+            "git_commit and run_identity_sha256 disagree about the retired "
+            f"session: git_commit: audit={retired_session.get('git_commit')!r} "
+            f"expected={str(git_commit)!r}; run_identity_sha256: "
+            f"audit={retired_session.get('run_identity_sha256')!r} "
+            f"expected={str(run_identity_sha256)!r}"
+        )
     if drift:
         raise ValueError(
             "takeover audit identity drift; refusing to adopt the active "
@@ -3125,6 +3226,14 @@ def _adopt_published_takeover_replacement(
     if current["account_label"] != str(account_label):
         # A different confirmed operator is the next real takeover, so the
         # caller must retire this marker instead of adopting it.
+        return None
+    if not (retired_same_commit and current_same_commit):
+        # A cross-identity audit proves that some confirmed takeover happened,
+        # not that this caller is the one that published it: A@old -> B@new and
+        # the next code revision arriving at B's marker leave the same evidence.
+        # Neither historical field is independent authority, so this already
+        # confirmed takeover records one explicit follow-up transition rather
+        # than adopting a session it cannot prove is its own.
         return None
     return require_active_session_identity(
         current,
@@ -3177,7 +3286,10 @@ def start_sequential_session(
         )
 
     if not marker_path.exists():
-        write_json_atomic(marker_path, build_marker(session_id))
+        # The first marker is published onto the same shared Drive mount as a
+        # takeover replacement, so it needs the same bounded visibility readback
+        # instead of failing on a single ENOENT the cloud later contradicts.
+        _replace_json_atomic(marker_path, build_marker(session_id))
         return require_active_session_identity(
             _read_active_session(marker_path),
             session_id=session_id,

@@ -2377,6 +2377,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
 
     ROOT_UUID = "765b971f-d148-4960-a77d-b73f28fc013c"
     COMMIT = "c" * 40
+    PREVIOUS_COMMIT = "a" * 40
 
     # --- shared fixtures ---------------------------------------------------
     def _session_paths(self, base):
@@ -2390,12 +2391,22 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             panderm_run.canonical_identity_sha256(identity()),
         )
 
-    def _start(self, marker, history, run_hash, account, session, *, takeover=False):
+    def _start(
+        self,
+        marker,
+        history,
+        run_hash,
+        account,
+        session,
+        *,
+        takeover=False,
+        git_commit=None,
+    ):
         return panderm_run.start_sequential_session(
             marker,
             session_id=session,
             run_version=panderm_run.RUN_VERSION,
-            git_commit=self.COMMIT,
+            git_commit=self.COMMIT if git_commit is None else git_commit,
             shared_root_uuid=self.ROOT_UUID,
             account_label=account,
             run_identity_sha256=run_hash,
@@ -2937,6 +2948,148 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
                 ),
             )
 
+    def _completed_cross_commit_takeover(self, marker, history, run_hash):
+        """Return (session_a, session_b) after a confirmed A@old -> B@new takeover.
+
+        This is the shape a real cross-commit validation takeover leaves behind:
+        the retired snapshot names the commit and identity that session really
+        ran, and the replacement marker names the caller's current ones.
+        """
+        previous_hash = panderm_run.canonical_identity_sha256(
+            identity(git_commit=self.PREVIOUS_COMMIT)
+        )
+        self.assertNotEqual(previous_hash, run_hash)
+        session_a = str(uuid.uuid4())
+        session_b = str(uuid.uuid4())
+        self._start(
+            marker,
+            history,
+            previous_hash,
+            "A",
+            session_a,
+            git_commit=self.PREVIOUS_COMMIT,
+        )
+        active_b = self._start(
+            marker, history, run_hash, "B", session_b, takeover=True
+        )
+        self.assertEqual(active_b["session_id"], session_b)
+        self.assertEqual(active_b["git_commit"], self.COMMIT)
+        self.assertEqual(active_b["run_identity_sha256"], run_hash)
+        audit = json.loads(
+            (history / f"{session_a}.takeover.json").read_text(encoding="utf-8")
+        )
+        retired = audit["previous_active_session"]
+        self.assertEqual(retired["git_commit"], self.PREVIOUS_COMMIT)
+        self.assertEqual(retired["run_identity_sha256"], previous_hash)
+        self.assertEqual(audit["replacement_session_id"], session_b)
+        self.assertEqual(
+            [path.name for path in history.iterdir()],
+            [f"{session_a}.takeover.json"],
+        )
+        return session_a, session_b
+
+    def test_cross_commit_takeover_requires_one_explicit_followup_transition(self):
+        """A cross-identity audit is not proof of who published the marker.
+
+        A confirmed manual takeover is allowed to retire a session pinned to an
+        older commit, so the audit records the commit and identity that session
+        really ran. Those historical fields are then not independent authority:
+        A@old -> B@new and the next published code revision arriving at B's
+        marker leave the same evidence behind. Adopting on that evidence would
+        hand the marker to a caller that never published it, so the already
+        confirmed takeover records exactly one explicit follow-up transition and
+        only then becomes idempotent.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a, session_b = self._completed_cross_commit_takeover(
+                marker, history, run_hash
+            )
+            audit_path = history / f"{session_a}.takeover.json"
+            audit_before = audit_path.read_bytes()
+
+            # Fresh runtime, same operator B, therefore a brand new candidate id.
+            session_c = str(uuid.uuid4())
+            active_c = self._start(
+                marker, history, run_hash, "B", session_c, takeover=True
+            )
+            self.assertEqual(
+                active_c["session_id"],
+                session_c,
+                "a cross-identity audit must not be read as B's own lost response",
+            )
+            self.assertEqual(active_c["account_label"], "B")
+            self.assertEqual(active_c["git_commit"], self.COMMIT)
+            self.assertEqual(
+                audit_path.read_bytes(),
+                audit_before,
+                "the A->B audit is history and must never be rewritten",
+            )
+            followup_path = history / f"{session_b}.takeover.json"
+            self.assertEqual(
+                sorted(path.name for path in history.iterdir()),
+                sorted([audit_path.name, followup_path.name]),
+                "exactly one follow-up transition may be recorded",
+            )
+            followup = json.loads(followup_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                followup["previous_active_session"]["session_id"], session_b
+            )
+            self.assertEqual(followup["replacement_session_id"], session_c)
+
+            # With both the retired snapshot and the marker now on the caller's
+            # own identity, the next fresh candidate is a plain lost response.
+            marker_after = marker.read_bytes()
+            followup_before = followup_path.read_bytes()
+            adopted = self._start(
+                marker, history, run_hash, "B", str(uuid.uuid4()), takeover=True
+            )
+            self.assertEqual(adopted, active_c)
+            self.assertEqual(marker.read_bytes(), marker_after)
+            self.assertEqual(audit_path.read_bytes(), audit_before)
+            self.assertEqual(followup_path.read_bytes(), followup_before)
+            self.assertEqual(
+                sorted(path.name for path in history.iterdir()),
+                sorted([audit_path.name, followup_path.name]),
+                "third_transition_created_by_retry must be False",
+            )
+
+    def test_cross_commit_adoption_still_arms_the_next_real_takeover(self):
+        """Accepting a cross-commit audit must not disarm the next operator."""
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            session_a, session_b = self._completed_cross_commit_takeover(
+                marker, history, run_hash
+            )
+            session_c = str(uuid.uuid4())
+            active_c = self._start(
+                marker, history, run_hash, "C", session_c, takeover=True
+            )
+            self.assertEqual(active_c["session_id"], session_c)
+            self.assertEqual(active_c["account_label"], "C")
+            self.assertEqual(
+                sorted(path.name for path in history.iterdir()),
+                sorted([f"{session_a}.takeover.json", f"{session_b}.takeover.json"]),
+            )
+            published = json.loads(
+                (history / f"{session_b}.takeover.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                published["previous_active_session"]["session_id"], session_b
+            )
+            self.assertEqual(
+                published["previous_active_session"]["git_commit"], self.COMMIT
+            )
+            self.assertEqual(published["replacement_session_id"], session_c)
+            self.assertEqual(
+                published["event_id"],
+                panderm_run.audit_event_id(
+                    panderm_run.MANUAL_TAKEOVER_EVENT,
+                    run_version=panderm_run.RUN_VERSION,
+                    subject_session_id=session_b,
+                ),
+            )
+
     def test_replacement_id_disagreeing_with_the_marker_blocks_every_mutation(self):
         """A dangling replacement id must never be resolved by guessing."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -2967,10 +3120,11 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
         for field, value in (
             ("shared_root_uuid", "8b0d4b25-1b6b-4a52-9f0f-6b9a3a5e2c11"),
             ("run_version", "other-version"),
-            ("run_identity_sha256", "e" * 64),
             # git_commit is hashed into run_identity_sha256, so a retired
-            # session naming a different commit cannot belong to this run even
-            # though every other identity field still agrees.
+            # snapshot cannot name one of them differently from the caller and
+            # the other identically. A cross-commit takeover moves both; each of
+            # these moves one, which no real session could have written.
+            ("run_identity_sha256", "e" * 64),
             ("git_commit", "d" * 40),
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
@@ -3094,6 +3248,354 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
                 self.assertEqual(
                     [path.name for path in history.iterdir()], [audit_path.name]
                 )
+
+    def test_account_change_cannot_bypass_active_marker_validation(self):
+        """A different account label must not skip validating the marker.
+
+        The different-account answer is a decision about the marker in front of
+        the caller: it retires that marker and publishes the next transition
+        from it. Answering it before the marker has been held to this run means
+        a marker naming another run version, another shared root, or a
+        self-contradicting commit/identity pair still authorises a real
+        transition, and the operator only has to arrive under a different
+        account for the validation to be skipped entirely.
+        """
+        for field, value in (
+            ("run_version", "other-version"),
+            ("shared_root_uuid", "8b0d4b25-1b6b-4a52-9f0f-6b9a3a5e2c11"),
+            # git_commit is hashed into run_identity_sha256, so a real marker
+            # cannot name one of them differently from the caller and the other
+            # identically. Each of these moves exactly one.
+            ("git_commit", "d" * 40),
+            ("run_identity_sha256", "e" * 64),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                marker, history, run_hash = self._session_paths(temporary)
+                session_a, _ = self._completed_a_to_b_takeover(
+                    marker, history, run_hash
+                )
+                audit_path = history / f"{session_a}.takeover.json"
+                tampered = json.loads(marker.read_text(encoding="utf-8"))
+                tampered[field] = value
+                marker.write_text(
+                    json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker_before = marker.read_bytes()
+                audit_before = audit_path.read_bytes()
+                with self.assertRaisesRegex(
+                    ValueError, "active session identity drift"
+                ):
+                    self._start(
+                        marker,
+                        history,
+                        run_hash,
+                        "C",
+                        str(uuid.uuid4()),
+                        takeover=True,
+                    )
+                self.assertEqual(marker.read_bytes(), marker_before)
+                self.assertEqual(audit_path.read_bytes(), audit_before)
+                self.assertEqual(
+                    [path.name for path in history.iterdir()],
+                    [audit_path.name],
+                    "no transition may be published from an unvalidated marker",
+                )
+
+    def test_initial_marker_validation_is_not_skipped_by_empty_history(self):
+        """An empty audit history must not skip validating the marker.
+
+        The very first marker has no takeover audit naming it, so the adoption
+        search finds no replacement and answers immediately. Deciding that
+        before the marker has been held to this run means the most common real
+        state on Drive -- one active session, no history yet -- is exactly the
+        state in which a marker naming another run version, another shared
+        root, or a self-contradicting commit/identity pair still authorises a
+        real transition.
+        """
+        for field, value in (
+            ("run_version", "other-version"),
+            ("shared_root_uuid", "8b0d4b25-1b6b-4a52-9f0f-6b9a3a5e2c11"),
+            # git_commit is hashed into run_identity_sha256, so each of these
+            # moves exactly one half of a pair that cannot really disagree.
+            ("git_commit", "d" * 40),
+            ("run_identity_sha256", "e" * 64),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                marker, history, run_hash = self._session_paths(temporary)
+                self._start(marker, history, run_hash, "A", str(uuid.uuid4()))
+                self.assertEqual(list(history.iterdir()), [])
+                tampered = json.loads(marker.read_text(encoding="utf-8"))
+                tampered[field] = value
+                marker.write_text(
+                    json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker_before = marker.read_bytes()
+                with self.assertRaisesRegex(
+                    ValueError, "active session identity drift"
+                ):
+                    self._start(
+                        marker,
+                        history,
+                        run_hash,
+                        "B",
+                        str(uuid.uuid4()),
+                        takeover=True,
+                    )
+                self.assertEqual(marker.read_bytes(), marker_before)
+                self.assertEqual(
+                    list(history.iterdir()),
+                    [],
+                    "no transition may be published from an unvalidated marker",
+                )
+
+    # --- durable marker publish under Google Drive FUSE ---------------------
+    MARKER_VALUE = {
+        "schema_version": 1,
+        "session_id": "ec2112e9-382c-47c7-b487-b3fe01d00d37",
+    }
+
+    @contextlib.contextmanager
+    def _drive_readback(
+        self, target, responses, *, timeout=5.0, poll=0.0, heartbeat=0.0
+    ):
+        """Answer reads of ``target`` from ``responses`` and count attempts.
+
+        A response is either an exception to raise or the exact text to return;
+        the last entry repeats. Every other path reads normally, so the
+        temporary file written before ``os.replace`` is untouched.
+        """
+        attempts = []
+        real_read_text = Path.read_text
+
+        def read_text(path_self, *args, **kwargs):
+            if path_self != target:
+                return real_read_text(path_self, *args, **kwargs)
+            attempts.append(path_self)
+            answer = responses[min(len(attempts) - 1, len(responses) - 1)]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        with mock.patch.object(Path, "read_text", read_text), mock.patch.object(
+            panderm_run, "DRIVE_VISIBILITY_TIMEOUT_SECONDS", timeout
+        ), mock.patch.object(
+            panderm_run, "DRIVE_VISIBILITY_POLL_SECONDS", poll
+        ), mock.patch.object(
+            panderm_run, "DRIVE_VISIBILITY_HEARTBEAT_SECONDS", heartbeat
+        ), mock.patch("builtins.print") as printed:
+            yield attempts, printed
+
+    @staticmethod
+    def _heartbeats(printed):
+        return [
+            call
+            for call in printed.call_args_list
+            if call.args and str(call.args[0]).startswith("[drive-visibility]")
+        ]
+
+    def test_delayed_marker_visibility_after_replace_converges_on_exact_json(self):
+        """probe delayed_marker_visibility must be tolerated.
+
+        Google Drive FUSE answered ENOENT for active_session.json immediately
+        after os.replace had published it, so a takeover that had already
+        written its audit and its replacement marker failed on a readback of
+        bytes the cloud later proved were correct. A single attempt is not
+        evidence the publish failed.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            hidden = FileNotFoundError("simulated Drive FUSE delay")
+            published = json.dumps(
+                self.MARKER_VALUE, allow_nan=False, ensure_ascii=True, sort_keys=True
+            ) + "\n"
+            with self._drive_readback(
+                target, [hidden, hidden, hidden, published]
+            ) as (attempts, printed):
+                panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertEqual(len(attempts), 4)
+            self.assertEqual(
+                json.loads(target.read_text(encoding="ascii")), self.MARKER_VALUE
+            )
+            self.assertEqual(
+                [path.name for path in Path(temporary).iterdir()], [target.name]
+            )
+            heartbeats = self._heartbeats(printed)
+            self.assertEqual(len(heartbeats), 3)
+            for call in heartbeats:
+                self.assertIs(call.kwargs.get("flush"), True)
+                self.assertIn(target.name, call.args[0])
+            self.assertIn("attempts=3", heartbeats[-1].args[0])
+
+    def test_marker_visibility_wait_stays_silent_until_the_heartbeat_interval(self):
+        """A truthful heartbeat reports real silence, so it must be timed."""
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            published = json.dumps(
+                self.MARKER_VALUE, allow_nan=False, ensure_ascii=True, sort_keys=True
+            ) + "\n"
+            with self._drive_readback(
+                target,
+                [FileNotFoundError("simulated Drive FUSE delay"), published],
+                heartbeat=3600.0,
+            ) as (attempts, printed):
+                panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(self._heartbeats(printed), [])
+
+            # An immediately visible marker prints nothing at all.
+            second = Path(temporary) / "second.json"
+            with self._drive_readback(second, [published]) as (again, quiet):
+                panderm_run._replace_json_atomic(second, self.MARKER_VALUE)
+            self.assertEqual(len(again), 1)
+            self.assertEqual(self._heartbeats(quiet), [])
+
+    def test_permanently_invisible_marker_fails_bounded_with_no_false_success(self):
+        """The wait is bounded: a marker that never appears must fail loud."""
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            with self._drive_readback(
+                target,
+                [FileNotFoundError("simulated Drive FUSE delay")],
+                timeout=0.05,
+                poll=0.02,
+                heartbeat=3600.0,
+            ) as (attempts, printed):
+                with self.assertRaises(TimeoutError) as raised:
+                    panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertIn("never became visible", str(raised.exception))
+            self.assertIn("FileNotFoundError", str(raised.exception))
+            self.assertGreaterEqual(len(attempts), 1)
+            # The temporary file was consumed by os.replace, so no residue is
+            # left behind by the failure.
+            self.assertEqual(
+                [path.name for path in Path(temporary).iterdir()], [target.name]
+            )
+
+    def test_wrong_bytes_after_delayed_visibility_are_never_accepted(self):
+        """Late is retried; wrong is not. Mismatched bytes must fail at once."""
+        wrong = json.dumps({"schema_version": 1, "session_id": "wrong"}) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            with self._drive_readback(
+                target, [FileNotFoundError("simulated Drive FUSE delay"), wrong]
+            ) as (attempts, printed):
+                with self.assertRaisesRegex(
+                    ValueError, "published JSON reopen mismatch"
+                ):
+                    panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertEqual(
+                len(attempts), 2, "wrong bytes must not be retried into a timeout"
+            )
+            self.assertEqual(
+                [path.name for path in Path(temporary).iterdir()], [target.name]
+            )
+
+    def test_refused_read_of_the_published_marker_fails_immediately(self):
+        """A refused read is a permission answer, not delayed visibility.
+
+        Polling it would spend the whole bounded wait and then report a
+        timeout, which names the wrong fault and hides the real one from the
+        operator who has to fix it.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            with self._drive_readback(
+                target, [PermissionError("simulated shared-root permission loss")]
+            ) as (attempts, printed):
+                with self.assertRaises(PermissionError):
+                    panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertEqual(
+                len(attempts), 1, "a refused read must not be retried"
+            )
+            self.assertEqual(self._heartbeats(printed), [])
+            self.assertEqual(
+                [path.name for path in Path(temporary).iterdir()], [target.name]
+            )
+
+    def test_malformed_visible_marker_bytes_fail_immediately(self):
+        """Bytes that are visible are an answer, even when they do not parse."""
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / panderm_run.ACTIVE_SESSION_FILENAME
+            target.write_text('{"retired": true}\n', encoding="ascii")
+            with self._drive_readback(target, ['{"session_id": ']) as (
+                attempts,
+                printed,
+            ):
+                with self.assertRaises(json.JSONDecodeError):
+                    panderm_run._replace_json_atomic(target, self.MARKER_VALUE)
+            self.assertEqual(
+                len(attempts), 1, "malformed bytes must not be retried"
+            )
+            self.assertEqual(self._heartbeats(printed), [])
+            self.assertEqual(
+                [path.name for path in Path(temporary).iterdir()], [target.name]
+            )
+
+    def test_first_active_session_publish_waits_for_drive_visibility(self):
+        """The initial marker is published onto the same mount as a takeover.
+
+        Only the replacement path was given the bounded readback, so the very
+        first session of a run still failed on the one ENOENT Google Drive FUSE
+        answers right after os.replace. That refuses to start a run whose marker
+        the cloud proves moments later was written correctly, and it does so at
+        the point where the operator has no published state to inspect.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._session_paths(temporary)
+            self.assertFalse(marker.exists())
+            session_a = str(uuid.uuid4())
+            expected = {
+                "schema_version": 1,
+                "session_id": session_a,
+                "run_version": panderm_run.RUN_VERSION,
+                "git_commit": self.COMMIT,
+                "shared_root_uuid": self.ROOT_UUID,
+                "evaluation_scope": panderm_run.VALIDATION_ONLY,
+                "account_label": "A",
+                "hostname": "fixed-host",
+                "started_utc": "2026-08-03T00:00:00Z",
+                "run_identity_sha256": run_hash,
+                "checkpoint_cadence": "every_epoch",
+                "maximum_quota_loss": "one_incomplete_epoch",
+            }
+            published = json.dumps(
+                expected, allow_nan=False, ensure_ascii=True, sort_keys=True
+            ) + "\n"
+            hidden = FileNotFoundError("simulated Drive FUSE delay")
+            with mock.patch.object(
+                panderm_run, "utc_now", return_value=expected["started_utc"]
+            ), mock.patch.object(
+                panderm_run.socket, "gethostname", return_value=expected["hostname"]
+            ), self._drive_readback(marker, [hidden, hidden, published]) as (
+                attempts,
+                printed,
+            ):
+                active = self._start(marker, history, run_hash, "A", session_a)
+            self.assertEqual(active, expected)
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), expected)
+            self.assertEqual(
+                len(attempts),
+                4,
+                "two delayed readbacks, the visible one, then the active-session "
+                "read that answers the caller",
+            )
+            self.assertEqual(
+                sorted(path.name for path in marker.parent.iterdir()),
+                sorted([marker.name, history.name]),
+                "the delayed publish must leave no temporary behind",
+            )
+            self.assertEqual(list(history.iterdir()), [])
+            heartbeats = self._heartbeats(printed)
+            self.assertEqual(len(heartbeats), 2)
+            for call in heartbeats:
+                self.assertIs(call.kwargs.get("flush"), True)
+                self.assertIn(marker.name, call.args[0])
+            self.assertIn("attempts=2", heartbeats[-1].args[0])
 
     def test_manual_takeover_is_still_refused_without_confirmation(self):
         """probe manual_takeover_forced_false must not become an auto-takeover."""
