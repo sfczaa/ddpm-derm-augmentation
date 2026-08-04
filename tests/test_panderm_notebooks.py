@@ -1544,17 +1544,30 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
         result_path.parent.mkdir(parents=True)
         if epoch is None:
             return checkpoint_dir, result_path
-        self._save(checkpoint_dir / "last.pt", run_identity, epoch)
-        self._save(checkpoint_dir / "best.pt", run_identity, epoch)
+        epoch_filename = train_panderm._epoch_checkpoint_filename(epoch, 0)
+        epoch_path = checkpoint_dir / epoch_filename
+        self._save(epoch_path, run_identity, epoch)
+        train_panderm.write_checkpoint_pointer_atomic(
+            checkpoint_dir,
+            best_filename=epoch_filename,
+            last_filename=epoch_filename,
+            write_guard=AllowDurableWriteGuard(),
+        )
         if with_result:
             result = {
                 "run_identity": copy.deepcopy(run_identity),
                 **copy.deepcopy(run_identity),
                 "checkpoint_integrity": {
-                    name: train_panderm.checkpoint_integrity_record(
-                        checkpoint_dir / name, expected_identity=run_identity
-                    )
-                    for name in ("best.pt", "last.pt")
+                    "best.pt": train_panderm.checkpoint_integrity_record(
+                        epoch_path, expected_identity=run_identity
+                    ),
+                    "last.pt": train_panderm.checkpoint_integrity_record(
+                        epoch_path, expected_identity=run_identity
+                    ),
+                },
+                "checkpoint_pointer": {
+                    "best": epoch_filename,
+                    "last": epoch_filename,
                 },
             }
             result_path.write_text(
@@ -1611,7 +1624,7 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
             )
             self.assertEqual(state["mode"], "resume")
             self.assertEqual(state["epoch"], 2)
-            self.assertIn("last.pt", state["present"])
+            self.assertIn("checkpoint_pointer.json", state["present"])
 
     def test_phase6_classifies_an_empty_attempt_as_fresh(self):
         helpers = load_phase6_resume_helpers()
@@ -1630,15 +1643,17 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
         run_identity = blocker_identity()
         cases = {
             "corrupt_checkpoint_bytes": lambda directory, result: (
-                (directory / "last.pt").write_bytes(b"interrupted")
+                (directory / train_panderm.read_checkpoint_pointer(directory)["last"]).write_bytes(b"interrupted")
             ),
             "invalid_sidecar": lambda directory, result: (
-                (directory / "last.pt.integrity.json").write_text(
-                    '{"partial":true}\n', encoding="utf-8"
-                )
+                train_panderm.checkpoint_integrity_path(
+                    directory / train_panderm.read_checkpoint_pointer(directory)["last"]
+                ).write_text('{"partial":true}\n', encoding="utf-8")
             ),
             "missing_sidecar": lambda directory, result: (
-                (directory / "last.pt.integrity.json").unlink()
+                train_panderm.checkpoint_integrity_path(
+                    directory / train_panderm.read_checkpoint_pointer(directory)["last"]
+                ).unlink()
             ),
         }
         for name, damage in cases.items():

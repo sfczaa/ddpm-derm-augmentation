@@ -2424,14 +2424,15 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
         return model, optimizer, schedule, scaler
 
     def _write_checkpoint_pair(self, directory, run_identity, *, epoch, perturb=0.0):
-        """Save one production checkpoint named ``last.pt`` with a real sidecar."""
+        """Save one production checkpoint named epoch file with a real sidecar."""
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         model, optimizer, schedule, scaler = self._components()
         if perturb:
             with torch.no_grad():
                 next(model.parameters()).add_(perturb)
-        path = directory / "last.pt"
+        epoch_filename = train_panderm._epoch_checkpoint_filename(epoch, schedule.step_count)
+        path = directory / epoch_filename
         train_panderm.save_checkpoint(
             path,
             model,
@@ -2448,23 +2449,13 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             run_identity,
             write_guard=AllowDurableWriteGuard(),
         )
-        return path, train_panderm.checkpoint_integrity_path(path)
-
-    def _install_backup(self, final_path, source_pair, previous_id, *, sidecar_edit=None):
-        """Copy a saved pair into ``final_path``'s directory as a predecessor."""
-        source_checkpoint, source_sidecar = source_pair
-        prefix = f".{final_path.name}.previous.{previous_id}"
-        backup = final_path.parent / f"{prefix}.pt"
-        backup_sidecar = final_path.parent / f"{prefix}.integrity.json"
-        shutil.copy2(source_checkpoint, backup)
-        record = json.loads(source_sidecar.read_text(encoding="utf-8"))
-        if sidecar_edit is not None:
-            record = sidecar_edit(record)
-        backup_sidecar.write_text(
-            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        train_panderm.write_checkpoint_pointer_atomic(
+            directory,
+            best_filename=epoch_filename,
+            last_filename=epoch_filename,
+            write_guard=AllowDurableWriteGuard(),
         )
-        return backup, backup_sidecar
-
+        return path, train_panderm.checkpoint_integrity_path(path)
     def _corrupt_final(self, final_path):
         final_path.write_bytes(b"interrupted-publish")
         train_panderm.checkpoint_integrity_path(final_path).write_text(
@@ -2508,183 +2499,6 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             return False
 
     # --- blocker 3 ---------------------------------------------------------
-    def test_three_way_same_step_backup_divergence_is_never_ignored(self):
-        """probe three_way_same_step_ambiguity_accepted must be False.
-
-        Comparing only the first two candidates let a third divergent backup at
-        the same (epoch, global_step) be silently restored, so a resume could
-        continue from bytes that were never the published state.
-        """
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            final_path, final_sidecar = self._write_checkpoint_pair(
-                root / "run", run_identity, epoch=1
-            )
-            divergent = self._write_checkpoint_pair(
-                root / "divergent", run_identity, epoch=1, perturb=1.5
-            )
-            self.assertNotEqual(
-                train_panderm.sha256_file(final_path),
-                train_panderm.sha256_file(divergent[0]),
-            )
-            # The two candidates a same-step comparison reaches first agree, so
-            # only a comparison across every candidate can see the third.
-            self._install_backup(final_path, (final_path, final_sidecar), "a" * 32)
-            self._install_backup(final_path, (final_path, final_sidecar), "b" * 32)
-            self._install_backup(final_path, divergent, "c" * 32)
-            self._corrupt_final(final_path)
-
-            model, optimizer, schedule, scaler = self._components()
-            ambiguity_accepted = True
-            with self._MutationRecorder(
-                model, optimizer, schedule, scaler
-            ) as recorder:
-                with self.assertRaisesRegex(
-                    ValueError, "ambiguous preserved checkpoints"
-                ):
-                    train_panderm.load_checkpoint_for_resume(
-                        final_path,
-                        map_location="cpu",
-                        model=model,
-                        expected_identity=run_identity,
-                        write_guard=AllowDurableWriteGuard(),
-                    )
-                ambiguity_accepted = False
-            self.assertFalse(
-                ambiguity_accepted,
-                "three_way_same_step_ambiguity_accepted must be False",
-            )
-            self.assertEqual(recorder.mutations, [])
-
-    def test_same_step_backups_that_all_agree_still_recover_deterministically(self):
-        """Full agreement must still resume; the gate rejects only real drift."""
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            final_path, final_sidecar = self._write_checkpoint_pair(
-                root / "run", run_identity, epoch=1
-            )
-            expected_bytes = final_path.read_bytes()
-            for previous_id in ("a" * 32, "b" * 32, "c" * 32):
-                self._install_backup(
-                    final_path, (final_path, final_sidecar), previous_id
-                )
-            self._corrupt_final(final_path)
-            model, _, _, _ = self._components()
-            recovered = train_panderm.load_checkpoint_for_resume(
-                final_path,
-                map_location="cpu",
-                model=model,
-                expected_identity=run_identity,
-                write_guard=AllowDurableWriteGuard(),
-            )
-            self.assertEqual(recovered["epoch"], 1)
-            self.assertEqual(final_path.read_bytes(), expected_bytes)
-
-    # --- blocker 4 ---------------------------------------------------------
-    def test_invalid_highest_recovery_candidate_falls_back_to_valid_lower(self):
-        """probe invalid_highest_falls_back_to_valid_lower must be True.
-
-        The old inline candidate check never verified schema_version, so a
-        sidecar the production validator rejects could still win the ranking and
-        then blow up after the final path had already been overwritten.
-        """
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            final_path, final_sidecar = self._write_checkpoint_pair(
-                root / "run", run_identity, epoch=1
-            )
-            valid_lower_bytes = final_path.read_bytes()
-            newer = self._write_checkpoint_pair(
-                root / "newer", run_identity, epoch=2
-            )
-            self._install_backup(
-                final_path, (final_path, final_sidecar), "a" * 32
-            )
-            self._install_backup(
-                final_path,
-                newer,
-                "b" * 32,
-                sidecar_edit=lambda record: {**record, "schema_version": 2},
-            )
-            self._corrupt_final(final_path)
-
-            model, _, _, _ = self._components()
-            recovered = train_panderm.load_checkpoint_for_resume(
-                final_path,
-                map_location="cpu",
-                model=model,
-                expected_identity=run_identity,
-                write_guard=AllowDurableWriteGuard(),
-            )
-            self.assertEqual(
-                recovered["epoch"],
-                1,
-                "invalid_highest_falls_back_to_valid_lower must be True",
-            )
-            self.assertEqual(final_path.read_bytes(), valid_lower_bytes)
-
-    def test_recovery_candidates_are_validated_by_the_production_validator(self):
-        """Every authoritative sidecar field must disqualify a candidate."""
-        run_identity = identity()
-        edits = {
-            "schema_version": lambda record: {**record, "schema_version": 2},
-            "checkpoint_format": lambda record: {
-                **record,
-                "checkpoint_format": "other_format_v1",
-            },
-            "checkpoint_filename": lambda record: {
-                **record,
-                "checkpoint_filename": "best.pt",
-            },
-            "sha256": lambda record: {**record, "sha256": "0" * 64},
-            "byte_size": lambda record: {**record, "byte_size": record["byte_size"] + 1},
-            "run_identity_sha256": lambda record: {
-                **record,
-                "run_identity_sha256": "1" * 64,
-            },
-            "epoch": lambda record: {**record, "epoch": record["epoch"] + 1},
-            "global_step": lambda record: {
-                **record,
-                "global_step": record["global_step"] + 1,
-            },
-            "extra_key": lambda record: {**record, "unexpected": True},
-            "missing_key": lambda record: {
-                key: value for key, value in record.items() if key != "epoch"
-            },
-        }
-        for field, edit in edits.items():
-            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                final_path, final_sidecar = self._write_checkpoint_pair(
-                    root / "run", run_identity, epoch=1
-                )
-                self._install_backup(
-                    final_path, (final_path, final_sidecar), "a" * 32,
-                    sidecar_edit=edit,
-                )
-                self._corrupt_final(final_path)
-                interrupted = final_path.read_bytes()
-                model, optimizer, schedule, scaler = self._components()
-                with self._MutationRecorder(
-                    model, optimizer, schedule, scaler
-                ) as recorder:
-                    with self.assertRaises((ValueError, RuntimeError)):
-                        train_panderm.load_checkpoint_for_resume(
-                            final_path,
-                            map_location="cpu",
-                            model=model,
-                            expected_identity=run_identity,
-                            write_guard=AllowDurableWriteGuard(),
-                        )
-                self.assertEqual(recorder.mutations, [])
-                # A candidate the authoritative validator rejects must never be
-                # promoted onto the final path before the failure is raised.
-                self.assertEqual(final_path.read_bytes(), interrupted)
-
-    # --- blocker 5 ---------------------------------------------------------
     def test_graceful_completion_is_idempotent_after_a_crash(self):
         """probe graceful_completion_retry_after_crash must be True.
 
@@ -3719,12 +3533,11 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
                 root / "run", run_identity, epoch=1
             )
             model, optimizer, schedule, scaler = self._components()
-            checkpoint = train_panderm.load_checkpoint_for_resume(
+            checkpoint = train_panderm.load_checkpoint_safe(
                 final_path,
                 map_location="cpu",
                 model=model,
                 expected_identity=run_identity,
-                write_guard=AllowDurableWriteGuard(),
             )
             start_epoch, best, history = train_panderm.restore_checkpoint_state(
                 checkpoint,
@@ -3740,6 +3553,9 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             self.assertNotIn("session_id", checkpoint["run_identity"])
             self.assertNotIn("account_label", checkpoint["run_identity"])
             self.assertNotIn("hostname", checkpoint["run_identity"])
+
+
+
 
 
 class IdentityAdversarialMatrixTests(unittest.TestCase):
@@ -4152,153 +3968,6 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
     def _sidecar_path(self, checkpoint):
         return checkpoint.with_name(checkpoint.name + ".integrity.json")
 
-    def test_overwrite_waits_for_stale_checkpoint_visibility(self):
-        run_identity = identity()
-        for filename in ("best.pt", "last.pt"):
-            with self.subTest(filename=filename):
-                with tempfile.TemporaryDirectory() as temporary:
-                    path = Path(temporary) / filename
-                    self._save_visibility(path, run_identity, epoch=1)
-                    sidecar_path = self._sidecar_path(path)
-                    before = (path.read_bytes(), sidecar_path.read_bytes())
-                    simulator = self._VisibilitySimulator(
-                        path, checkpoint_visible_after=3
-                    )
-                    with self._simulate_visibility(simulator):
-                        self._save_visibility(path, run_identity, epoch=2)
-                    self.assertEqual(
-                        train_panderm.load_checkpoint_safe(
-                            path, expected_identity=run_identity
-                        )["epoch"],
-                        2,
-                    )
-                    self.assertNotEqual(
-                        (path.read_bytes(), sidecar_path.read_bytes()), before
-                    )
-                    self.assertFalse(simulator.pending)
-
-    def test_overwrite_waits_for_independently_stale_sidecar_visibility(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "best.pt"
-            self._save_visibility(path, run_identity, epoch=1)
-            simulator = self._VisibilitySimulator(
-                path, sidecar_visible_after=3
-            )
-            with self._simulate_visibility(simulator):
-                self._save_visibility(path, run_identity, epoch=2)
-            self.assertEqual(
-                train_panderm.load_checkpoint_safe(
-                    path, expected_identity=run_identity
-                )["epoch"],
-                2,
-            )
-            self.assertFalse(simulator.pending)
-
-    def test_visibility_timeout_restores_exact_pair_without_residue(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "last.pt"
-            self._save_visibility(path, run_identity, epoch=1)
-            sidecar_path = self._sidecar_path(path)
-            before = (path.read_bytes(), sidecar_path.read_bytes())
-            simulator = self._VisibilitySimulator(
-                path, checkpoint_visible_after=None
-            )
-            with self._simulate_visibility(simulator):
-                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
-                    self._save_visibility(path, run_identity, epoch=2)
-            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
-            self.assertEqual(
-                sorted(item.name for item in root.iterdir()),
-                ["last.pt", "last.pt.integrity.json"],
-            )
-
-    def test_same_size_tampered_candidate_never_bypasses_sha(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "last.pt"
-            self._save_visibility(path, run_identity, epoch=1)
-            sidecar_path = self._sidecar_path(path)
-            before = (path.read_bytes(), sidecar_path.read_bytes())
-            simulator = self._VisibilitySimulator(
-                path,
-                checkpoint_visible_after=2,
-                checkpoint_mutation=self._same_size_byte_tamper,
-            )
-            with self._simulate_visibility(simulator):
-                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
-                    self._save_visibility(path, run_identity, epoch=2)
-            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
-            self.assertEqual(
-                sorted(item.name for item in root.iterdir()),
-                ["last.pt", "last.pt.integrity.json"],
-            )
-
-    def test_wrong_sidecar_never_converges_or_survives_rollback(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "best.pt"
-            self._save_visibility(path, run_identity, epoch=1)
-            sidecar_path = self._sidecar_path(path)
-            before = (path.read_bytes(), sidecar_path.read_bytes())
-            simulator = self._VisibilitySimulator(
-                path,
-                sidecar_visible_after=2,
-                sidecar_mutation=self._same_size_sidecar_tamper,
-            )
-            with self._simulate_visibility(simulator):
-                with self.assertRaisesRegex(TimeoutError, "visibility timeout"):
-                    self._save_visibility(path, run_identity, epoch=2)
-            self.assertEqual((path.read_bytes(), sidecar_path.read_bytes()), before)
-            self.assertEqual(
-                sorted(item.name for item in root.iterdir()),
-                ["best.pt", "best.pt.integrity.json"],
-            )
-
-    def test_visibility_guard_loss_stops_before_rollback_mutation(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "last.pt"
-            self._save_visibility(path, run_identity, epoch=1)
-            simulator = self._VisibilitySimulator(
-                path, checkpoint_visible_after=None
-            )
-
-            class ExpiringGuard:
-                def __init__(self):
-                    self.lost = False
-                    self.replace_count_at_loss = None
-
-                def require(inner_self, phase):
-                    if "checkpoint publication visibility" in phase:
-                        inner_self.lost = True
-                        inner_self.replace_count_at_loss = len(
-                            simulator.replace_calls
-                        )
-                        raise RuntimeError("stale publication fence")
-                    if inner_self.lost:
-                        raise RuntimeError("stale publication fence")
-
-            guard = ExpiringGuard()
-            with self._simulate_visibility(simulator):
-                with self.assertRaisesRegex(
-                    RuntimeError, "stale publication fence|restoration"
-                ):
-                    self._save_visibility(
-                        path, run_identity, epoch=2, write_guard=guard
-                    )
-            self.assertTrue(guard.lost)
-            self.assertEqual(
-                len(simulator.replace_calls), guard.replace_count_at_loss
-            )
-            predecessor = sorted(root.glob(".last.pt.previous.*"))
-            self.assertEqual(len(predecessor), 2)
-
     def test_torch_version_subclass_is_normalized_to_exact_str(self):
         class TorchVersionLike(str):
             pass
@@ -4384,8 +4053,12 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
     def test_normal_save_load_and_resume_have_verified_sidecar(self):
         run_identity = identity()
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "last.pt"
+            epoch_filename = train_panderm._epoch_checkpoint_filename(1, 0)
+            path = Path(temporary) / epoch_filename
             model, _, _, _ = self._save(path, run_identity)
+            train_panderm.write_checkpoint_pointer_atomic(
+                temporary, best_filename=epoch_filename, last_filename=epoch_filename, write_guard=AllowDurableWriteGuard()
+            )
             sidecar_path = self._sidecar_path(path)
             self.assertTrue(path.is_file())
             self.assertTrue(sidecar_path.is_file())
@@ -4422,293 +4095,6 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                 resumed,
                 (2, 0.5, [{"epoch": 1, "optimizer_steps": 0}]),
             )
-
-    def test_checkpoint_publish_rejects_rollback_and_same_step_drift(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "last.pt"
-            model, optimizer, schedule, scaler = self._save(
-                path, run_identity, epoch=2
-            )
-            sidecar_path = self._sidecar_path(path)
-            before = (path.read_bytes(), sidecar_path.read_bytes())
-            args = type("A", (), {"seed": 0, "epochs": 5})()
-            history = [
-                {"epoch": completed, "optimizer_steps": schedule.step_count}
-                for completed in (1, 2)
-            ]
-            train_panderm.save_checkpoint(
-                path,
-                model,
-                optimizer,
-                schedule,
-                scaler,
-                2,
-                0.5,
-                history,
-                args,
-                run_identity,
-                write_guard=AllowDurableWriteGuard(),
-            )
-            self.assertEqual(
-                (path.read_bytes(), sidecar_path.read_bytes()),
-                before,
-            )
-            with self.assertRaisesRegex(ValueError, "rollback"):
-                self._save(path, run_identity, epoch=1)
-            self.assertEqual(
-                (path.read_bytes(), sidecar_path.read_bytes()),
-                before,
-            )
-
-            model, optimizer, schedule, scaler = self._components()
-            with torch.no_grad():
-                next(model.parameters()).add_(1.0)
-            history = [
-                {"epoch": completed, "optimizer_steps": schedule.step_count}
-                for completed in (1, 2)
-            ]
-            with self.assertRaisesRegex(ValueError, "same-step checkpoint differs"):
-                train_panderm.save_checkpoint(
-                    path,
-                    model,
-                    optimizer,
-                    schedule,
-                    scaler,
-                    2,
-                    0.5,
-                    history,
-                    args,
-                    run_identity,
-                    write_guard=AllowDurableWriteGuard(),
-                )
-            self.assertEqual(
-                (path.read_bytes(), sidecar_path.read_bytes()),
-                before,
-            )
-
-    def test_checkpoint_reopen_failure_restores_previous_complete_pair(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "last.pt"
-            self._save(path, run_identity, epoch=1)
-            sidecar_path = self._sidecar_path(path)
-            before = (path.read_bytes(), sidecar_path.read_bytes())
-            model, optimizer, schedule, scaler = self._components()
-            args = type("A", (), {"seed": 0, "epochs": 5})()
-            history = [
-                {"epoch": completed, "optimizer_steps": schedule.step_count}
-                for completed in (1, 2)
-            ]
-            real_wait = train_panderm._wait_for_checkpoint_pair_visibility
-            publication_waits = []
-
-            def fail_candidate_reopen(*args, phase, **kwargs):
-                reopened = real_wait(*args, phase=phase, **kwargs)
-                if phase == "checkpoint publication":
-                    publication_waits.append(
-                        train_panderm.sha256_file(args[0])
-                    )
-                    raise RuntimeError("simulated final reopen failure")
-                return reopened
-
-            with mock.patch.object(
-                train_panderm,
-                "_wait_for_checkpoint_pair_visibility",
-                side_effect=fail_candidate_reopen,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "reopen failure"):
-                    train_panderm.save_checkpoint(
-                        path,
-                        model,
-                        optimizer,
-                        schedule,
-                        scaler,
-                        2,
-                        0.5,
-                        history,
-                        args,
-                        run_identity,
-                        write_guard=AllowDurableWriteGuard(),
-                    )
-            self.assertEqual(
-                (path.read_bytes(), sidecar_path.read_bytes()),
-                before,
-            )
-            self.assertEqual(
-                train_panderm.load_checkpoint_safe(
-                    path, expected_identity=run_identity
-                )["epoch"],
-                1,
-            )
-            self.assertEqual(len(publication_waits), 1)
-
-    def test_abrupt_publish_recovers_only_the_last_complete_predecessor(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "last.pt"
-            model, _, _, _ = self._save(path, run_identity, epoch=1)
-            sidecar_path = self._sidecar_path(path)
-            previous_id = "a" * 32
-            backup = path.parent / (
-                f".{path.name}.previous.{previous_id}.pt"
-            )
-            backup_sidecar = path.parent / (
-                f".{path.name}.previous.{previous_id}.integrity.json"
-            )
-            shutil.copy2(path, backup)
-            shutil.copy2(sidecar_path, backup_sidecar)
-            path.write_bytes(b"interrupted-new-checkpoint")
-            sidecar_path.write_text('{"partial":true}\n', encoding="utf-8")
-
-            recovered = train_panderm.load_checkpoint_for_resume(
-                path,
-                map_location="cpu",
-                model=model,
-                expected_identity=run_identity,
-                write_guard=AllowDurableWriteGuard(),
-            )
-            self.assertEqual(recovered["epoch"], 1)
-            self.assertEqual(path.read_bytes(), backup.read_bytes())
-            self.assertEqual(
-                sidecar_path.read_bytes(),
-                backup_sidecar.read_bytes(),
-            )
-            self.assertTrue(backup.is_file())
-            self.assertTrue(backup_sidecar.is_file())
-
-    def test_resume_recovery_waits_for_stale_checkpoint_and_sidecar_visibility(self):
-        run_identity = identity()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "last.pt"
-            model, _, _, _ = self._save_visibility(
-                path, run_identity, epoch=1
-            )
-            sidecar_path = self._sidecar_path(path)
-            previous_id = "a" * 32
-            backup = root / f".last.pt.previous.{previous_id}.pt"
-            backup_sidecar = root / (
-                f".last.pt.previous.{previous_id}.integrity.json"
-            )
-            shutil.copy2(path, backup)
-            shutil.copy2(sidecar_path, backup_sidecar)
-            expected_pair = (
-                backup.read_bytes(),
-                backup_sidecar.read_bytes(),
-            )
-            path.write_bytes(b"interrupted-new-checkpoint")
-            sidecar_path.write_text('{"partial":true}\n', encoding="utf-8")
-            simulator = self._VisibilitySimulator(
-                path,
-                checkpoint_visible_after=3,
-                sidecar_visible_after=2,
-            )
-            with self._simulate_visibility(simulator):
-                recovered = train_panderm.load_checkpoint_for_resume(
-                    path,
-                    map_location="cpu",
-                    model=model,
-                    expected_identity=run_identity,
-                    write_guard=AllowDurableWriteGuard(),
-                )
-            self.assertEqual(recovered["epoch"], 1)
-            self.assertEqual(
-                (path.read_bytes(), sidecar_path.read_bytes()),
-                expected_pair,
-            )
-            self.assertFalse(simulator.pending)
-            self.assertTrue(backup.is_file())
-            self.assertTrue(backup_sidecar.is_file())
-
-    def test_resume_recovery_guard_loss_blocks_unauthorized_replace(self):
-        run_identity = identity()
-        cases = (
-            ("checkpoint resume recovery checkpoint staging", 0),
-            ("checkpoint resume recovery sidecar publish", 1),
-            ("checkpoint resume recovery publication visibility wait", 2),
-        )
-        for target_phase, expected_replace_count in cases:
-            with (
-                self.subTest(target_phase=target_phase),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                root = Path(temporary)
-                path = root / "last.pt"
-                model, _, _, _ = self._save_visibility(
-                    path, run_identity, epoch=1
-                )
-                sidecar_path = self._sidecar_path(path)
-                previous_id = "a" * 32
-                backup = root / f".last.pt.previous.{previous_id}.pt"
-                backup_sidecar = root / (
-                    f".last.pt.previous.{previous_id}.integrity.json"
-                )
-                shutil.copy2(path, backup)
-                shutil.copy2(sidecar_path, backup_sidecar)
-                predecessor_pair = (
-                    backup.read_bytes(),
-                    backup_sidecar.read_bytes(),
-                )
-                path.write_bytes(b"interrupted-new-checkpoint")
-                sidecar_path.write_text(
-                    '{"partial":true}\n', encoding="utf-8"
-                )
-                replace_calls = []
-                real_replace = train_panderm.os.replace
-
-                def observed_replace(source, destination):
-                    replace_calls.append(
-                        (Path(source).name, Path(destination).name)
-                    )
-                    return real_replace(source, destination)
-
-                class ExpiringGuard:
-                    def __init__(inner_self):
-                        inner_self.lost = False
-                        inner_self.replace_count_at_loss = None
-
-                    def require(inner_self, phase):
-                        if target_phase in phase:
-                            inner_self.lost = True
-                            inner_self.replace_count_at_loss = len(
-                                replace_calls
-                            )
-                            raise RuntimeError("stale recovery fence")
-                        if inner_self.lost:
-                            raise RuntimeError("stale recovery fence")
-
-                guard = ExpiringGuard()
-                with mock.patch.object(
-                    train_panderm.os,
-                    "replace",
-                    side_effect=observed_replace,
-                ):
-                    with self.assertRaisesRegex(
-                        RuntimeError, "stale recovery fence"
-                    ):
-                        train_panderm.load_checkpoint_for_resume(
-                            path,
-                            map_location="cpu",
-                            model=model,
-                            expected_identity=run_identity,
-                            write_guard=guard,
-                        )
-                self.assertTrue(guard.lost)
-                self.assertEqual(
-                    len(replace_calls), guard.replace_count_at_loss
-                )
-                self.assertEqual(
-                    len(replace_calls), expected_replace_count
-                )
-                self.assertEqual(
-                    (backup.read_bytes(), backup_sidecar.read_bytes()),
-                    predecessor_pair,
-                )
-                self.assertTrue(backup.is_file())
-                self.assertTrue(backup_sidecar.is_file())
-                self.assertFalse(list(root.glob(".*.recovery.*")))
-                self.assertFalse(list(root.glob(".*.recovery-sidecar.*")))
 
     def test_monotonic_result_publish_allows_exact_retry_and_rejects_rollback(self):
         run_identity = identity()
@@ -4783,47 +4169,6 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                         path, second, write_guard=guard
                     )
             self.assertEqual(path.read_bytes(), before)
-
-    def test_resume_loader_active_session_loss_rejects_before_any_restore(self):
-        class ExpiringGuard:
-            def __init__(self):
-                self.active = True
-                self.calls = []
-
-            def require(self, phase):
-                self.calls.append(phase)
-                if not self.active:
-                    raise RuntimeError("stale resume fence")
-
-        guard = ExpiringGuard()
-        restore = mock.Mock()
-
-        def expire_during_load(*args, **kwargs):
-            guard.active = False
-            return {"checkpoint_format": panderm_run.CHECKPOINT_FORMAT}
-
-        with mock.patch.object(
-            train_panderm,
-            "load_checkpoint_safe",
-            side_effect=expire_during_load,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stale resume fence"):
-                checkpoint = train_panderm.load_checkpoint_for_resume(
-                    "last.pt",
-                    map_location="cpu",
-                    model=mock.Mock(),
-                    expected_identity=identity(),
-                    write_guard=guard,
-                )
-                restore(checkpoint)
-        restore.assert_not_called()
-        self.assertEqual(
-            guard.calls,
-            [
-                "checkpoint resume before state load",
-                "checkpoint resume after state load",
-            ],
-        )
 
     def test_resume_component_boundaries_block_all_stale_followup_mutations(self):
         run_identity = identity()
@@ -5083,7 +4428,7 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
     def test_result_checkpoint_relationship_rejects_stale_or_wrong_record(self):
         run_identity = identity()
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "last.pt"
+            path = Path(temporary) / "epoch001_step000000.pt"
             model, _, _, _ = self._save(path, run_identity)
             record = train_panderm.checkpoint_integrity_record(
                 path, expected_identity=run_identity
@@ -5100,10 +4445,11 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
 
             with torch.no_grad():
                 model.head.weight.add_(1)
-            self._save(path, run_identity, epoch=2)
+            path2 = Path(temporary) / "epoch002_step000000.pt"
+            self._save(path2, run_identity, epoch=2)
             with self.assertRaisesRegex(ValueError, "result"):
                 train_panderm.load_checkpoint_safe(
-                    path,
+                    path2,
                     model=model,
                     expected_identity=run_identity,
                     expected_result_checkpoint=record,
@@ -5146,6 +4492,143 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
                     self.assertEqual(
                         panderm.changed_parameter_count(before, model), 0
                     )
+
+
+    def test_save_checkpoint_target_exists_raises_file_exists_error_without_mutation(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "epoch001_step000000.pt"
+            self._save(path, run_identity, epoch=1)
+            before_bytes = path.read_bytes()
+            sidecar_path = self._sidecar_path(path)
+            before_sidecar = sidecar_path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                self._save(path, run_identity, epoch=1)
+            self.assertEqual(path.read_bytes(), before_bytes)
+            self.assertEqual(sidecar_path.read_bytes(), before_sidecar)
+            tmp_files = list(Path(temporary).glob(".*"))
+            self.assertEqual(tmp_files, [])
+
+    def test_write_once_training_loop_sequence_creates_immutable_pt_files_and_updates_pointer(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Epoch 1 (initial best)
+            ep1_name = train_panderm._epoch_checkpoint_filename(1, 10)
+            ep1_path = root / ep1_name
+            self._save(ep1_path, run_identity, epoch=1)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep1_name, write_guard=AllowDurableWriteGuard())
+            ep1_hash = train_panderm.sha256_file(ep1_path)
+            ptr1 = train_panderm.read_checkpoint_pointer(root)
+            self.assertEqual(ptr1, {"schema_version": 1, "best": ep1_name, "last": ep1_name})
+
+            # Epoch 2 (not best)
+            ep2_name = train_panderm._epoch_checkpoint_filename(2, 20)
+            ep2_path = root / ep2_name
+            self._save(ep2_path, run_identity, epoch=2)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep2_name, write_guard=AllowDurableWriteGuard())
+            ep2_hash = train_panderm.sha256_file(ep2_path)
+            ptr2 = train_panderm.read_checkpoint_pointer(root)
+            self.assertEqual(ptr2, {"schema_version": 1, "best": ep1_name, "last": ep2_name})
+
+            # Epoch 3 (new best)
+            ep3_name = train_panderm._epoch_checkpoint_filename(3, 30)
+            ep3_path = root / ep3_name
+            self._save(ep3_path, run_identity, epoch=3)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep3_name, last_filename=ep3_name, write_guard=AllowDurableWriteGuard())
+            ep3_hash = train_panderm.sha256_file(ep3_path)
+            ptr3 = train_panderm.read_checkpoint_pointer(root)
+            self.assertEqual(ptr3, {"schema_version": 1, "best": ep3_name, "last": ep3_name})
+
+            # Verify immutability of previous checkpoints
+            self.assertEqual(train_panderm.sha256_file(ep1_path), ep1_hash)
+            self.assertEqual(train_panderm.sha256_file(ep2_path), ep2_hash)
+            self.assertEqual(train_panderm.sha256_file(ep3_path), ep3_hash)
+
+    def test_resume_reads_pointer_and_loads_safe(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ep1_name = train_panderm._epoch_checkpoint_filename(1, 10)
+            ep1_path = root / ep1_name
+            model, _, _, _ = self._save(ep1_path, run_identity, epoch=1)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep1_name, write_guard=AllowDurableWriteGuard())
+
+            pointer = train_panderm.read_checkpoint_pointer(root)
+            self.assertIsNotNone(pointer)
+            last_path = root / pointer["last"]
+            checkpoint = train_panderm.load_checkpoint_safe(
+                last_path, map_location="cpu", model=model, expected_identity=run_identity
+            )
+            self.assertEqual(checkpoint["epoch"], 1)
+
+    def test_resume_missing_pointer_referenced_target_raises_file_not_found(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ep1_name = train_panderm._epoch_checkpoint_filename(1, 10)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep1_name, write_guard=AllowDurableWriteGuard())
+            with self.assertRaises(FileNotFoundError):
+                train_panderm.read_checkpoint_pointer(root)
+
+    def test_read_checkpoint_pointer_tamper_and_schema_matrix(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ep1_name = train_panderm._epoch_checkpoint_filename(1, 10)
+            ep1_path = root / ep1_name
+            self._save(ep1_path, run_identity, epoch=1)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep1_name, write_guard=AllowDurableWriteGuard())
+
+            ptr_path = train_panderm.checkpoint_pointer_path(root)
+
+            # Matrix of corrupt / invalid pointer JSON payloads
+            corruptions = [
+                {"best": ep1_name, "last": ep1_name},  # missing schema_version
+                {"schema_version": 2, "best": ep1_name, "last": ep1_name},  # wrong schema_version
+                {"schema_version": 1, "last": ep1_name},  # missing best
+                {"schema_version": 1, "best": ep1_name},  # missing last
+                {"schema_version": 1, "best": ep1_name, "last": ep1_name, "extra": True},  # extra key
+                {"schema_version": 1, "best": 123, "last": ep1_name},  # non-string best
+                {"schema_version": 1, "best": ep1_name, "last": "../etc/passwd"},  # path traversal / slash
+                {"schema_version": 1, "best": "sub/ep.pt", "last": ep1_name},  # path with slash
+                {"schema_version": 1, "best": "missing.pt", "last": ep1_name},  # referenced best file missing
+            ]
+            for bad_payload in corruptions:
+                with self.subTest(payload=bad_payload):
+                    ptr_path.write_text(json.dumps(bad_payload) + "\n", encoding="utf-8")
+                    with self.assertRaises((ValueError, FileNotFoundError)):
+                        train_panderm.read_checkpoint_pointer(root)
+
+    def test_completed_run_resolves_pointer_and_verifies_pair(self):
+        run_identity = identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ep1_name = train_panderm._epoch_checkpoint_filename(1, 10)
+            ep1_path = root / ep1_name
+            self._save(ep1_path, run_identity, epoch=1)
+            train_panderm.write_checkpoint_pointer_atomic(root, best_filename=ep1_name, last_filename=ep1_name, write_guard=AllowDurableWriteGuard())
+            pointer = train_panderm.read_checkpoint_pointer(root)
+            result = {
+                "checkpoint_integrity": {
+                    "best.pt": train_panderm.checkpoint_integrity_record(ep1_path, expected_identity=run_identity),
+                    "last.pt": train_panderm.checkpoint_integrity_record(ep1_path, expected_identity=run_identity),
+                },
+                "checkpoint_pointer": pointer,
+            }
+            best, last = train_panderm.load_completed_checkpoint_pair_safe(
+                best_path=root / pointer["best"],
+                last_path=root / pointer["last"],
+                result=result,
+                model=None,
+                expected_identity=run_identity,
+                map_location="cpu",
+            )
+            self.assertEqual(best["epoch"], 1)
+            self.assertEqual(last["epoch"], 1)
+
+    def test_load_checkpoint_for_resume_removed(self):
+        self.assertFalse(hasattr(train_panderm, "load_checkpoint_for_resume"))
 
 
 class PanDermRunnerMockSmokeTests(unittest.TestCase):
@@ -5306,7 +4789,10 @@ class PanDermRunnerMockSmokeTests(unittest.TestCase):
             self.assertEqual(
                 set(result["checkpoint_integrity"]), {"best.pt", "last.pt"}
             )
-            for name in ("best.pt", "last.pt"):
+            pointer = train_panderm.read_checkpoint_pointer(checkpoint_dir)
+            self.assertIsNotNone(pointer)
+            self.assertTrue((checkpoint_dir / "checkpoint_pointer.json").is_file())
+            for name in (pointer["best"], pointer["last"]):
                 self.assertTrue((checkpoint_dir / name).is_file())
                 self.assertTrue(
                     (checkpoint_dir / f"{name}.integrity.json").is_file()
