@@ -45,7 +45,6 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "f1b27f70f6c48b8b70b63df7772740c6edd714eb"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -726,34 +725,147 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
-        """A published notebook must name the exact reviewed commit.
+    def test_first_cell_is_an_unpinned_implementation_candidate(self):
+        """A candidate must remain fail-loud until its reviewed commit exists.
 
-        Colab clones the repository and checks this value out detached, so the
-        pin is the only thing tying a real run to code that passed review. The
-        placeholder must be gone rather than merely accompanied.
+        The publication step replaces this placeholder only after push.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Pin the reviewed pushed commit",
+        ):
+            exec(compile(first, "cell-0", "exec"), namespace)
+
+    @staticmethod
+    def _phase0_shared_root_rebind():
+        """The contiguous Phase 0 block that rebinds the durable path basis."""
+        notebook, _ = load(VALIDATION)
+        phase0 = "".join(notebook["cells"][3]["source"]).splitlines(keepends=True)
+        start = next(
+            index
+            for index, line in enumerate(phase0)
+            if line.startswith("SHARED_RUN_ROOT = resolved_root")
         )
+        end = next(
+            index
+            for index, line in enumerate(phase0[start:], start)
+            if line.startswith("DATA_CACHE_DIRECTORY = ")
+        )
+        return "".join(phase0[start : end + 1])
+
+    def test_phase0_rebinds_every_durable_path_to_the_resolved_basis(self):
+        """probe shared_root_path_basis must have exactly one spelling.
+
+        `ensure_tree` builds its result on `require_existing_shared_root`, which
+        resolves. The notebook kept the My Drive alias bound, so a value that
+        came back from `ensure_tree` was not lexically under `SHARED_RUN_ROOT`
+        and `relative_to` raised. Through a Drive shortcut the two spellings
+        genuinely differ, so this executes the rebind rather than reading it.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            resolved = Path(temporary).resolve() / "ddpm-derm-panderm-runs"
+            resolved.mkdir()
+            namespace = {
+                "Path": Path,
+                "resolved_root": resolved,
+                "RUN_VERSION": panderm_run.RUN_VERSION,
+            }
+            exec(compile(self._phase0_shared_root_rebind(), "phase0", "exec"), namespace)
+            self.assertEqual(namespace["SHARED_RUN_ROOT"], resolved)
+            derived = (
+                "V1_ROOT",
+                "VALIDATION_RUNS_ROOT",
+                "VALIDATION_RECORD",
+                "LATEST_FAILURE_RECORD",
+                "FORMAL_ROOT",
+                "SHARED_ROOT_SENTINEL",
+                "DATA_CACHE_DIRECTORY",
+            )
+            for name in derived:
+                self.assertTrue(
+                    namespace[name].is_relative_to(resolved),
+                    f"{name} escaped the resolved shared root",
+                )
+
+    def test_ensure_tree_results_stay_relative_to_the_rebound_shared_root(self):
+        """The failure was reached only by a fresh attempt, so prove both paths.
+
+        An unresolved alias spelling makes the exact Phase 6 derivation raise,
+        which is what a real Colab run hit at the first attempt directory it
+        ever created. The rebound basis must make the same derivation work.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            resolved = Path(temporary).resolve() / "ddpm-derm-panderm-runs"
+            resolved.mkdir()
+            alias = Path(os.path.relpath(resolved, Path.cwd()))
+            self.assertFalse(alias.is_absolute(), "alias spelling must differ")
+
+            attempt = panderm_run.ensure_tree(
+                alias, Path(panderm_run.RUN_VERSION) / "validation_runs" / "20260803T160024Z"
+            )
+            with self.assertRaises(ValueError):
+                (attempt / "attempt_sessions").relative_to(alias)
+
+            rebound = panderm_run.require_existing_shared_root(alias)
+            sessions = panderm_run.ensure_tree(
+                rebound, (attempt / "attempt_sessions").relative_to(rebound)
+            )
+            self.assertTrue(sessions.is_dir())
+            self.assertEqual(sessions.parent, attempt)
+
+    def test_live_notebooks_rebind_before_any_shared_root_relative_to(self):
+        """probe shared_root_path_basis must not be reintroduced.
+
+        The frozen notebooks carry the same alias-basis pattern, but they are
+        records of finished runs and `test_frozen_notebooks_are_unmodified`
+        fails the suite if they change; they also only ever ran on the owner
+        account, where the alias and the resolved path are the same directory.
+        So the pattern is fenced off here for the notebooks that can still run,
+        rather than edited into the ones that cannot.
+        """
+        live = [
+            path
+            for path in sorted((ROOT / "notebooks").glob("*.ipynb"))
+            if path.name not in FROZEN_NOTEBOOKS and path.name != PROTECTED_NOTEBOOK
+        ]
+        self.assertIn(VALIDATION, [path.name for path in live])
+        for path in live:
+            with self.subTest(notebook=path.name):
+                _, code = load(path.name)
+                first_use = code.find("relative_to(SHARED_RUN_ROOT)")
+                if first_use < 0:
+                    continue
+                rebind = code.find("SHARED_RUN_ROOT = resolved_root")
+                self.assertNotEqual(
+                    rebind,
+                    -1,
+                    f"{path.name} derives paths from an unresolved shared root",
+                )
+                self.assertLess(
+                    code.find("require_existing_shared_root(SHARED_RUN_ROOT)"),
+                    rebind,
+                    f"{path.name} must resolve the shared root before rebinding it",
+                )
+                self.assertLess(
+                    rebind,
+                    first_use,
+                    f"{path.name} must rebind before the first relative_to",
+                )
 
     def test_phase0_wires_the_resolved_root_id_and_both_shared_root_shapes(self):
         """Both Drive provider defects were wiring errors, not missing logic.
