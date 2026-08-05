@@ -46,6 +46,7 @@ PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
 PINNED_IMPLEMENTATION_COMMIT = "6e0fe35cebe92667fc24946f0907dd3d14f57566"
+PINNED_FORMAL_IMPLEMENTATION_COMMIT = "14562253f52c83a8e4f71ece291bcf90d9ed06cc"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -1824,12 +1825,26 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
 
 
 class FormalNotebookTests(unittest.TestCase):
-    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
-        self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
+        self.assertIn(
+            f'EXPECTED_GIT_COMMIT = "{PINNED_FORMAL_IMPLEMENTATION_COMMIT}"',
+            first,
+        )
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
+
+    def test_pinned_first_cell_passes_its_own_guard(self):
+        notebook, _ = load(FORMAL)
+        first = "".join(notebook["cells"][0]["source"])
+        namespace = {}
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(
+            namespace["EXPECTED_GIT_COMMIT"],
+            PINNED_FORMAL_IMPLEMENTATION_COMMIT,
+        )
 
     def test_three_seed_loop_is_present(self):
         _, code = load(FORMAL)
