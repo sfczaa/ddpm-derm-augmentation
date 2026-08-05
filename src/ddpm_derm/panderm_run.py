@@ -148,6 +148,10 @@ EFFECTIVE_BATCH_SIZE = 128
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.05
 WARMUP_EPOCHS = 10
+KNOWN_TRAINING_SCALES = frozenset(
+    {(0, VALIDATION_EPOCHS, VALIDATION_WARMUP_EPOCHS)}
+    | {(seed, FORMAL_EPOCHS, WARMUP_EPOCHS) for seed in SEEDS}
+)
 LAYER_DECAY = 0.65
 DROP_PATH = 0.2
 DF_TARGET_COUNT = 585
@@ -1757,15 +1761,19 @@ def require_provenance_clearance(
     license_review: Mapping[str, Any] | None = None,
     contamination_review: Mapping[str, Any] | None = None,
     purpose: str = VALIDATION_ONLY,
+    formal_training_confirmed: bool = False,
 ) -> dict[str, Any]:
     """Permit only exploratory validation after provenance checks.
 
     Formal training and test access are policy-prohibited, independent of an
     author assertion, pinned commit, or pinned checkpoint hash.
     """
-    if purpose in {FORMAL_TRAINING, TEST_ACCESS}:
+    if purpose == TEST_ACCESS:
         raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
-    if purpose != VALIDATION_ONLY:
+    if purpose == FORMAL_TRAINING:
+        if formal_training_confirmed is not True:
+            raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
+    elif purpose != VALIDATION_ONLY:
         raise ValueError(f"unsupported PanDerm provenance purpose: {purpose!r}")
 
     license_review = dict(license_review or LICENSE_REVIEW)
@@ -1819,7 +1827,7 @@ def require_provenance_clearance(
             + "; ".join(failures)
         )
     return {
-        "cleared_for": VALIDATION_ONLY,
+        "cleared_for": purpose,
         "upstream_commit": upstream_commit,
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_sha256_provenance": CHECKPOINT_SHA256_PROVENANCE,
@@ -1827,7 +1835,7 @@ def require_provenance_clearance(
         "contamination_review": contamination_review,
         "claim_boundary": contamination_review["claim_boundary"],
         "deployment_allowed": False,
-        "formal_training_allowed": False,
+        "formal_training_allowed": purpose == FORMAL_TRAINING,
         "test_access_allowed": False,
         "attribution": ATTRIBUTION,
         "reviewed_utc": utc_now(),
@@ -1897,13 +1905,8 @@ def build_run_identity(
         )
     if evaluation_scope != VALIDATION_ONLY:
         raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
-    if int(seed) != 0 or int(epochs) != VALIDATION_EPOCHS:
+    if (int(seed), int(epochs), int(warmup_epochs)) not in KNOWN_TRAINING_SCALES:
         raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
-    if int(warmup_epochs) != VALIDATION_WARMUP_EPOCHS:
-        raise ValueError(
-            f"PanDerm v1 validation warmup must be "
-            f"{VALIDATION_WARMUP_EPOCHS} epochs"
-        )
     missing_manifests = [
         split for split in ("train", "val") if split not in manifest_sha256
     ]
@@ -3643,9 +3646,85 @@ def evaluate_non_collapse_gate(
 
 
 def aggregate_results(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """PanDerm v1 has no formal/test aggregation entry point."""
-    del runs
-    raise ValueError(PROHIBITED_FORMAL_TEST_REASON)
+    """Aggregate the 3 formal C1 seeds into mean/population_std only.
+
+    No bootstrap CI, no significance testing. Every run must still be
+    evaluation_scope=validation_only with test_metrics=None: the formal path
+    never touches the test split.
+    """
+    expected_seeds = set(SEEDS)
+    found_seeds = {run.get("seed") for run in runs}
+    if found_seeds != expected_seeds or len(runs) != len(SEEDS):
+        raise ValueError(
+            f"expected exactly the {sorted(expected_seeds)} C1 formal seed runs, "
+            f"found {sorted(found_seeds)}"
+        )
+    variants = {run.get("variant") for run in runs}
+    if variants != {VARIANT}:
+        raise ValueError(f"refusing to aggregate non-C1 variants: {variants}")
+    scopes = {run.get("evaluation_scope") for run in runs}
+    if scopes != {VALIDATION_ONLY} or any(
+        run.get("test_metrics") is not None for run in runs
+    ):
+        raise ValueError(
+            "PanDerm v1 formal aggregation must stay validation_only with no "
+            "test_metrics; test access is prohibited"
+        )
+    claim_boundaries = {run.get("claim_boundary") for run in runs}
+    if claim_boundaries != {CLAIM_BOUNDARY}:
+        raise ValueError(
+            f"refusing to aggregate mixed claim boundaries: {claim_boundaries}"
+        )
+
+    # Cross-run identity consistency: everything in IMMUTABLE_IDENTITY_KEYS
+    # except "seed" must be pairwise identical -- these 3 runs are the SAME
+    # experiment, differing only by seed.
+    identity_keys = [key for key in IMMUTABLE_IDENTITY_KEYS if key != "seed"]
+    reference = {key: runs[0]["run_identity"].get(key) for key in identity_keys}
+    for run in runs[1:]:
+        current = {key: run["run_identity"].get(key) for key in identity_keys}
+        if current != reference:
+            raise ValueError("refusing to aggregate seed runs with drifted identity")
+
+    output: dict[str, Any] = {
+        "ddof": 0,
+        "variant": VARIANT,
+        "seeds": sorted(expected_seeds),
+        "claim_boundary": CLAIM_BOUNDARY,
+        "evaluation_scope": VALIDATION_ONLY,
+        "test_metrics": None,
+        "formal_training_allowed": True,
+        "test_access_allowed": False,
+        "validation_metrics": {},
+    }
+    metric_keys = {
+        "df_f1": "target_f1",
+        "macro_f1": "macro_f1",
+        "df_recall": "target_recall",
+    }
+    by_seed = {run["seed"]: run for run in runs}
+    ordered = [by_seed[seed] for seed in sorted(expected_seeds)]
+    for label, key in metric_keys.items():
+        values = [float(run["validation_metrics"][key]) for run in ordered]
+        output["validation_metrics"][label] = {
+            "values": values,
+            "mean": float(np.mean(values)),
+            "population_std": float(np.std(values, ddof=0)),
+        }
+    classes = sorted(ordered[0]["validation_metrics"]["per_class_recall"])
+    output["validation_metrics"]["per_class_recall"] = {
+        name: {
+            "mean": float(np.mean(
+                [r["validation_metrics"]["per_class_recall"][name] for r in ordered]
+            )),
+            "population_std": float(np.std(
+                [r["validation_metrics"]["per_class_recall"][name] for r in ordered],
+                ddof=0,
+            )),
+        }
+        for name in classes
+    }
+    return output
 
 
 def summarize_provenance() -> dict[str, Any]:

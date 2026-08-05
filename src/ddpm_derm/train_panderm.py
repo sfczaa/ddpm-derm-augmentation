@@ -1222,9 +1222,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.generated_manifest is not None:
         p.error("PanDerm C1 is real-data only; synthetic manifests are rejected")
-    frozen = {
-        "seed": (0, "--seed"),
-        "epochs": (panderm_run.VALIDATION_EPOCHS, "--epochs"),
+    always_frozen = {
         "batch_size": (panderm_run.BATCH_SIZE, "--batch-size"),
         "accumulation_steps": (
             panderm_run.ACCUMULATION_STEPS,
@@ -1232,15 +1230,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         ),
         "lr": (panderm_run.LEARNING_RATE, "--lr"),
         "weight_decay": (panderm_run.WEIGHT_DECAY, "--weight-decay"),
-        "warmup_epochs": (
-            panderm_run.VALIDATION_WARMUP_EPOCHS,
-            "--warmup-epochs",
-        ),
         "layer_decay": (panderm_run.LAYER_DECAY, "--layer-decay"),
     }
-    for attribute, (expected, option) in frozen.items():
+    for attribute, (expected, option) in always_frozen.items():
         if getattr(args, attribute) != expected:
-            p.error(f"{option} must be exactly {expected} for PanDerm v1 validation")
+            p.error(f"{option} must be exactly {expected} for PanDerm v1")
+
+    scale = (args.seed, args.epochs, args.warmup_epochs)
+    if scale not in panderm_run.KNOWN_TRAINING_SCALES:
+        p.error(
+            "--seed/--epochs/--warmup-epochs must together be exactly the "
+            f"validation combo (seed=0, epochs={panderm_run.VALIDATION_EPOCHS}, "
+            f"warmup_epochs={panderm_run.VALIDATION_WARMUP_EPOCHS}) or a formal "
+            f"combo (seed in {sorted(panderm_run.SEEDS)}, "
+            f"epochs={panderm_run.FORMAL_EPOCHS}, "
+            f"warmup_epochs={panderm_run.WARMUP_EPOCHS})"
+        )
     if args.run_version != panderm_run.RUN_VERSION:
         p.error(f"--run-version must be {panderm_run.RUN_VERSION}")
     if args.df_target_count != panderm_run.DF_TARGET_COUNT:
@@ -1272,13 +1277,25 @@ def main(argv=None) -> None:
         args.checkpoint_sha256 or panderm_run.EXPECTED_CHECKPOINT_SHA256,
     )
     panderm_run.require_no_deployment_contamination(config.PROJECT_ROOT)
+    if (args.seed, args.epochs, args.warmup_epochs) == (
+        0, panderm_run.VALIDATION_EPOCHS, panderm_run.VALIDATION_WARMUP_EPOCHS,
+    ):
+        purpose = panderm_run.VALIDATION_ONLY
+    elif (args.seed, args.epochs, args.warmup_epochs) in panderm_run.KNOWN_TRAINING_SCALES:
+        purpose = panderm_run.FORMAL_TRAINING
+    else:
+        # Unreachable: parse_args already rejected anything outside
+        # KNOWN_TRAINING_SCALES before main() ever runs.
+        raise ValueError(panderm_run.PROHIBITED_FORMAL_TEST_REASON)
+
     panderm_run.require_provenance_clearance(
         upstream_commit=upstream_commit,
         checkpoint_sha256=checkpoint_sha256,
         expected_checkpoint_sha256=(
             args.checkpoint_sha256 or panderm_run.EXPECTED_CHECKPOINT_SHA256
         ),
-        purpose=panderm_run.VALIDATION_ONLY,
+        purpose=purpose,
+        formal_training_confirmed=(purpose == panderm_run.FORMAL_TRAINING),
     )
 
     # Constructed only after every read-only validation above, so an illegal CLI
@@ -1519,7 +1536,7 @@ def main(argv=None) -> None:
             ),
             "checkpoint_cadence": "every_epoch",
             "maximum_quota_loss": "one_incomplete_epoch",
-            "formal_training_allowed": False,
+            "formal_training_allowed": purpose == panderm_run.FORMAL_TRAINING,
             "test_access_allowed": False,
         }
         panderm_run.write_monotonic_run_record_atomic(
@@ -1591,7 +1608,7 @@ def main(argv=None) -> None:
         "amp_requested": amp_requested,
         "amp_effective": amp_effective,
         "device_type": device.type,
-        "formal_training_allowed": False,
+        "formal_training_allowed": purpose == panderm_run.FORMAL_TRAINING,
         "test_access_allowed": False,
         "claim_boundary": panderm_run.CLAIM_BOUNDARY,
         "data_counts": {"train": len(train_frame), "val": len(val_frame), "test": None},

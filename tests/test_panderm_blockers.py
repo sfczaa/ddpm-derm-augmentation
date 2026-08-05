@@ -4869,5 +4869,152 @@ class CliRuntimeIdentityTests(unittest.TestCase):
             self.assertEqual(panderm.changed_parameter_count(before, model), 0)
 
 
+
+
+class FormalTrainingGateTests(unittest.TestCase):
+    def test_formal_training_provenance_clearance_success(self):
+        cleared = panderm_run.require_provenance_clearance(
+            upstream_commit=panderm_run.UPSTREAM_COMMIT,
+            checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+            purpose=panderm_run.FORMAL_TRAINING,
+            formal_training_confirmed=True,
+        )
+        self.assertEqual(cleared["cleared_for"], "formal_training")
+        self.assertTrue(cleared["formal_training_allowed"])
+        self.assertFalse(cleared["test_access_allowed"])
+        self.assertEqual(cleared["claim_boundary"], "suggestive_exploratory_only")
+
+    def test_formal_training_unconfirmed_rejected(self):
+        for unconfirmed in (False, None, "True", 1, 0, []):
+            with self.subTest(unconfirmed=unconfirmed):
+                with self.assertRaisesRegex(ValueError, panderm_run.PROHIBITED_FORMAL_TEST_REASON):
+                    panderm_run.require_provenance_clearance(
+                        upstream_commit=panderm_run.UPSTREAM_COMMIT,
+                        checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+                        purpose=panderm_run.FORMAL_TRAINING,
+                        formal_training_confirmed=unconfirmed,
+                    )
+        with self.assertRaisesRegex(ValueError, panderm_run.PROHIBITED_FORMAL_TEST_REASON):
+            panderm_run.require_provenance_clearance(
+                upstream_commit=panderm_run.UPSTREAM_COMMIT,
+                checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+                purpose=panderm_run.FORMAL_TRAINING,
+            )
+
+    def test_confirmation_never_unlocks_test_access(self):
+        with self.assertRaisesRegex(ValueError, panderm_run.PROHIBITED_FORMAL_TEST_REASON):
+            panderm_run.require_provenance_clearance(
+                upstream_commit=panderm_run.UPSTREAM_COMMIT,
+                checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+                purpose=panderm_run.TEST_ACCESS,
+                formal_training_confirmed=True,
+            )
+
+    def test_formal_training_still_enforces_disclaimer_checklist(self):
+        tampered_review = dict(panderm_run.CONTAMINATION_REVIEW)
+        tampered_review["claim_boundary"] = "unrestricted_clinical_claim"
+        with self.assertRaisesRegex(ValueError, "claim boundary must stay suggestive/exploratory"):
+            panderm_run.require_provenance_clearance(
+                upstream_commit=panderm_run.UPSTREAM_COMMIT,
+                checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+                contamination_review=tampered_review,
+                purpose=panderm_run.FORMAL_TRAINING,
+                formal_training_confirmed=True,
+            )
+
+        tampered_overlap = dict(panderm_run.CONTAMINATION_REVIEW)
+        tampered_overlap["patient_level_overlap"] = "none"
+        with self.assertRaisesRegex(ValueError, "patient overlap is not excludable"):
+            panderm_run.require_provenance_clearance(
+                upstream_commit=panderm_run.UPSTREAM_COMMIT,
+                checkpoint_sha256=panderm_run.EXPECTED_CHECKPOINT_SHA256,
+                contamination_review=tampered_overlap,
+                purpose=panderm_run.FORMAL_TRAINING,
+                formal_training_confirmed=True,
+            )
+
+    def test_build_run_identity_scale_matrix(self):
+        accepted_scales = [(0, 5, 5), (0, 50, 10), (1, 50, 10), (2, 50, 10)]
+        for seed, epochs, warmup in accepted_scales:
+            with self.subTest(scale=(seed, epochs, warmup)):
+                run_id = panderm_run.build_run_identity(
+                    git_commit="c" * 40,
+                    seed=seed,
+                    epochs=epochs,
+                    evaluation_scope="validation_only",
+                    checkpoint_sha256="a" * 64,
+                    model_identity={"arch": "panderm_base_vit_b16"},
+                    manifest_sha256={"train": "t", "val": "v"},
+                    fixed_split_identity="t",
+                    shared_root_uuid="u",
+                    formal_output_identity="o",
+                    dependency_versions={},
+                    warmup_epochs=warmup,
+                )
+                self.assertEqual(run_id["seed"], seed)
+                self.assertEqual(run_id["optimization"]["epochs"], epochs)
+                self.assertEqual(run_id["optimization"]["warmup_epochs"], warmup)
+
+        rejected_scales = [
+            (5, 50, 10),  # seed out of range
+            (1, 49, 10),  # off-by-one epochs
+            (1, 50, 5),   # formal epochs, validation warmup
+            (1, 5, 5),    # formal seed, validation scale
+        ]
+        for seed, epochs, warmup in rejected_scales:
+            with self.subTest(rejected_scale=(seed, epochs, warmup)):
+                with self.assertRaisesRegex(ValueError, panderm_run.PROHIBITED_FORMAL_TEST_REASON):
+                    panderm_run.build_run_identity(
+                        git_commit="c" * 40,
+                        seed=seed,
+                        epochs=epochs,
+                        evaluation_scope="validation_only",
+                        checkpoint_sha256="a" * 64,
+                        model_identity={"arch": "panderm_base_vit_b16"},
+                        manifest_sha256={"train": "t", "val": "v"},
+                        fixed_split_identity="t",
+                        shared_root_uuid="u",
+                        formal_output_identity="o",
+                        dependency_versions={},
+                        warmup_epochs=warmup,
+                    )
+
+    def test_parse_args_scale_and_frozen_hyperparams_matrix(self):
+        base_cli = [
+            "--checkpoint", "weights.pth",
+            "--upstream-dir", "upstream",
+            "--output-dir", "out",
+        ]
+        # Valid formal triple
+        args = train_panderm.parse_args(base_cli + ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10"])
+        self.assertEqual(args.seed, 1)
+        self.assertEqual(args.epochs, 50)
+        self.assertEqual(args.warmup_epochs, 10)
+
+        # Invalid scale triples
+        invalid_scales = [
+            ["--seed", "5", "--epochs", "50", "--warmup-epochs", "10"],
+            ["--seed", "1", "--epochs", "49", "--warmup-epochs", "10"],
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "5"],
+            ["--seed", "1", "--epochs", "5", "--warmup-epochs", "5"],
+        ]
+        for scale_args in invalid_scales:
+            with self.subTest(scale_args=scale_args):
+                with self.assertRaises(SystemExit):
+                    train_panderm.parse_args(base_cli + scale_args)
+
+        # Always frozen optimizer params are rejected even with valid formal scale
+        frozen_violations = [
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10", "--batch-size", "32"],
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10", "--accumulation-steps", "4"],
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10", "--lr", "1e-3"],
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10", "--weight-decay", "0.01"],
+            ["--seed", "1", "--epochs", "50", "--warmup-epochs", "10", "--layer-decay", "0.5"],
+        ]
+        for violation in frozen_violations:
+            with self.subTest(violation=violation):
+                with self.assertRaises(SystemExit):
+                    train_panderm.parse_args(base_cli + violation)
+
 if __name__ == "__main__":
     unittest.main()

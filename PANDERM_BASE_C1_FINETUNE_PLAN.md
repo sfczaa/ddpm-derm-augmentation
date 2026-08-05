@@ -30,6 +30,20 @@ PanDerm v1 may produce only a seed-0, five-epoch validation-only engineering rec
 must not produce test metrics, a formal test comparison, or a performance-improvement
 claim. Selecting a different model for a formal experiment is a separate user decision.
 
+## Formal training decision
+
+This section amends the training-scale limit stated above; every contamination, license,
+and test-access provision above remains fully binding and unchanged.
+
+Formal-scale training (50 epochs, seeds 0, 1, 2) is unlocked by explicit user decision. The
+seed-0, five-epoch validation-only budget described above was PanDerm v1's original scope;
+formal-scale training is now a second, equally binding-checked scope for the same
+`v1_panderm_base_c1_finetune` run version. `evaluation_scope` stays `validation_only`
+everywhere and test-split access remains permanently prohibited
+(`TEST_ACCESS_ALLOWED = False`). `claim_boundary` stays `suggestive_exploratory_only` in
+every formal record too. The pretraining contamination risk is unchanged by training scale —
+this decision accepts that risk rather than resolving it.
+
 ## Phase 0 CHECK — provenance needed for validation only
 
 | Item | Fixed value |
@@ -86,8 +100,11 @@ manifest mutation, or is included from the runtime value in the immutable identi
 `--drop-path` and `--no-amp` are not supported overrides.
 
 The trainer has no executable `full` scope, test manifest load, test frame, test loader,
-test evaluation, or test metric path. A forged `VALIDATION PASSED` record cannot unlock
-test access because there is no downstream v1 formal/test notebook path.
+test evaluation, or test metric path — this remains true for the formal-scale training path
+added below too. A forged `VALIDATION PASSED` record cannot unlock test access: there is a
+downstream v1 formal *training* notebook path (see "Formal training decision" above), but it
+carries the identical `evaluation_scope=validation_only` restriction and has no test
+manifest, test evaluation, or test metric path of its own either.
 
 ## Immutable identity
 
@@ -125,7 +142,10 @@ duplicates, `best.pt`, and `last.pt` must all use this complete schema. Incomple
 or current identities are rejected. Resume checks identity before model, optimizer,
 scheduler, scaler, or RNG state mutation.
 
-Formal aggregation is disabled and always fails with the binding v1 prohibition.
+Formal aggregation (`panderm_run.aggregate_results`) is enabled per the "Formal training
+decision" above, but only across exactly the three formal seed runs, and it independently
+refuses any run whose `evaluation_scope` is not `validation_only` or whose `test_metrics` is
+not `None` — aggregation carries its own test-access refusal, not just a policy note.
 
 ## Persistence contract
 
@@ -143,9 +163,11 @@ non-empty existing final record is never overwritten silently.
 - `notebooks/colab_panderm_base_c1_finetune_validation.ipynb` remains unexecuted and
   Run-all-safe only after `REPLACE_AFTER_PUSH` and the checkpoint hash are pinned. It runs
   seed 0 for five epochs with `evaluation_scope=validation_only`.
-- `notebooks/colab_panderm_base_c1_finetune_classifier.ipynb` is a STOP/DECISION notebook.
-  Its first substantive cell fails loud with the binding prohibition and contains no
-  formal training, resume, aggregation, or test helper.
+- `notebooks/colab_panderm_base_c1_finetune_classifier.ipynb` was originally a STOP/DECISION
+  notebook whose first substantive cell failed loud with the binding prohibition. Per the
+  "Formal training decision" above it is now a real formal-training notebook (50 epochs,
+  seeds 0/1/2, `evaluation_scope=validation_only`). It still contains no test manifest, test
+  evaluation, or test metric helper of any kind.
 
 Existing ResNet, DDPM, CoCa, deployment, README, HANDOFF, experiment logs, and outputs
 remain out of scope and byte-identical. PanDerm adapted weights must never be published,
