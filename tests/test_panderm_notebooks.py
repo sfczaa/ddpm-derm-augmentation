@@ -728,34 +728,31 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
-        """A published notebook must name the exact reviewed commit.
+    def test_first_cell_is_an_unpinned_implementation_candidate(self):
+        """A candidate must remain fail-loud until its reviewed commit exists.
 
-        Colab clones the repository and checks this value out detached, so the
-        pin is the only thing tying a real run to code that passed review. The
-        placeholder must be gone rather than merely accompanied.
+        The publication step replaces this placeholder only after push.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Pin the reviewed pushed commit",
+        ):
+            exec(compile(first, "cell-0", "exec"), namespace)
 
     @staticmethod
     def _phase0_shared_root_rebind():
@@ -1825,26 +1822,12 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
 
 
 class FormalNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_FORMAL_IMPLEMENTATION_COMMIT}"',
-            first,
-        )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
-        self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
-
-    def test_pinned_first_cell_passes_its_own_guard(self):
-        notebook, _ = load(FORMAL)
-        first = "".join(notebook["cells"][0]["source"])
-        namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_FORMAL_IMPLEMENTATION_COMMIT,
-        )
+        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
 
     def test_three_seed_loop_is_present(self):
         _, code = load(FORMAL)

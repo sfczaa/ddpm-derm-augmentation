@@ -3554,8 +3554,65 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             self.assertNotIn("account_label", checkpoint["run_identity"])
             self.assertNotIn("hostname", checkpoint["run_identity"])
 
+    def _formal_identity(self, seed: int, **overrides):
+        kwargs = dict(
+            git_commit=self.COMMIT,
+            seed=seed,
+            epochs=50,
+            evaluation_scope="validation_only",
+            checkpoint_sha256="a" * 64,
+            model_identity={"arch": "panderm_base_vit_b16"},
+            manifest_sha256={"train": "t", "val": "v"},
+            fixed_split_identity="t",
+            shared_root_uuid=self.ROOT_UUID,
+            formal_output_identity="o",
+            dependency_versions={},
+            warmup_epochs=10,
+        )
+        kwargs.update(overrides)
+        return panderm_run.build_run_identity(**kwargs)
 
+    def test_bind_run_identity_allows_cross_seed_binding_in_same_session(self):
+        """Cross-seed formal loop binding must not trip identity drift."""
+        identity_seed_0 = self._formal_identity(0)
+        identity_seed_1 = self._formal_identity(1)
+        session_hash = panderm_run.session_scope_identity_sha256(identity_seed_0)
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, _ = self._session_paths(temporary)
+            session = str(uuid.uuid4())
+            self._start(marker, history, session_hash, "A", session)
+            guard = self._guard(marker, session_hash, session)
+            guard.bind_run_identity(identity_seed_0)
+            guard.bind_run_identity(identity_seed_1)
 
+    def test_bind_run_identity_still_rejects_non_seed_identity_drift(self):
+        """Mismatched non-seed fields must still raise active session drift error."""
+        identity_seed_0 = self._formal_identity(0)
+        drifted_identity = self._formal_identity(0, checkpoint_sha256="b" * 64)
+        session_hash = panderm_run.session_scope_identity_sha256(identity_seed_0)
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, _ = self._session_paths(temporary)
+            session = str(uuid.uuid4())
+            self._start(marker, history, session_hash, "A", session)
+            guard = self._guard(marker, session_hash, session)
+            guard.bind_run_identity(identity_seed_0)
+            with self.assertRaisesRegex(
+                ValueError, "active session run identity does not match this process"
+            ):
+                guard.bind_run_identity(drifted_identity)
+
+    def test_session_scope_identity_sha256_excludes_only_seed(self):
+        """session_scope_identity_sha256 ignores seed while canonical_identity_sha256 includes it."""
+        identity_seed_0 = self._formal_identity(0)
+        identity_seed_1 = self._formal_identity(1)
+        self.assertEqual(
+            panderm_run.session_scope_identity_sha256(identity_seed_0),
+            panderm_run.session_scope_identity_sha256(identity_seed_1),
+        )
+        self.assertNotEqual(
+            panderm_run.canonical_identity_sha256(identity_seed_0),
+            panderm_run.canonical_identity_sha256(identity_seed_1),
+        )
 
 
 class IdentityAdversarialMatrixTests(unittest.TestCase):
