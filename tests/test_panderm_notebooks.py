@@ -45,7 +45,6 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "a1b1f863523f9a9f177b1946dd1212433e8d8651"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -625,12 +624,13 @@ class Phase2ManifestBindingTests(unittest.TestCase):
                 "--accumulation-steps must be exactly 8",
             ),
             (["--batch-size", "0"], "--batch-size must be exactly 16"),
-            (["--warmup-epochs", "999"], "--warmup-epochs must be exactly 5"),
+            (["--warmup-epochs", "999"], "must together be exactly the"),
             (["--evaluation-scope", "full"], "invalid choice"),
             (["--drop-path", "0.3"], "unrecognized arguments"),
             (["--no-amp"], "unrecognized arguments"),
-            (["--seed", "1"], "--seed must be exactly 0"),
-            (["--epochs", "50"], "--epochs must be exactly 5"),
+            (["--seed", "1"], "must together be exactly the"),
+            (["--epochs", "50"], "must together be exactly the"),
+            (["--epochs", "50", "--warmup-epochs", "5"], "must together be exactly the"),
         )
         for extra, expected_error in cases:
             with self.subTest(extra=extra):
@@ -726,34 +726,31 @@ class Phase2ManifestBindingTests(unittest.TestCase):
 
 
 class ValidationNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
-        """A published notebook must name the exact reviewed commit.
+    def test_first_cell_is_an_unpinned_implementation_candidate(self):
+        """A candidate must remain fail-loud until its reviewed commit exists.
 
-        Colab clones the repository and checks this value out detached, so the
-        pin is the only thing tying a real run to code that passed review. The
-        placeholder must be gone rather than merely accompanied.
+        The publication step replaces this placeholder only after push.
         """
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
         self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
             first,
         )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
         self.assertIn("Pin the reviewed pushed commit", first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(VALIDATION)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Pin the reviewed pushed commit",
+        ):
+            exec(compile(first, "cell-0", "exec"), namespace)
 
     @staticmethod
     def _phase0_shared_root_rebind():
@@ -1822,47 +1819,50 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
         )
 
 
-class StopDecisionNotebookTests(unittest.TestCase):
-    def test_first_substantive_cell_is_the_exact_fail_loud_stop(self):
-        notebook, code = load(FORMAL)
+class FormalNotebookTests(unittest.TestCase):
+    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
+        notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(
-            panderm_run.PROHIBITED_FORMAL_TEST_REASON,
-            first,
-        )
-        self.assertIn("raise RuntimeError(STOP_REASON)", first)
-        self.assertLess(first.index("STOP_REASON"), first.index("raise RuntimeError"))
+        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
 
-    def test_stop_notebook_has_no_bypass_helper(self):
-        notebook, code = load(FORMAL)
-        raw = "\n".join(
-            "".join(cell.get("source", [])) for cell in notebook["cells"]
-        )
+    def test_three_seed_loop_is_present(self):
+        _, code = load(FORMAL)
+        self.assertIn("for seed in SEEDS:", code)
+
+    def test_aggregate_results_called_once_after_seed_loop(self):
+        _, code = load(FORMAL)
+        self.assertEqual(code.count("panderm_run.aggregate_results("), 1)
+        seed_loop_pos = code.find("for seed in SEEDS:")
+        agg_pos = code.find("panderm_run.aggregate_results(")
+        self.assertGreater(agg_pos, seed_loop_pos)
+
+    def test_require_active_session_present_at_durable_boundaries(self):
+        _, code = load(FORMAL)
+        self.assertGreaterEqual(code.count("require_active_session"), 3)
+
+    def test_evaluation_scope_always_validation_only_and_full_never_appears(self):
+        _, code = load(FORMAL)
+        self.assertIn('"--evaluation-scope", "validation_only"', code)
+        self.assertNotIn('"--evaluation-scope", "full"', code)
+        self.assertNotIn('evaluation_scope="full"', code)
+
+    def test_formal_training_confirmed_present(self):
+        _, code = load(FORMAL)
+        self.assertIn("FORMAL_TRAINING_CONFIRMED = True", code)
+
+    def test_forbidden_operations_absent(self):
+        _, code = load(FORMAL)
         for forbidden in (
-            "ddpm_derm.train_panderm",
-            "--evaluation-scope",
-            "load_split",
-            "test.csv",
-            "test_metrics",
-            "run_queue",
-            "aggregate_results",
-            "validate_completed",
-            "create_running_marker",
-            "torch.load",
-            "subprocess",
-            "gdown",
+            'load_split("test")',
+            'manifests.load_split("test")',
+            '"--evaluation-scope", "full"',
+            "scripts/smoke_test.py",
         ):
-            self.assertNotIn(forbidden, code)
-        for required in (
-            "STOP / DECISION",
-            "formal_training_allowed=False",
-            "test_access_allowed=False",
-            "no training, resume, aggregation",
-            "CC BY-NC-ND 4.0",
-            "must not be shared or deployed",
-        ):
-            self.assertIn(required, raw)
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, code)
+        self.assertNotIn('test_metrics": {', code)
 
 
 class ProtectedArtifactTests(unittest.TestCase):

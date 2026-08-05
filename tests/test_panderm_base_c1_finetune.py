@@ -1923,10 +1923,125 @@ class NonCollapseGateTests(unittest.TestCase):
         )
 
 
-class AggregationTests(unittest.TestCase):
-    def test_formal_aggregation_always_fails_loud(self):
-        with self.assertRaisesRegex(ValueError, "independently unauditable"):
-            panderm_run.aggregate_results([])
+class AggregateResultsTests(unittest.TestCase):
+    def _synthetic_run(self, seed, **overrides):
+        base_id = {
+            "schema_version": 1,
+            "git_commit": "c" * 40,
+            "run_version": panderm_run.RUN_VERSION,
+            "upstream_repo": panderm_run.UPSTREAM_REPO,
+            "upstream_commit": panderm_run.UPSTREAM_COMMIT,
+            "checkpoint_filename": panderm_run.CHECKPOINT_FILENAME,
+            "checkpoint_source_url": panderm_run.CHECKPOINT_SOURCE_URL,
+            "checkpoint_sha256": "a" * 64,
+            "checkpoint_sha256_provenance": panderm_run.CHECKPOINT_SHA256_PROVENANCE,
+            "checkpoint_format": panderm_run.CHECKPOINT_FORMAT,
+            "model_identity": {"arch": "panderm_base_vit_b16"},
+            "variant": panderm_run.VARIANT,
+            "seed": seed,
+            "fixed_split_identity": "fixed-split-sha",
+            "manifest_sha256": {"train": "t", "val": "v"},
+            "c1_construction": {"df_target_count": 585},
+            "objective": {"num_classes": 7},
+            "optimization": {"learning_rate": 5e-4},
+            "dependency_versions": {"torch": "2.2.0"},
+            "shared_root_uuid": "shared-uuid",
+            "formal_output_identity": "formal-identity",
+            "evaluation_scope": panderm_run.VALIDATION_ONLY,
+            "license_review": {"license": "CC-BY-NC-ND-4.0"},
+            "contamination_review": {"patient_level_overlap": "not_excludable"},
+            "claim_boundary": panderm_run.CLAIM_BOUNDARY,
+        }
+        val_metrics = {
+            "target_f1": 0.5 + seed * 0.1,
+            "macro_f1": 0.6 + seed * 0.05,
+            "target_recall": 0.4 + seed * 0.1,
+            "per_class_recall": {
+                "akiec": 0.5, "bcc": 0.6, "bkl": 0.7, "df": 0.4 + seed * 0.1,
+                "mel": 0.8, "nv": 0.9, "vasc": 0.3,
+            },
+            "confusion_matrix": [[10] * 7] * 7,
+        }
+        run = {
+            "seed": seed,
+            "variant": panderm_run.VARIANT,
+            "evaluation_scope": panderm_run.VALIDATION_ONLY,
+            "test_metrics": None,
+            "claim_boundary": panderm_run.CLAIM_BOUNDARY,
+            "validation_metrics": val_metrics,
+            "run_identity": base_id,
+        }
+        for key, val in overrides.items():
+            if key in run:
+                run[key] = val
+            if key in base_id:
+                base_id[key] = val
+        return run
+
+    def test_aggregate_results_happy_path(self):
+        runs = [self._synthetic_run(seed) for seed in (0, 1, 2)]
+        agg = panderm_run.aggregate_results(runs)
+        self.assertEqual(agg["variant"], panderm_run.VARIANT)
+        self.assertEqual(agg["seeds"], [0, 1, 2])
+        self.assertEqual(agg["evaluation_scope"], panderm_run.VALIDATION_ONLY)
+        self.assertIsNone(agg["test_metrics"])
+        self.assertTrue(agg["formal_training_allowed"])
+        self.assertFalse(agg["test_access_allowed"])
+        self.assertEqual(agg["claim_boundary"], panderm_run.CLAIM_BOUNDARY)
+
+        # Values: [0.5, 0.6, 0.7] -> mean = 0.6
+        df_f1 = agg["validation_metrics"]["df_f1"]
+        self.assertEqual(df_f1["values"], [0.5, 0.6, 0.7])
+        self.assertAlmostEqual(df_f1["mean"], 0.6)
+        self.assertAlmostEqual(df_f1["population_std"], 0.08164965809277261)
+
+    def test_aggregate_results_missing_duplicate_or_extra_seeds_rejected(self):
+        # Missing seed 2
+        with self.assertRaisesRegex(ValueError, "expected exactly the"):
+            panderm_run.aggregate_results([self._synthetic_run(0), self._synthetic_run(1)])
+
+        # Duplicate seed 0
+        with self.assertRaisesRegex(ValueError, "expected exactly the"):
+            panderm_run.aggregate_results([self._synthetic_run(0), self._synthetic_run(0), self._synthetic_run(1)])
+
+        # Extra seed 3
+        with self.assertRaisesRegex(ValueError, "expected exactly the"):
+            panderm_run.aggregate_results([self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2), self._synthetic_run(3)])
+
+    def test_aggregate_results_wrong_variant_rejected(self):
+        runs = [self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2, variant="C2")]
+        with self.assertRaisesRegex(ValueError, "refusing to aggregate non-C1 variants"):
+            panderm_run.aggregate_results(runs)
+
+    def test_aggregate_results_full_evaluation_scope_rejected(self):
+        runs = [self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2, evaluation_scope="full")]
+        with self.assertRaisesRegex(ValueError, "PanDerm v1 formal aggregation must stay validation_only"):
+            panderm_run.aggregate_results(runs)
+
+    def test_aggregate_results_non_none_test_metrics_rejected(self):
+        runs = [self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2, test_metrics={"accuracy": 0.9})]
+        with self.assertRaisesRegex(ValueError, "test access is prohibited"):
+            panderm_run.aggregate_results(runs)
+
+    def test_aggregate_results_claim_boundary_drift_rejected(self):
+        runs = [self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2, claim_boundary="unrestricted")]
+        with self.assertRaisesRegex(ValueError, "refusing to aggregate mixed claim boundaries"):
+            panderm_run.aggregate_results(runs)
+
+    def test_aggregate_results_identity_drift_matrix_rejects_24_of_24(self):
+        non_seed_keys = [key for key in panderm_run.IMMUTABLE_IDENTITY_KEYS if key != "seed"]
+        self.assertEqual(len(non_seed_keys), 24)
+        rejection_count = 0
+        for key in non_seed_keys:
+            runs = [self._synthetic_run(0), self._synthetic_run(1), self._synthetic_run(2)]
+            # Drift run 2's key in its run_identity
+            runs[2]["run_identity"][key] = "DRIFTED_VALUE"
+            try:
+                panderm_run.aggregate_results(runs)
+            except ValueError as error:
+                if "drifted identity" in str(error):
+                    rejection_count += 1
+        self.assertEqual(rejection_count, 24)
 
 
 class OutputIsolationTests(unittest.TestCase):
