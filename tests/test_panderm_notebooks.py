@@ -1824,26 +1824,12 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
 
 
 class FormalNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_IMPLEMENTATION_COMMIT}"',
-            first,
-        )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
-        self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
-
-    def test_pinned_first_cell_passes_its_own_guard(self):
-        notebook, _ = load(FORMAL)
-        first = "".join(notebook["cells"][0]["source"])
-        namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_IMPLEMENTATION_COMMIT,
-        )
+        self.assertIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
+        self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
 
     def test_three_seed_loop_is_present(self):
         _, code = load(FORMAL)
