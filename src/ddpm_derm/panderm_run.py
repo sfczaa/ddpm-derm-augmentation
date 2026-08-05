@@ -2898,6 +2898,22 @@ def canonical_identity_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# A sequential formal session spans multiple seeds (see KNOWN_TRAINING_SCALES);
+# seed is the only field expected to vary within one session's lifetime, so the
+# write guard binds against the run identity with that one field excluded.
+SESSION_SCOPE_IDENTITY_EXCLUDED_KEYS = frozenset({"seed"})
+
+
+def session_scope_identity_sha256(run_identity: Mapping[str, Any]) -> str:
+    """Session-level identity: the run identity minus the per-seed axis."""
+    scoped = {
+        key: value
+        for key, value in run_identity.items()
+        if key not in SESSION_SCOPE_IDENTITY_EXCLUDED_KEYS
+    }
+    return canonical_identity_sha256(scoped)
+
+
 # Google Drive FUSE can answer ENOENT for a path os.replace already published,
 # so the readback needs a bounded wait rather than a single attempt.
 DRIVE_VISIBILITY_TIMEOUT_SECONDS = 120.0
@@ -3513,7 +3529,7 @@ class SequentialSessionWriteGuard:
         )
 
     def bind_run_identity(self, run_identity: Mapping[str, Any]) -> None:
-        observed = canonical_identity_sha256(run_identity)
+        observed = session_scope_identity_sha256(run_identity)
         if observed != self._values["run_identity_sha256"]:
             raise ValueError("active session run identity does not match this process")
         self.require("bind immutable run identity")
