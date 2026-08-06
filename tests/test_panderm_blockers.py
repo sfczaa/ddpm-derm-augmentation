@@ -2295,6 +2295,47 @@ class SequentialHandoffTests(unittest.TestCase):
             self.assertEqual(active_b["session_id"], session_b)
             self.assertTrue(abandoned_temp.is_file())
 
+    def test_takeover_chain_through_a_graceful_completion_is_not_a_contradiction(self):
+        """A takeover's replacement can complete gracefully instead of being retaken.
+
+        Real history: session 1 is takeover-replaced by session 2, session 2
+        later completes gracefully (marker removed), session 3 starts fresh
+        with no takeover audit of its own, then session 3 is abruptly
+        abandoned and session 4 takes over. Session 4's takeover walks the
+        *entire* history, including session 1's audit naming session 2 as its
+        replacement. Session 2 was never itself named in a later takeover
+        audit, only in a graceful completion record, so the chain-
+        contradiction check must still accept it instead of misreading
+        ordinary history as tampering.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            marker, history, run_hash = self._paths(temporary)
+            session_1 = str(uuid.uuid4())
+            session_2 = str(uuid.uuid4())
+            session_3 = str(uuid.uuid4())
+            session_4 = str(uuid.uuid4())
+            self._start(marker, history, run_hash, "A", session_1)
+            self._start(marker, history, run_hash, "B", session_2, takeover=True)
+            panderm_run.complete_sequential_session(
+                marker,
+                session_id=session_2,
+                history_directory=history,
+                checkpoint_integrity={"epoch": 5, "global_step": 40, "sha256": "b" * 64},
+                result_identity={
+                    "epoch": 5, "global_step": 40, "run_identity_sha256": run_hash,
+                },
+            )
+            self._start(marker, history, run_hash, "C", session_3)
+            active_4 = self._start(
+                marker, history, run_hash, "A", session_4, takeover=True
+            )
+            self.assertEqual(active_4["session_id"], session_4)
+            audit_1 = json.loads(
+                (history / f"{session_1}.takeover.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(audit_1["replacement_session_id"], session_2)
+            self.assertTrue((history / f"{session_2}.completed.json").is_file())
+
     def test_conflicting_audit_blocks_takeover_without_replacing_marker(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker, history, run_hash = self._paths(temporary)
