@@ -2142,6 +2142,7 @@ def require_shared_root_sentinel_identity(
 ACTIVE_SESSION_FILENAME = "active_session.json"
 SESSION_HISTORY_DIRECTORY = "session_history"
 TAKEOVER_AUDIT_SUFFIX = ".takeover.json"
+GRACEFUL_HANDOFF_AUDIT_SUFFIX = ".completed.json"
 MANUAL_TAKEOVER_CONFIRMATION = "I CONFIRM THE PREVIOUS RUNTIME IS STOPPED"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DRIVE_JSON_MIME_TYPE = "application/json"
@@ -3119,6 +3120,56 @@ def _read_takeover_audit_history(
     return history
 
 
+def _read_graceful_completion_session_ids(history_directory: Path) -> set[str]:
+    """Sessions retired by a verified graceful handoff, not by a takeover.
+
+    A takeover audit's replacement is not always taken over in turn — it can
+    instead run to completion and hand the marker back cleanly, after which a
+    later session starts fresh with no takeover audit of its own. That
+    replacement is just as retired as one named in a later takeover audit, so
+    the takeover-chain contradiction check must recognise this path too or it
+    misreads ordinary history as evidence of tampering.
+    """
+    session_ids: set[str] = set()
+    for path in sorted(history_directory.glob(f"*{GRACEFUL_HANDOFF_AUDIT_SUFFIX}")):
+        record = _read_existing_audit_event(path)
+        if record is None:
+            continue
+        if set(record) != set(GRACEFUL_HANDOFF_STABLE_FIELDS):
+            raise ValueError(
+                f"graceful handoff audit schema mismatch at {path}; inspect manually"
+            )
+        if record["schema_version"] != 1:
+            raise ValueError(
+                "graceful handoff audit schema_version mismatch: "
+                f"saved={record['schema_version']!r} expected=1: {path}"
+            )
+        subject = record.get("active_session")
+        subject_id = (
+            subject.get("session_id") if isinstance(subject, Mapping) else None
+        )
+        if type(subject_id) is not str or not subject_id:
+            raise ValueError(
+                f"graceful handoff audit has no usable session id: {path}"
+            )
+        if path.name != f"{subject_id}{GRACEFUL_HANDOFF_AUDIT_SUFFIX}":
+            raise ValueError(
+                f"graceful handoff audit name disagrees with its session: {path}"
+            )
+        # Mirrors _read_takeover_audit_history: the graceful path already
+        # revalidates its own retired marker through _read_active_session, so
+        # this audit's stored snapshot must be held to the same schema instead
+        # of being trusted as-is.
+        try:
+            _validate_active_session_marker(subject, marker_path=path)
+        except ValueError as error:
+            raise ValueError(
+                f"graceful handoff audit session is unusable: {path}: {error}"
+            ) from error
+        session_ids.add(subject_id)
+    return session_ids
+
+
 def _adopt_published_takeover_replacement(
     history_directory: Path,
     *,
@@ -3178,7 +3229,7 @@ def _adopt_published_takeover_replacement(
     history = _read_takeover_audit_history(history_directory)
     retired = {
         record["previous_active_session"]["session_id"] for _, record in history
-    }
+    } | _read_graceful_completion_session_ids(history_directory)
     replacements: list[tuple[Path, dict[str, Any]]] = []
     for path, record in history:
         if record["previous_active_session"]["session_id"] == current_session_id:
@@ -3430,7 +3481,7 @@ def complete_sequential_session(
         raise FileNotFoundError(
             f"session history directory is missing: {history_directory}"
         )
-    completion_path = history_directory / f"{session_id}.completed.json"
+    completion_path = history_directory / f"{session_id}{GRACEFUL_HANDOFF_AUDIT_SUFFIX}"
     snapshot_path = history_directory / f"{session_id}.active.json"
     published = _read_existing_audit_event(completion_path)
 
