@@ -265,6 +265,34 @@ def is_pinned_sha256(value: Any) -> bool:
     )
 
 
+def is_pinned_git_commit(value: Any) -> bool:
+    """True only for a real 40-char lowercase commit SHA."""
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def normalize_commit_carry_forward(value: Any) -> str:
+    """Normalise an authorized carry-forward commit to "" or a full SHA.
+
+    Absent authorization is the default and must stay indistinguishable from
+    an empty string, so a caller that forwards ``None`` cannot accidentally
+    weaken an identity check. Anything else has to be a real pinned commit:
+    a truncated or uppercase value would silently never match and turn a
+    deliberate human authorization into a confusing identity failure.
+    """
+    if value is None or value == "":
+        return ""
+    if not is_pinned_git_commit(value):
+        raise ValueError(
+            "authorized commit carry-forward must be empty or a full lowercase "
+            f"40-character commit SHA, got {value!r}"
+        )
+    return str(value)
+
+
 def write_json_atomic(
     path: str | Path,
     value: Mapping[str, Any],
@@ -318,6 +346,7 @@ def write_monotonic_run_record_atomic(
     value: Mapping[str, Any],
     *,
     write_guard: Callable[[str], Any],
+    authorized_commit_carry_forward: Any = None,
 ) -> None:
     """Publish one run history without rollback, truncation, or cross-run drift."""
     path = Path(path)
@@ -352,7 +381,9 @@ def write_monotonic_run_record_atomic(
         if not isinstance(existing, dict) or not required.issubset(existing):
             raise ValueError("existing run record schema is invalid")
         require_matching_identity(
-            existing["run_identity"], record["run_identity"]
+            existing["run_identity"],
+            record["run_identity"],
+            authorized_commit_carry_forward=authorized_commit_carry_forward,
         )
         existing_position = (existing["epoch"], existing["global_step"])
         new_position = (epoch, global_step)
@@ -1989,8 +2020,47 @@ def build_run_identity(
     return identity
 
 
+def accepts_commit_carry_forward(
+    saved: Mapping[str, Any],
+    current: Mapping[str, Any],
+    authorized_commit_carry_forward: Any = None,
+    *,
+    keys: Sequence[str] | None = None,
+) -> bool:
+    """True only for a saved artifact that drifted in ``git_commit`` alone.
+
+    ``git_commit`` is a deliberate identity-drift field for this project, so a
+    code fix normally orphans every artifact written before it. This is the one
+    narrow, human-authorized exception: the operator names the exact old commit
+    they reviewed as orchestration-only, and the artifact is accepted only when
+    that commit is what it actually carries **and** every other compared field
+    still matches exactly. It is never a general relaxation -- any second
+    difference, or an unnamed old commit, still fails.
+
+    ``keys`` selects what "every other field" means: the default is
+    :data:`IMMUTABLE_IDENTITY_KEYS`, and ``()`` compares the full mappings
+    instead, for callers that already require more than the immutable subset
+    to agree.
+    """
+    authorized = normalize_commit_carry_forward(authorized_commit_carry_forward)
+    if not authorized:
+        return False
+    if saved.get("git_commit") != authorized:
+        return False
+    if keys is None:
+        keys = IMMUTABLE_IDENTITY_KEYS
+    elif not keys:
+        keys = sorted(set(saved) | set(current))
+    return all(
+        saved.get(key) == current.get(key) for key in keys if key != "git_commit"
+    )
+
+
 def require_matching_identity(
-    saved: Mapping[str, Any], current: Mapping[str, Any]
+    saved: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    authorized_commit_carry_forward: Any = None,
 ) -> None:
     """Reject a resume/verification before any state is loaded or mutated."""
     require_expected_identity_complete(current)
@@ -2005,6 +2075,10 @@ def require_matching_identity(
         for key in IMMUTABLE_IDENTITY_KEYS
         if saved[key] != current.get(key)
     ]
+    if mismatches and accepts_commit_carry_forward(
+        saved, current, authorized_commit_carry_forward
+    ):
+        return
     if mismatches:
         raise ValueError("PanDerm identity mismatch: " + "; ".join(mismatches))
 
@@ -2025,6 +2099,7 @@ def require_identity_duplicates(
     record: Mapping[str, Any],
     nested: Mapping[str, Any],
     top_level: Mapping[str, Any],
+    authorized_commit_carry_forward: Any = None,
 ) -> None:
     """Require the record, its nested identity and top-level duplicates to agree.
 
@@ -2043,8 +2118,14 @@ def require_identity_duplicates(
         if nested.get(key) != top_level.get(key)
     ]
     if drift:
+        # Both duplicates live inside one record, so they always carry the same
+        # commit. A disagreement here is tampering, never carry-forward drift.
         raise ValueError("duplicated identity drift: " + "; ".join(drift))
-    require_matching_identity(nested, expected)
+    require_matching_identity(
+        nested,
+        expected,
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
+    )
     if record.get("run_version") != expected.get("run_version"):
         raise ValueError(
             f"record run_version {record.get('run_version')!r} does not match "
@@ -2058,6 +2139,7 @@ def require_completed_artifact_identities(
     result: Mapping[str, Any],
     best_checkpoint: Mapping[str, Any],
     last_checkpoint: Mapping[str, Any],
+    authorized_commit_carry_forward: Any = None,
 ) -> None:
     """Validate result/best/last against the current complete identity."""
     require_expected_identity_complete(expected)
@@ -2074,6 +2156,7 @@ def require_completed_artifact_identities(
         record=result,
         nested=nested,
         top_level=top_level,
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
     for label, checkpoint in (
         ("best.pt", best_checkpoint),
@@ -2082,8 +2165,18 @@ def require_completed_artifact_identities(
         identity = checkpoint.get("run_identity")
         if not isinstance(identity, Mapping):
             raise ValueError(f"{label} is missing run_identity")
-        require_matching_identity(identity, expected)
-        if dict(identity) != dict(nested):
+        require_matching_identity(
+            identity,
+            expected,
+            authorized_commit_carry_forward=authorized_commit_carry_forward,
+        )
+        # A carried-forward run finishes under the new commit while an earlier
+        # epoch can still hold the best checkpoint, so result and checkpoint
+        # legitimately disagree on git_commit alone. Every other key -- including
+        # the non-immutable ones -- must still be identical.
+        if dict(identity) != dict(nested) and not accepts_commit_carry_forward(
+            identity, nested, authorized_commit_carry_forward, keys=()
+        ):
             raise ValueError(f"{label} identity does not equal result identity")
 
 
@@ -2143,7 +2236,11 @@ ACTIVE_SESSION_FILENAME = "active_session.json"
 SESSION_HISTORY_DIRECTORY = "session_history"
 TAKEOVER_AUDIT_SUFFIX = ".takeover.json"
 GRACEFUL_HANDOFF_AUDIT_SUFFIX = ".completed.json"
+COMMIT_CARRY_FORWARD_AUDIT_SUFFIX = ".carry_forward.json"
 MANUAL_TAKEOVER_CONFIRMATION = "I CONFIRM THE PREVIOUS RUNTIME IS STOPPED"
+COMMIT_CARRY_FORWARD_CONFIRMATION = (
+    "I CONFIRM THIS COMMIT CHANGED ORCHESTRATION ONLY"
+)
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DRIVE_JSON_MIME_TYPE = "application/json"
 DRIVE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
@@ -2174,6 +2271,18 @@ ACTIVE_SESSION_FIELDS = (
 )
 GRACEFUL_HANDOFF_EVENT = "graceful_handoff_complete"
 MANUAL_TAKEOVER_EVENT = "manual_takeover"
+COMMIT_CARRY_FORWARD_EVENT = "commit_carry_forward"
+COMMIT_CARRY_FORWARD_STABLE_FIELDS = (
+    "schema_version",
+    "event",
+    "event_id",
+    "confirmation",
+    "confirmed_utc",
+    "carried_forward_commit",
+    "current_commit",
+    "run_version",
+    "shared_root_uuid",
+)
 GRACEFUL_HANDOFF_STABLE_FIELDS = (
     "schema_version",
     "event",
@@ -3077,6 +3186,69 @@ def _publish_audit_event_once(
     return published
 
 
+def publish_commit_carry_forward_audit(
+    history_directory: str | Path,
+    *,
+    carried_forward_commit: str,
+    current_commit: str,
+    run_version: str,
+    shared_root_uuid: str,
+) -> dict[str, Any]:
+    """Record the human authorization to accept one old commit's artifacts.
+
+    ``git_commit`` is an immutable identity field on purpose, so accepting an
+    artifact stamped with an older one is a policy decision a human made after
+    reviewing that diff -- not something the code may infer. This publishes that
+    decision durably next to the takeover and graceful-handoff audits, keyed on
+    the old->new commit pair so re-running the same authorization (every later
+    seed re-verifies the carried-forward ones) reproduces one identical record
+    instead of minting a second event.
+    """
+    history_directory = Path(history_directory)
+    if not history_directory.is_dir():
+        raise FileNotFoundError(
+            f"session history directory is missing: {history_directory}"
+        )
+    carried_forward_commit = normalize_commit_carry_forward(carried_forward_commit)
+    if not carried_forward_commit:
+        raise ValueError("a carry-forward audit needs the authorized old commit")
+    if not is_pinned_git_commit(current_commit):
+        raise ValueError("a carry-forward audit needs the current commit")
+    if carried_forward_commit == current_commit:
+        raise ValueError(
+            "carry-forward from the current commit is a no-op; refusing to "
+            "publish an audit that authorizes nothing"
+        )
+    subject = f"{carried_forward_commit}->{current_commit}"
+    # The filename spells the same pair with "__": this directory is a Google
+    # Drive mount and ">" is not a legal Windows filename character.
+    audit_path = history_directory / (
+        f"{carried_forward_commit}__{current_commit}"
+        f"{COMMIT_CARRY_FORWARD_AUDIT_SUFFIX}"
+    )
+    published = _read_existing_audit_event(audit_path)
+    audit = {
+        "schema_version": 1,
+        "event": COMMIT_CARRY_FORWARD_EVENT,
+        "event_id": audit_event_id(
+            COMMIT_CARRY_FORWARD_EVENT,
+            run_version=str(run_version),
+            subject_session_id=subject,
+        ),
+        "confirmation": COMMIT_CARRY_FORWARD_CONFIRMATION,
+        "confirmed_utc": _reused_audit_timestamp(
+            published, "confirmed_utc", audit_path
+        ),
+        "carried_forward_commit": carried_forward_commit,
+        "current_commit": str(current_commit),
+        "run_version": str(run_version),
+        "shared_root_uuid": str(shared_root_uuid),
+    }
+    return _publish_audit_event_once(
+        audit_path, audit, stable_fields=COMMIT_CARRY_FORWARD_STABLE_FIELDS
+    )
+
+
 def _read_takeover_audit_history(
     history_directory: Path,
 ) -> list[tuple[Path, dict[str, Any]]]:
@@ -3712,7 +3884,11 @@ def evaluate_non_collapse_gate(
     return checks
 
 
-def aggregate_results(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def aggregate_results(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    authorized_commit_carry_forward: Any = None,
+) -> dict[str, Any]:
     """Aggregate the 3 formal C1 seeds into mean/population_std only.
 
     No bootstrap CI, no significance testing. Every run must still be
@@ -3746,12 +3922,29 @@ def aggregate_results(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     # Cross-run identity consistency: everything in IMMUTABLE_IDENTITY_KEYS
     # except "seed" must be pairwise identical -- these 3 runs are the SAME
     # experiment, differing only by seed.
-    identity_keys = [key for key in IMMUTABLE_IDENTITY_KEYS if key != "seed"]
+    authorized = normalize_commit_carry_forward(authorized_commit_carry_forward)
+    identity_keys = [
+        key
+        for key in IMMUTABLE_IDENTITY_KEYS
+        if key != "seed" and not (authorized and key == "git_commit")
+    ]
     reference = {key: runs[0]["run_identity"].get(key) for key in identity_keys}
     for run in runs[1:]:
         current = {key: run["run_identity"].get(key) for key in identity_keys}
         if current != reference:
             raise ValueError("refusing to aggregate seed runs with drifted identity")
+    if authorized:
+        # An authorized carry-forward lets seeds completed before the fix keep
+        # their old commit, so exactly two commits may appear: the authorized
+        # one and the single commit every remaining seed ran under. A third
+        # commit is real drift and is still refused.
+        commits = {run["run_identity"].get("git_commit") for run in runs}
+        if len(commits - {authorized}) > 1:
+            raise ValueError(
+                "refusing to aggregate seed runs with drifted identity: "
+                f"git_commit values {sorted(map(str, commits))} exceed the one "
+                f"authorized carry-forward from {authorized}"
+            )
 
     output: dict[str, Any] = {
         "ddof": 0,

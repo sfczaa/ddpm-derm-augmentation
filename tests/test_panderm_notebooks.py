@@ -46,7 +46,6 @@ PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
 PINNED_IMPLEMENTATION_COMMIT = "45751eb317230b6eb2691c359c24f6f85ae2dc49"
-PINNED_FORMAL_IMPLEMENTATION_COMMIT = "45751eb317230b6eb2691c359c24f6f85ae2dc49"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -1825,26 +1824,111 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
 
 
 class FormalNotebookTests(unittest.TestCase):
-    def test_first_cell_is_pinned_to_the_implementation_commit(self):
+    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(
-            f'EXPECTED_GIT_COMMIT = "{PINNED_FORMAL_IMPLEMENTATION_COMMIT}"',
-            first,
-        )
-        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
 
-    def test_pinned_first_cell_passes_its_own_guard(self):
+    def test_unpinned_first_cell_fails_its_own_guard(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        exec(compile(first, "cell-0", "exec"), namespace)
-        self.assertEqual(
-            namespace["EXPECTED_GIT_COMMIT"],
-            PINNED_FORMAL_IMPLEMENTATION_COMMIT,
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Pin the reviewed pushed commit",
+        ):
+            exec(compile(first, "cell-0", "exec"), namespace)
+
+    def test_commit_carry_forward_is_an_empty_human_set_cell_zero_variable(self):
+        """The carve-out is only ever opened by a human, per run.
+
+        git_commit is a deliberate immutable identity field, so a default that
+        carried any commit forward would silently turn the one narrow audited
+        exception into a permanent bypass. It has to ship empty, be rejected
+        unless it is a real commit, and never name the pinned commit itself
+        (which would authorize nothing while masking a real identity failure).
+        """
+        notebook, _ = load(FORMAL)
+        first = "".join(notebook["cells"][0]["source"])
+        self.assertIn('COMMIT_CARRY_FORWARD_FROM = ""', first)
+        self.assertIn(
+            "COMMIT_CARRY_FORWARD_FROM != EXPECTED_GIT_COMMIT", first
         )
+        namespace = {}
+        exec(
+            compile(
+                first.replace(
+                    f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
+                    f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
+                ),
+                "cell-0",
+                "exec",
+            ),
+            namespace,
+        )
+        self.assertEqual(namespace["COMMIT_CARRY_FORWARD_FROM"], "")
+
+    def test_cell_zero_rejects_a_malformed_or_self_naming_carry_forward(self):
+        notebook, _ = load(FORMAL)
+        first = "".join(notebook["cells"][0]["source"]).replace(
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
+            f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
+        )
+        for value, expected in (
+            ("45751eb", "must be empty or a full lowercase commit SHA"),
+            ("A" * 40, "must be empty or a full lowercase commit SHA"),
+            ("a" * 40, "authorizes nothing"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, expected):
+                    exec(
+                        compile(
+                            first.replace(
+                                'COMMIT_CARRY_FORWARD_FROM = ""',
+                                f'COMMIT_CARRY_FORWARD_FROM = "{value}"',
+                            ),
+                            "cell-0",
+                            "exec",
+                        ),
+                        {},
+                    )
+
+    def test_every_carry_forward_consumer_is_wired_to_the_cell_zero_value(self):
+        """A site left unthreaded fails only after hours of real GPU time.
+
+        The authorization has to reach the trainer, both post-loop
+        verifications and the aggregate, or the run dies at whichever site was
+        missed -- exactly the failure this mechanism exists to prevent.
+        """
+        _, code = load(FORMAL)
+        for call in (
+            '"--authorized-commit-carry-forward", COMMIT_CARRY_FORWARD_FROM',
+            "load_completed_checkpoint_pair_safe(",
+            "require_completed_artifact_identities(",
+            "aggregate_results(",
+        ):
+            with self.subTest(call=call):
+                self.assertIn(call, code)
+        for consumer in (
+            "load_completed_checkpoint_pair_safe",
+            "require_completed_artifact_identities",
+            "aggregate_results",
+        ):
+            with self.subTest(consumer=consumer):
+                start = code.index(consumer)
+                self.assertIn(
+                    "authorized_commit_carry_forward=COMMIT_CARRY_FORWARD_FROM",
+                    code[start : code.index("\n", code.index(")", start))],
+                )
+        self.assertIn("publish_commit_carry_forward_audit(", code)
+
+    def test_carry_forward_audit_is_published_before_any_training(self):
+        _, code = load(FORMAL)
+        audit = code.index("publish_commit_carry_forward_audit(")
+        self.assertGreater(audit, code.index("start_sequential_session("))
+        self.assertLess(audit, code.index("for seed in SEEDS:"))
 
     def test_three_seed_loop_is_present(self):
         _, code = load(FORMAL)
