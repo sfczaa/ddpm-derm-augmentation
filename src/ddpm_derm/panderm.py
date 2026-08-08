@@ -953,6 +953,21 @@ def require_finite(value: float, label: str) -> float:
     return numeric
 
 
+def finite_gradients(parameters: Iterable[nn.Parameter]) -> bool:
+    """True when every populated gradient is finite.
+
+    Callers that are inside an AMP ``GradScaler`` loop want this predicate, not
+    the raising form: an fp16 overflow there is an expected, self-correcting
+    event the scaler handles by skipping the step and backing the scale off.
+    Callers outside one -- a smoke test, or any unscaled step -- want the
+    raising form, because for them a non-finite gradient is a real defect.
+    """
+    return all(
+        parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+        for parameter in parameters
+    )
+
+
 def require_finite_gradients(parameters: Iterable[nn.Parameter]) -> None:
     for parameter in parameters:
         if parameter.grad is not None and not torch.isfinite(parameter.grad).all():

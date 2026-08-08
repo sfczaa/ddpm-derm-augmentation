@@ -621,7 +621,9 @@ def _build_checkpoint_integrity(
     }
 
 
-def checkpoint_integrity_record(path, *, expected_identity=None) -> dict:
+def checkpoint_integrity_record(
+    path, *, expected_identity=None, authorized_commit_carry_forward=None
+) -> dict:
     """Verify sidecar and final checkpoint bytes without deserializing."""
     path = Path(path)
     if not path.is_file():
@@ -636,11 +638,17 @@ def checkpoint_integrity_record(path, *, expected_identity=None) -> dict:
         sidecar_path,
         expected_filename=path.name,
         expected_identity=expected_identity,
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
 
 
 def require_checkpoint_integrity_sidecar(
-    path, sidecar_path, *, expected_filename, expected_identity=None
+    path,
+    sidecar_path,
+    *,
+    expected_filename,
+    expected_identity=None,
+    authorized_commit_carry_forward=None,
 ) -> dict:
     """The one authoritative sidecar validator for a checkpoint's final bytes."""
     path = Path(path)
@@ -693,12 +701,23 @@ def require_checkpoint_integrity_sidecar(
         raise ValueError("checkpoint integrity format mismatch")
     if not panderm_run.is_pinned_sha256(record["run_identity_sha256"]):
         raise ValueError("checkpoint integrity run identity hash is invalid")
-    if (
-        expected_identity is not None
-        and record["run_identity_sha256"]
-        != _canonical_identity_sha256(expected_identity)
-    ):
-        raise ValueError("checkpoint integrity run identity mismatch")
+    if expected_identity is not None:
+        # The sidecar pins a hash, not the fields, so a carry-forward has to be
+        # expressed as the hash of the same identity carrying the authorized old
+        # commit. Substituting the one field keeps every other field pinned by
+        # the digest exactly as before.
+        accepted = {_canonical_identity_sha256(expected_identity)}
+        authorized = panderm_run.normalize_commit_carry_forward(
+            authorized_commit_carry_forward
+        )
+        if authorized:
+            accepted.add(
+                _canonical_identity_sha256(
+                    {**dict(expected_identity), "git_commit": authorized}
+                )
+            )
+        if record["run_identity_sha256"] not in accepted:
+            raise ValueError("checkpoint integrity run identity mismatch")
     return record
 
 
@@ -914,10 +933,13 @@ def load_checkpoint_safe(
     model=None,
     expected_identity=None,
     expected_result_checkpoint=None,
+    authorized_commit_carry_forward=None,
 ):
     """Verify final bytes and sidecar before restricted deserialization."""
     record = checkpoint_integrity_record(
-        path, expected_identity=expected_identity
+        path,
+        expected_identity=expected_identity,
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
     if (
         expected_result_checkpoint is not None
@@ -930,11 +952,18 @@ def load_checkpoint_safe(
         map_location=map_location,
         model=model,
         expected_identity=expected_identity,
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
 
 
 def require_verified_checkpoint_payload(
-    path, record, *, map_location="cpu", model=None, expected_identity=None
+    path,
+    record,
+    *,
+    map_location="cpu",
+    model=None,
+    expected_identity=None,
+    authorized_commit_carry_forward=None,
 ):
     """Deserialize restricted bytes and require exact sidecar/payload agreement."""
     checkpoint = torch.load(path, map_location=map_location, weights_only=True)
@@ -965,7 +994,11 @@ def require_verified_checkpoint_payload(
     if _canonical_identity_sha256(run_identity) != record["run_identity_sha256"]:
         raise ValueError("checkpoint integrity payload identity mismatch")
     if expected_identity is not None:
-        panderm_run.require_matching_identity(run_identity, expected_identity)
+        panderm_run.require_matching_identity(
+            run_identity,
+            expected_identity,
+            authorized_commit_carry_forward=authorized_commit_carry_forward,
+        )
     if model is not None:
         validate_checkpoint_payload(checkpoint, model)
     return checkpoint
@@ -982,6 +1015,7 @@ def load_completed_checkpoint_pair_safe(
     model,
     expected_identity,
     map_location="cpu",
+    authorized_commit_carry_forward=None,
 ):
     """Verify both completed checkpoints before any caller mutates state."""
     integrity = result.get("checkpoint_integrity")
@@ -993,6 +1027,7 @@ def load_completed_checkpoint_pair_safe(
         model=model,
         expected_identity=expected_identity,
         expected_result_checkpoint=integrity["best.pt"],
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
     last = load_checkpoint_safe(
         last_path,
@@ -1000,6 +1035,7 @@ def load_completed_checkpoint_pair_safe(
         model=model,
         expected_identity=expected_identity,
         expected_result_checkpoint=integrity["last.pt"],
+        authorized_commit_carry_forward=authorized_commit_carry_forward,
     )
     return best, last
 
@@ -1150,11 +1186,14 @@ def evaluate(model, loader, device) -> dict:
 def train_one_epoch(
     model, loader, optimizer, schedule, scaler, criterion, device,
     accumulation_steps, amp_enabled,
-) -> tuple[float, int]:
-    """One epoch of accumulated AMP steps. Returns (mean loss, optimizer steps)."""
+) -> tuple[float, int, int]:
+    """One epoch of accumulated AMP steps.
+
+    Returns (mean loss, optimizer steps, non-finite gradient skips).
+    """
     model.train()
     batches = len(loader)
-    running, counted, steps = 0.0, 0, 0
+    running, counted, steps, non_finite_skips = 0.0, 0, 0, 0
     optimizer.zero_grad(set_to_none=True)
     for index, (images, labels) in enumerate(loader):
         scale = panderm.accumulation_loss_scale(index, accumulation_steps, batches)
@@ -1170,13 +1209,22 @@ def train_one_epoch(
         counted += images.size(0)
         if (index + 1) % accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            panderm.require_finite_gradients(model.parameters())
+            # An fp16 overflow in the accumulated gradient is what GradScaler
+            # exists to absorb: step() no-ops and update() halves the scale, so
+            # the run self-corrects instead of dying mid-training. Only count it
+            # -- a pathological run has to stay visible per epoch rather than be
+            # silently swallowed. The optimizer step is what gets skipped; the
+            # window, the schedule and global_step still advance, which is both
+            # the standard AMP recipe and what steps_per_epoch/global_step
+            # monotonicity downstream require.
+            if not panderm.finite_gradients(model.parameters()):
+                non_finite_skips += 1
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             schedule.step()
             steps += 1
-    return running / max(counted, 1), steps
+    return running / max(counted, 1), steps, non_finite_skips
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1214,6 +1262,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--formal-output-identity", default=None)
     p.add_argument("--fixed-split-identity", default=None)
     p.add_argument("--resume", action="store_true")
+    p.add_argument(
+        "--authorized-commit-carry-forward",
+        default="",
+        help="Old commit a human reviewed as orchestration-only; artifacts "
+             "stamped with it are accepted despite the git_commit identity "
+             "drift. Empty by default and never a general bypass.",
+    )
     p.add_argument("--device", default=None)
     p.add_argument("--evaluation-scope", default="validation_only",
                    choices=["validation_only"])
@@ -1250,6 +1305,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error(f"--run-version must be {panderm_run.RUN_VERSION}")
     if args.df_target_count != panderm_run.DF_TARGET_COUNT:
         p.error(f"--df-target-count must be {panderm_run.DF_TARGET_COUNT}")
+    try:
+        args.authorized_commit_carry_forward = (
+            panderm_run.normalize_commit_carry_forward(
+                args.authorized_commit_carry_forward
+            )
+        )
+    except ValueError as error:
+        p.error(f"--authorized-commit-carry-forward {error}")
     return args
 
 
@@ -1387,6 +1450,21 @@ def main(argv=None) -> None:
         run_version=args.run_version,
     )
     write_guard.bind_run_identity(run_identity)
+    carry_forward = args.authorized_commit_carry_forward
+    if carry_forward:
+        if carry_forward == run_identity["git_commit"]:
+            raise ValueError(
+                "--authorized-commit-carry-forward names the commit this run is "
+                "already on; a carry-forward from the current commit authorizes "
+                "nothing and would mask a real identity failure"
+            )
+        # Loud on purpose: this is the one place an immutable identity field is
+        # allowed to differ, and it is only ever allowed because a human said so.
+        print(
+            f"[carry-forward] AUTHORIZED git_commit {carry_forward} -> "
+            f"{run_identity['git_commit']}; artifacts stamped with the old "
+            "commit are accepted, every other identity field still must match"
+        )
     print(f"[run] arch={panderm.ARCH} variant={args.variant} seed={args.seed} "
           f"epochs={args.epochs} bs={args.batch_size} "
           f"accum={args.accumulation_steps} "
@@ -1416,13 +1494,16 @@ def main(argv=None) -> None:
             map_location=device,
             model=model,
             expected_identity=run_identity,
+            authorized_commit_carry_forward=carry_forward,
         )
         if checkpoint["epoch"] > args.epochs:
             raise ValueError("last.pt epoch exceeds the fixed validation budget")
         if progress_path.exists():
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
             panderm_run.require_matching_identity(
-                progress.get("run_identity"), run_identity
+                progress.get("run_identity"),
+                run_identity,
+                authorized_commit_carry_forward=carry_forward,
             )
             progress_position = (progress.get("epoch"), progress.get("global_step"))
             checkpoint_position = (checkpoint["epoch"], checkpoint["global_step"])
@@ -1452,12 +1533,14 @@ def main(argv=None) -> None:
                 model=model,
                 expected_identity=run_identity,
                 map_location="cpu",
+                authorized_commit_carry_forward=carry_forward,
             )
             panderm_run.require_completed_artifact_identities(
                 expected=run_identity,
                 result=completed_result,
                 best_checkpoint=best_checkpoint,
                 last_checkpoint=last_checkpoint,
+                authorized_commit_carry_forward=carry_forward,
             )
             print(
                 f"[skip] already completed all {args.epochs} validation epochs; "
@@ -1484,7 +1567,7 @@ def main(argv=None) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         write_guard.require(f"epoch {epoch} start")
         started = time.time()
-        train_loss, steps = train_one_epoch(
+        train_loss, steps, non_finite_skips = train_one_epoch(
             model, train_loader, optimizer, schedule, scaler, criterion, device,
             args.accumulation_steps, amp_effective,
         )
@@ -1500,6 +1583,7 @@ def main(argv=None) -> None:
             "val_macro_f1": val_metrics["macro_f1"],
             "lr": schedule.lr_at(min(schedule.step_count, schedule.total_steps - 1)),
             "optimizer_steps": schedule.step_count,
+            "non_finite_gradient_skips": non_finite_skips,
         })
         is_new_best = val_metrics["target_f1"] > best_val_f1
         marker = ""
@@ -1531,6 +1615,8 @@ def main(argv=None) -> None:
             "global_step": int(schedule.step_count),
             "history": list(history),
             "run_identity": run_identity,
+            # This epoch's checkpoint was just written under the current
+            # identity, so it never needs the carry-forward allowance.
             "last_checkpoint_integrity": checkpoint_integrity_record(
                 epoch_path, expected_identity=run_identity
             ),
@@ -1541,11 +1627,13 @@ def main(argv=None) -> None:
         }
         panderm_run.write_monotonic_run_record_atomic(
             progress_path, progress_record, write_guard=write_guard.require,
+            authorized_commit_carry_forward=carry_forward,
         )
         print(f"[epoch {epoch:02d}/{args.epochs}] loss={train_loss:.4f} "
               f"val_df_f1={val_metrics['target_f1']:.4f} "
               f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-              f"steps={steps} lr={history[-1]['lr']:.3e} "
+              f"steps={steps} skipped_non_finite={non_finite_skips} "
+              f"lr={history[-1]['lr']:.3e} "
               f"elapsed={time.time()-started:.0f}s "
               f"checkpoint_saved={epoch_filename}{marker}")
 
@@ -1560,14 +1648,19 @@ def main(argv=None) -> None:
         best_checkpoint = load_checkpoint_safe(
             final_best_path, map_location=device, model=model,
             expected_identity=run_identity,
+            authorized_commit_carry_forward=carry_forward,
         )
         write_guard.require("best checkpoint after state load")
         restore_checkpoint_state(
             best_checkpoint, model, optimizer, schedule, scaler, write_guard=write_guard,
         )
 
+    # The best epoch can predate a carried-forward resume (seed 1's best is
+    # epoch 25 of 50), so best.pt legitimately still carries the old commit
+    # while last.pt and the result do not.
     best_checkpoint = load_checkpoint_safe(
         final_best_path, map_location=device, model=model, expected_identity=run_identity,
+        authorized_commit_carry_forward=carry_forward,
     )
     validation_metrics = best_checkpoint.get("val_metrics")
     if validation_metrics is None:
@@ -1579,8 +1672,14 @@ def main(argv=None) -> None:
     print(f"[validation-only] best_df_f1={best_val_f1:.4f} predicted_counts={predicted_counts}")
 
     checkpoint_integrity = {
-        "best.pt": checkpoint_integrity_record(final_best_path, expected_identity=run_identity),
-        "last.pt": checkpoint_integrity_record(final_last_path, expected_identity=run_identity),
+        "best.pt": checkpoint_integrity_record(
+            final_best_path, expected_identity=run_identity,
+            authorized_commit_carry_forward=carry_forward,
+        ),
+        "last.pt": checkpoint_integrity_record(
+            final_last_path, expected_identity=run_identity,
+            authorized_commit_carry_forward=carry_forward,
+        ),
     }
     result = {
         "epoch": history[-1]["epoch"],
@@ -1614,14 +1713,19 @@ def main(argv=None) -> None:
         "data_counts": {"train": len(train_frame), "val": len(val_frame), "test": None},
         **{key: run_identity[key] for key in panderm_run.IMMUTABLE_IDENTITY_KEYS},
     }
-    panderm_run.write_monotonic_run_record_atomic(out_path, result, write_guard=write_guard.require)
+    panderm_run.write_monotonic_run_record_atomic(
+        out_path, result, write_guard=write_guard.require,
+        authorized_commit_carry_forward=carry_forward,
+    )
     verified_best, verified_last = load_completed_checkpoint_pair_safe(
         best_path=final_best_path, last_path=final_last_path, result=result,
         model=model, expected_identity=run_identity, map_location="cpu",
+        authorized_commit_carry_forward=carry_forward,
     )
     panderm_run.require_completed_artifact_identities(
         expected=run_identity, result=result,
         best_checkpoint=verified_best, last_checkpoint=verified_last,
+        authorized_commit_carry_forward=carry_forward,
     )
     print(f"[done] results -> {out_path}")
     print(f"[done] best={current_best_filename} (val df_f1={best_val_f1:.4f}) "

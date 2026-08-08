@@ -4729,6 +4729,117 @@ class CheckpointIntegritySidecarTests(unittest.TestCase):
         self.assertFalse(hasattr(train_panderm, "load_checkpoint_for_resume"))
 
 
+@contextlib.contextmanager
+def mock_runner_environment(
+    *,
+    git_commit="c" * 40,
+    epoch_return=(1.0, 1, 0),
+    epoch_side_effect=None,
+    models=2,
+):
+    """Run the real train_panderm.main against mocked data, model and epochs.
+
+    Shared by the runner smoke test and the carry-forward end-to-end test so
+    both exercise the same real main(): the identity checks under test only
+    fire from inside it, and every bug this project has shipped to Colab was a
+    call-site bug that unit-testing the functions alone could not have caught.
+    """
+    import pandas as pd
+
+    class Loader:
+        def __len__(self):
+            return 8
+
+    train_frame = pd.DataFrame(
+        [{"dx": "df", "image_path": "train.jpg", "label_idx": 3}]
+    )
+    val_frame = pd.DataFrame(
+        [{"dx": "df", "image_path": "val.jpg", "label_idx": 3}]
+    )
+    validation_metrics = {
+        "target_f1": 0.5,
+        "macro_f1": 0.4,
+        "confusion_matrix": torch.eye(7, dtype=torch.int64).tolist(),
+    }
+    built_models = [build_mock_model() for _ in range(models)]
+    with contextlib.ExitStack() as stack:
+        runner_guard = AllowDurableWriteGuard()
+        for target, attribute, kwargs in (
+            (
+                train_panderm.panderm_run.SequentialSessionWriteGuard,
+                "from_environment",
+                {"return_value": runner_guard},
+            ),
+            (
+                train_panderm.panderm_run,
+                "require_checkpoint_sha256",
+                {"return_value": "a" * 64},
+            ),
+            (train_panderm.panderm_run, "require_no_deployment_contamination", {}),
+            (
+                train_panderm.panderm_run,
+                "require_provenance_clearance",
+                {"return_value": {"cleared_for": "validation_only"}},
+            ),
+            (train_panderm, "build_c1_frame", {"return_value": train_frame}),
+            (train_panderm.manifests, "load_split", {"return_value": val_frame}),
+            (train_panderm, "build_loader", {"return_value": Loader()}),
+            (train_panderm.panderm, "build_train_transform", {"return_value": object()}),
+            (train_panderm.panderm, "build_eval_transform", {"return_value": object()}),
+            (
+                train_panderm.panderm,
+                "build_panderm_classifier",
+                {"side_effect": built_models},
+            ),
+            (
+                train_panderm.panderm,
+                "model_identity",
+                {
+                    "return_value": {
+                        "arch": panderm_run.ARCH,
+                        "drop_path": panderm_run.DROP_PATH,
+                        "total_parameter_count": 1,
+                        "trainable_parameter_count": 1,
+                    }
+                },
+            ),
+            (
+                train_panderm.panderm,
+                "dependency_versions",
+                {"return_value": {"torch": "mock"}},
+            ),
+            (
+                train_panderm,
+                "manifest_identity",
+                {"return_value": {"train": "train-hash", "val": "val-hash"}},
+            ),
+            (train_panderm, "git_commit", {"return_value": git_commit}),
+            (
+                train_panderm,
+                "train_one_epoch",
+                {"side_effect": epoch_side_effect}
+                if epoch_side_effect is not None
+                else {"return_value": epoch_return},
+            ),
+            (train_panderm, "evaluate", {"return_value": validation_metrics}),
+        ):
+            stack.enter_context(mock.patch.object(target, attribute, **kwargs))
+        yield
+
+
+def mock_runner_argv(root, output):
+    return [
+        "--checkpoint", str(root / "weights.pth"),
+        "--checkpoint-sha256", "a" * 64,
+        "--upstream-dir", str(root / "upstream"),
+        "--output-dir", str(output),
+        "--shared-root-uuid", "uuid",
+        "--formal-output-identity", "validation-output",
+        "--fixed-split-identity", "train-hash",
+        "--device", "cpu",
+    ]
+
+
 class PanDermRunnerMockSmokeTests(unittest.TestCase):
     def test_runner_writes_verified_pairs_and_completed_resume_skips(self):
         import pandas as pd
@@ -4864,7 +4975,7 @@ class PanDermRunnerMockSmokeTests(unittest.TestCase):
                     mock.patch.object(
                         train_panderm,
                         "train_one_epoch",
-                        return_value=(1.0, 1),
+                        return_value=(1.0, 1, 0),
                     )
                 )
                 stack.enter_context(
@@ -4895,6 +5006,591 @@ class PanDermRunnerMockSmokeTests(unittest.TestCase):
                 self.assertTrue(
                     (checkpoint_dir / f"{name}.integrity.json").is_file()
                 )
+
+
+OLD_COMMIT = "c" * 40
+NEW_COMMIT = "d" * 40
+
+
+class CommitCarryForwardTests(unittest.TestCase):
+    """The one narrow, human-authorized exception to git_commit immutability.
+
+    git_commit is a deliberate identity-drift field: shipping any code fix
+    normally orphans every artifact written before it. These tests pin the
+    exception open exactly wide enough to keep already-spent GPU compute, and
+    no wider -- an unauthorized commit, or a second drifted field, must still
+    fail exactly as before.
+    """
+
+    def _components(self):
+        model = build_mock_model()
+        optimizer = mock.Mock()
+        optimizer.state_dict.return_value = {}
+        schedule = mock.Mock(step_count=0)
+        schedule.state_dict.return_value = {"step_count": 0}
+        scaler = mock.Mock()
+        scaler.state_dict.return_value = {}
+        return model, optimizer, schedule, scaler
+
+    def _save(self, path, run_identity, epoch=1):
+        model, optimizer, schedule, scaler = self._components()
+        args = type("A", (), {"seed": 0, "epochs": 5})()
+        train_panderm.save_checkpoint(
+            path, model, optimizer, schedule, scaler, epoch, 0.5,
+            [
+                {"epoch": done, "optimizer_steps": schedule.step_count}
+                for done in range(1, epoch + 1)
+            ],
+            args, run_identity, write_guard=AllowDurableWriteGuard(),
+        )
+
+    def test_authorized_pair_differing_only_in_commit_passes_every_site(self):
+        saved = identity(git_commit=OLD_COMMIT)
+        current = identity(git_commit=NEW_COMMIT)
+        panderm_run.require_matching_identity(
+            saved, current, authorized_commit_carry_forward=OLD_COMMIT
+        )
+        self.assertTrue(
+            panderm_run.accepts_commit_carry_forward(saved, current, OLD_COMMIT)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = train_panderm._epoch_checkpoint_filename(1, 0)
+            path = root / name
+            self._save(path, saved)
+            # The sidecar pins a hash, not fields: this is the site where a
+            # field-skip implementation would silently do nothing.
+            record = train_panderm.checkpoint_integrity_record(
+                path,
+                expected_identity=current,
+                authorized_commit_carry_forward=OLD_COMMIT,
+            )
+            self.assertEqual(
+                record["run_identity_sha256"],
+                train_panderm._canonical_identity_sha256(saved),
+            )
+            loaded = train_panderm.load_checkpoint_safe(
+                path,
+                expected_identity=current,
+                authorized_commit_carry_forward=OLD_COMMIT,
+            )
+            self.assertEqual(loaded["epoch"], 1)
+
+            # A carried-forward run finishes under the new commit while the best
+            # checkpoint can still be an epoch from before the fix.
+            result = {
+                "run_version": current["run_version"],
+                "run_identity": current,
+                "checkpoint_integrity": {"best.pt": record, "last.pt": record},
+                **{key: current[key] for key in panderm_run.IMMUTABLE_IDENTITY_KEYS},
+            }
+            panderm_run.require_completed_artifact_identities(
+                expected=current,
+                result=result,
+                best_checkpoint=loaded,
+                last_checkpoint=loaded,
+                authorized_commit_carry_forward=OLD_COMMIT,
+            )
+
+            progress_path = root / "progress.json"
+            existing = {
+                "schema_version": 1, "epoch": 1, "global_step": 1,
+                "history": [{"epoch": 1, "optimizer_steps": 1}],
+                "run_identity": saved,
+            }
+            panderm_run.write_json_atomic(progress_path, existing)
+            panderm_run.write_monotonic_run_record_atomic(
+                progress_path,
+                {
+                    "schema_version": 1, "epoch": 2, "global_step": 2,
+                    # The pre-bump entry predates the skip counter, exactly as
+                    # seed 1's epochs 1-38 do; only the resumed epoch carries it.
+                    "history": [
+                        {"epoch": 1, "optimizer_steps": 1},
+                        {
+                            "epoch": 2,
+                            "optimizer_steps": 2,
+                            "non_finite_gradient_skips": 2,
+                        },
+                    ],
+                    "run_identity": current,
+                },
+                write_guard=AllowDurableWriteGuard().require,
+                authorized_commit_carry_forward=OLD_COMMIT,
+            )
+            reopened = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(reopened["epoch"], 2)
+            self.assertEqual(reopened["run_identity"]["git_commit"], NEW_COMMIT)
+
+    def test_same_pair_without_authorization_still_fails(self):
+        saved = identity(git_commit=OLD_COMMIT)
+        current = identity(git_commit=NEW_COMMIT)
+        with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
+            panderm_run.require_matching_identity(saved, current)
+        with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
+            panderm_run.require_matching_identity(
+                saved, current, authorized_commit_carry_forward=""
+            )
+        # A different old commit is not the one the human reviewed.
+        with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
+            panderm_run.require_matching_identity(
+                saved, current, authorized_commit_carry_forward="e" * 40
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / train_panderm._epoch_checkpoint_filename(1, 0)
+            self._save(path, saved)
+            with self.assertRaisesRegex(ValueError, "run identity mismatch"):
+                train_panderm.checkpoint_integrity_record(
+                    path, expected_identity=current
+                )
+
+    def test_a_second_drifted_field_still_fails_even_when_authorized(self):
+        """Carry-forward must never become a general bypass."""
+        current = identity(git_commit=NEW_COMMIT)
+        for field, value in (
+            ("checkpoint_sha256", "b" * 64),
+            ("seed", 1),
+            ("manifest_sha256", {"train": "tampered", "val": "v"}),
+            ("evaluation_scope", "full"),
+        ):
+            with self.subTest(field=field):
+                saved = identity(git_commit=OLD_COMMIT, **{field: value})
+                self.assertFalse(
+                    panderm_run.accepts_commit_carry_forward(
+                        saved, current, OLD_COMMIT
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
+                    panderm_run.require_matching_identity(
+                        saved,
+                        current,
+                        authorized_commit_carry_forward=OLD_COMMIT,
+                    )
+
+    def test_completed_artifact_equality_tolerates_only_the_commit(self):
+        current = identity(git_commit=NEW_COMMIT)
+        old = identity(git_commit=OLD_COMMIT)
+        result = {
+            "run_version": current["run_version"],
+            "run_identity": current,
+            **{key: current[key] for key in panderm_run.IMMUTABLE_IDENTITY_KEYS},
+        }
+        # An extra key clears require_matching_identity, which only inspects
+        # IMMUTABLE_IDENTITY_KEYS, so the full-dict comparison is the only thing
+        # that catches it. The carve-out must not swallow that too.
+        drifted = dict(old)
+        drifted["injected_field"] = "tampered"
+        panderm_run.require_matching_identity(
+            drifted, current, authorized_commit_carry_forward=OLD_COMMIT
+        )
+        with self.assertRaisesRegex(ValueError, "does not equal result identity"):
+            panderm_run.require_completed_artifact_identities(
+                expected=current,
+                result=result,
+                best_checkpoint={"run_identity": drifted},
+                last_checkpoint={"run_identity": current},
+                authorized_commit_carry_forward=OLD_COMMIT,
+            )
+        # Unauthorized, the old commit never reaches the equality check at all.
+        with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
+            panderm_run.require_completed_artifact_identities(
+                expected=current,
+                result=result,
+                best_checkpoint={"run_identity": old},
+                last_checkpoint={"run_identity": current},
+            )
+        # Authorized, the same pair is accepted.
+        panderm_run.require_completed_artifact_identities(
+            expected=current,
+            result=result,
+            best_checkpoint={"run_identity": old},
+            last_checkpoint={"run_identity": current},
+            authorized_commit_carry_forward=OLD_COMMIT,
+        )
+
+    def test_aggregate_accepts_one_authorized_commit_and_refuses_a_third(self):
+        def run(seed, commit):
+            return {
+                "seed": seed,
+                "variant": panderm_run.VARIANT,
+                "evaluation_scope": panderm_run.VALIDATION_ONLY,
+                "test_metrics": None,
+                "claim_boundary": panderm_run.CLAIM_BOUNDARY,
+                "run_identity": identity(seed=seed, git_commit=commit),
+                "validation_metrics": {
+                    "target_f1": 0.5,
+                    "macro_f1": 0.4,
+                    "target_recall": 0.6,
+                    "per_class_recall": {"df": 0.6},
+                },
+            }
+
+        mixed = [run(0, OLD_COMMIT), run(1, NEW_COMMIT), run(2, NEW_COMMIT)]
+        with self.assertRaisesRegex(ValueError, "drifted identity"):
+            panderm_run.aggregate_results(mixed)
+        aggregated = panderm_run.aggregate_results(
+            mixed, authorized_commit_carry_forward=OLD_COMMIT
+        )
+        self.assertEqual(aggregated["seeds"], [0, 1, 2])
+        three = [run(0, OLD_COMMIT), run(1, NEW_COMMIT), run(2, "e" * 40)]
+        with self.assertRaisesRegex(ValueError, "drifted identity"):
+            panderm_run.aggregate_results(
+                three, authorized_commit_carry_forward=OLD_COMMIT
+            )
+        drifted = [run(0, OLD_COMMIT), run(1, NEW_COMMIT), run(2, NEW_COMMIT)]
+        drifted[2]["run_identity"]["checkpoint_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "drifted identity"):
+            panderm_run.aggregate_results(
+                drifted, authorized_commit_carry_forward=OLD_COMMIT
+            )
+
+    def test_normalizer_rejects_anything_but_empty_or_a_full_commit(self):
+        self.assertEqual(panderm_run.normalize_commit_carry_forward(None), "")
+        self.assertEqual(panderm_run.normalize_commit_carry_forward(""), "")
+        self.assertEqual(
+            panderm_run.normalize_commit_carry_forward(OLD_COMMIT), OLD_COMMIT
+        )
+        for bad in ("c" * 39, "C" * 40, "z" * 40, 0, True, ["c" * 40]):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "full lowercase"):
+                    panderm_run.normalize_commit_carry_forward(bad)
+
+    def test_audit_is_published_once_and_is_idempotent_under_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            history = Path(temporary)
+            first = panderm_run.publish_commit_carry_forward_audit(
+                history,
+                carried_forward_commit=OLD_COMMIT,
+                current_commit=NEW_COMMIT,
+                run_version=panderm_run.RUN_VERSION,
+                shared_root_uuid="uuid",
+            )
+            self.assertEqual(
+                set(first), set(panderm_run.COMMIT_CARRY_FORWARD_STABLE_FIELDS)
+            )
+            self.assertEqual(first["carried_forward_commit"], OLD_COMMIT)
+            self.assertEqual(first["current_commit"], NEW_COMMIT)
+            self.assertEqual(
+                first["confirmation"],
+                panderm_run.COMMIT_CARRY_FORWARD_CONFIRMATION,
+            )
+            written = sorted(
+                path.name
+                for path in history.glob(
+                    f"*{panderm_run.COMMIT_CARRY_FORWARD_AUDIT_SUFFIX}"
+                )
+            )
+            self.assertEqual(
+                written,
+                [
+                    f"{OLD_COMMIT}__{NEW_COMMIT}"
+                    f"{panderm_run.COMMIT_CARRY_FORWARD_AUDIT_SUFFIX}"
+                ],
+            )
+            # Every later seed re-authorizes the same pair; a retry must
+            # reproduce one identical record, timestamp included.
+            again = panderm_run.publish_commit_carry_forward_audit(
+                history,
+                carried_forward_commit=OLD_COMMIT,
+                current_commit=NEW_COMMIT,
+                run_version=panderm_run.RUN_VERSION,
+                shared_root_uuid="uuid",
+            )
+            self.assertEqual(again, first)
+            self.assertEqual(len(list(history.glob("*.json"))), 1)
+            # The takeover-chain readers must not mistake it for their own.
+            self.assertEqual(
+                list(
+                    history.glob(f"*{panderm_run.TAKEOVER_AUDIT_SUFFIX}")
+                ),
+                [],
+            )
+            self.assertEqual(
+                panderm_run._read_graceful_completion_session_ids(history), set()
+            )
+            with self.assertRaisesRegex(FileExistsError, "refusing overwrite"):
+                panderm_run.publish_commit_carry_forward_audit(
+                    history,
+                    carried_forward_commit=OLD_COMMIT,
+                    current_commit=NEW_COMMIT,
+                    run_version="tampered",
+                    shared_root_uuid="uuid",
+                )
+
+    def test_audit_filename_is_writable_on_a_windows_drive_mount(self):
+        """The history directory is a Google Drive mount on Windows."""
+        for character in '<>:"/\\|?*':
+            with self.subTest(character=character):
+                self.assertNotIn(
+                    character,
+                    f"{OLD_COMMIT}__{NEW_COMMIT}"
+                    f"{panderm_run.COMMIT_CARRY_FORWARD_AUDIT_SUFFIX}",
+                )
+
+    def test_audit_refuses_a_no_op_or_malformed_authorization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            history = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "authorizes nothing"):
+                panderm_run.publish_commit_carry_forward_audit(
+                    history,
+                    carried_forward_commit=OLD_COMMIT,
+                    current_commit=OLD_COMMIT,
+                    run_version=panderm_run.RUN_VERSION,
+                    shared_root_uuid="uuid",
+                )
+            with self.assertRaisesRegex(ValueError, "full lowercase"):
+                panderm_run.publish_commit_carry_forward_audit(
+                    history,
+                    carried_forward_commit="nope",
+                    current_commit=NEW_COMMIT,
+                    run_version=panderm_run.RUN_VERSION,
+                    shared_root_uuid="uuid",
+                )
+            self.assertEqual(list(history.glob("*.json")), [])
+
+    def test_a_completed_seed_survives_a_commit_bump_end_to_end(self):
+        """The whole point: seed 0's finished 50 epochs must not be orphaned.
+
+        A completed seed is re-verified on every later Run all, so the skip
+        path has to accept artifacts written under the reviewed old commit --
+        and must still refuse them when nobody authorized it.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "run"
+            argv = mock_runner_argv(root, output)
+            with mock_runner_environment(git_commit=OLD_COMMIT, models=1):
+                train_panderm.main(argv)
+            result_path = (
+                output / "results" / panderm_run.ARCH / "results_C1_seed0.json"
+            )
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["git_commit"], OLD_COMMIT)
+
+            # The code fix ships: same artifacts, new commit, no authorization.
+            with mock_runner_environment(git_commit=NEW_COMMIT, models=1):
+                with self.assertRaises(ValueError) as unauthorized:
+                    train_panderm.main(argv + ["--resume"])
+            self.assertIn("identity mismatch", str(unauthorized.exception))
+
+            # Authorized by a human who reviewed that exact diff.
+            with mock_runner_environment(git_commit=NEW_COMMIT, models=1):
+                train_panderm.main(
+                    argv
+                    + [
+                        "--resume",
+                        "--authorized-commit-carry-forward",
+                        OLD_COMMIT,
+                    ]
+                )
+            # The skip path must not rewrite the completed record.
+            self.assertEqual(
+                json.loads(result_path.read_text(encoding="utf-8")), result
+            )
+
+            # A different old commit is still refused.
+            with mock_runner_environment(git_commit=NEW_COMMIT, models=1):
+                with self.assertRaises(ValueError) as wrong:
+                    train_panderm.main(
+                        argv
+                        + [
+                            "--resume",
+                            "--authorized-commit-carry-forward",
+                            "e" * 40,
+                        ]
+                    )
+            self.assertIn("identity mismatch", str(wrong.exception))
+
+    def test_an_incomplete_seed_resumes_across_the_bump_and_records_skips(self):
+        """seed 1's real case: partway through the budget under the old commit.
+
+        Also the only test that proves the skip counter survives the whole
+        path -- train_one_epoch to the durable progress record on disk.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "run"
+            argv = mock_runner_argv(root, output)
+            progress_path = (
+                output / "results" / panderm_run.ARCH / "progress_C1_seed0.json"
+            )
+            with mock_runner_environment(
+                git_commit=OLD_COMMIT,
+                models=1,
+                epoch_side_effect=[(1.0, 1, 0), RuntimeError("simulated crash")],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                    train_panderm.main(argv)
+            partial = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(partial["epoch"], 1)
+            self.assertEqual(partial["run_identity"]["git_commit"], OLD_COMMIT)
+
+            with mock_runner_environment(
+                git_commit=NEW_COMMIT, epoch_return=(0.5, 1, 3), models=1
+            ):
+                with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                    train_panderm.main(argv + ["--resume"])
+            with mock_runner_environment(
+                git_commit=NEW_COMMIT, epoch_return=(0.5, 1, 3), models=1
+            ):
+                train_panderm.main(
+                    argv
+                    + [
+                        "--resume",
+                        "--authorized-commit-carry-forward",
+                        OLD_COMMIT,
+                    ]
+                )
+            resumed = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(resumed["run_identity"]["git_commit"], NEW_COMMIT)
+            self.assertEqual(len(resumed["history"]), 5)
+            # Pre-bump epochs pass through from the checkpoint verbatim, which
+            # is what keeps write_monotonic_run_record_atomic's history-prefix
+            # check satisfiable across a resume -- including for the real seed
+            # whose earlier entries predate the counter entirely.
+            self.assertEqual(resumed["history"][0], partial["history"][0])
+            self.assertEqual(
+                [
+                    entry["non_finite_gradient_skips"]
+                    for entry in resumed["history"][1:]
+                ],
+                [3, 3, 3, 3],
+            )
+
+    def test_cli_normalizes_and_defaults_the_authorization_to_empty(self):
+        base = [
+            "--checkpoint", "weights.pth",
+            "--upstream-dir", "upstream",
+            "--output-dir", "out",
+        ]
+        self.assertEqual(
+            train_panderm.parse_args(base).authorized_commit_carry_forward, ""
+        )
+        self.assertEqual(
+            train_panderm.parse_args(
+                base + ["--authorized-commit-carry-forward", OLD_COMMIT]
+            ).authorized_commit_carry_forward,
+            OLD_COMMIT,
+        )
+        with self.assertRaises(SystemExit):
+            train_panderm.parse_args(
+                base + ["--authorized-commit-carry-forward", "45751eb"]
+            )
+
+
+class NonFiniteGradientSkipTests(unittest.TestCase):
+    """An fp16 overflow is GradScaler's job, not a reason to end the run.
+
+    seed 1 died three times at the same epoch because the accumulated gradient
+    overflowed after unscale_ and the run raised instead of letting the scaler
+    skip the step and back the scale off. The skip must stay counted, though:
+    a run that skips constantly is a real defect and has to remain visible.
+    """
+
+    def _epoch(self, blow_up):
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=1024.0)
+        schedule = mock.Mock(step_count=0)
+        schedule.step = mock.Mock()
+        batch = (torch.ones(1, 2), torch.zeros(1, dtype=torch.long))
+
+        class Loader:
+            def __len__(self):
+                return 2
+
+            def __iter__(self):
+                return iter([batch, batch])
+
+        def criterion(logits, labels):
+            # Mirrors the real failure: every micro-batch loss stays finite and
+            # passes require_finite, and only the scaled accumulated gradient
+            # overflows fp32 -- the case GradScaler exists to absorb.
+            loss = torch.nn.functional.cross_entropy(logits, labels)
+            return loss * (1e37 if blow_up else 1.0)
+
+        return train_panderm.train_one_epoch(
+            model, Loader(), optimizer, schedule, scaler, criterion,
+            torch.device("cpu"), 2, False,
+        )
+
+    def test_a_finite_epoch_reports_no_skips(self):
+        _, steps, skips = self._epoch(blow_up=False)
+        self.assertEqual((steps, skips), (1, 0))
+
+    def test_a_non_finite_gradient_is_counted_instead_of_raising(self):
+        loss, steps, skips = self._epoch(blow_up=True)
+        # The window still closes: steps_per_epoch and global_step monotonicity
+        # both depend on every window advancing the schedule exactly once.
+        self.assertEqual(steps, 1)
+        self.assertEqual(skips, 1)
+        self.assertTrue(np.isfinite(loss))
+
+    def test_scaler_skips_the_update_and_backs_the_scale_off(self):
+        """The behaviour the fix relies on, asserted rather than assumed."""
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+        scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=1024.0)
+        loss = model(torch.ones(1, 2)).sum()
+        scaler.scale(loss).backward()
+        for parameter in model.parameters():
+            parameter.grad.fill_(float("inf"))
+        scaler.unscale_(optimizer)
+        self.assertFalse(panderm.finite_gradients(model.parameters()))
+        before = [p.detach().clone() for p in model.parameters()]
+        scaler.step(optimizer)
+        scaler.update()
+        for original, updated in zip(before, model.parameters()):
+            self.assertTrue(torch.equal(original, updated))
+        self.assertLess(scaler.get_scale(), 1024.0)
+
+    def test_the_raising_form_is_kept_for_callers_outside_a_scaler(self):
+        model = torch.nn.Linear(2, 2)
+        model(torch.ones(1, 2)).sum().backward()
+        panderm.require_finite_gradients(model.parameters())
+        self.assertTrue(panderm.finite_gradients(model.parameters()))
+        for parameter in model.parameters():
+            parameter.grad.fill_(float("nan"))
+        self.assertFalse(panderm.finite_gradients(model.parameters()))
+        with self.assertRaisesRegex(ValueError, "non-finite gradient"):
+            panderm.require_finite_gradients(model.parameters())
+
+    def test_the_skip_count_reaches_the_published_progress_history(self):
+        """A silent no-op would hide a pathological run; the record must show it."""
+        source = Path(train_panderm.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        keys = {
+            key.value
+            for node in ast.walk(main)
+            if isinstance(node, ast.Dict)
+            for key in node.keys
+            if isinstance(key, ast.Constant)
+        }
+        self.assertIn("non_finite_gradient_skips", keys)
+        history_append = next(
+            node
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "history"
+        )
+        entry = history_append.args[0]
+        self.assertIsInstance(entry, ast.Dict)
+        self.assertIn(
+            "non_finite_gradient_skips",
+            {
+                key.value
+                for key in entry.keys
+                if isinstance(key, ast.Constant)
+            },
+        )
 
 
 class CliRuntimeIdentityTests(unittest.TestCase):
