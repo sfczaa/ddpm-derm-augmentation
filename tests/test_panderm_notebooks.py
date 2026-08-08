@@ -45,7 +45,8 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "45751eb317230b6eb2691c359c24f6f85ae2dc49"
+PINNED_IMPLEMENTATION_COMMIT = "8efda18ed796fdb6208e1441fece46ff1f343b97"
+PINNED_FORMAL_IMPLEMENTATION_COMMIT = "8efda18ed796fdb6208e1441fece46ff1f343b97"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -1824,68 +1825,70 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
 
 
 class FormalNotebookTests(unittest.TestCase):
-    def test_first_cell_has_unpinned_pin_placeholder_guard(self):
+    def test_first_cell_is_pinned_to_the_implementation_commit(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         self.assertEqual(notebook["cells"][0]["cell_type"], "code")
-        self.assertIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
+        self.assertIn(
+            f'EXPECTED_GIT_COMMIT = "{PINNED_FORMAL_IMPLEMENTATION_COMMIT}"',
+            first,
+        )
+        self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
 
-    def test_unpinned_first_cell_fails_its_own_guard(self):
+    def test_pinned_first_cell_passes_its_own_guard(self):
         notebook, _ = load(FORMAL)
         first = "".join(notebook["cells"][0]["source"])
         namespace = {}
-        with self.assertRaisesRegex(
-            AssertionError,
-            "Pin the reviewed pushed commit",
-        ):
-            exec(compile(first, "cell-0", "exec"), namespace)
+        exec(compile(first, "cell-0", "exec"), namespace)
+        self.assertEqual(
+            namespace["EXPECTED_GIT_COMMIT"],
+            PINNED_FORMAL_IMPLEMENTATION_COMMIT,
+        )
+
+    @staticmethod
+    def _cell_zero_with_a_valid_pin():
+        """Cell 0 in a state where the carry-forward guards are reachable.
+
+        Deliberately stage-agnostic: an implementation candidate still holds
+        the placeholder and would abort on its own pin guard, while a published
+        notebook already holds a real commit. These guards must hold in both.
+        """
+        notebook, _ = load(FORMAL)
+        return "".join(notebook["cells"][0]["source"]).replace(
+            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
+            f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
+        )
 
     def test_commit_carry_forward_is_an_empty_human_set_cell_zero_variable(self):
         """The carve-out is only ever opened by a human, per run.
 
         git_commit is a deliberate immutable identity field, so a default that
         carried any commit forward would silently turn the one narrow audited
-        exception into a permanent bypass. It has to ship empty, be rejected
-        unless it is a real commit, and never name the pinned commit itself
-        (which would authorize nothing while masking a real identity failure).
+        exception into a permanent bypass. It has to ship empty.
         """
-        notebook, _ = load(FORMAL)
-        first = "".join(notebook["cells"][0]["source"])
-        self.assertIn('COMMIT_CARRY_FORWARD_FROM = ""', first)
-        self.assertIn(
-            "COMMIT_CARRY_FORWARD_FROM != EXPECTED_GIT_COMMIT", first
-        )
+        source = self._cell_zero_with_a_valid_pin()
+        self.assertIn('COMMIT_CARRY_FORWARD_FROM = ""', source)
+        self.assertIn("COMMIT_CARRY_FORWARD_FROM != EXPECTED_GIT_COMMIT", source)
         namespace = {}
-        exec(
-            compile(
-                first.replace(
-                    f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
-                    f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
-                ),
-                "cell-0",
-                "exec",
-            ),
-            namespace,
-        )
+        exec(compile(source, "cell-0", "exec"), namespace)
         self.assertEqual(namespace["COMMIT_CARRY_FORWARD_FROM"], "")
 
     def test_cell_zero_rejects_a_malformed_or_self_naming_carry_forward(self):
-        notebook, _ = load(FORMAL)
-        first = "".join(notebook["cells"][0]["source"]).replace(
-            f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"',
-            f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
-        )
+        """A partial SHA silently never matches; the pinned one authorizes nothing."""
+        source = self._cell_zero_with_a_valid_pin()
+        namespace = {}
+        exec(compile(source, "cell-0", "exec"), namespace)
         for value, expected in (
             ("45751eb", "must be empty or a full lowercase commit SHA"),
             ("A" * 40, "must be empty or a full lowercase commit SHA"),
-            ("a" * 40, "authorizes nothing"),
+            (namespace["EXPECTED_GIT_COMMIT"], "authorizes nothing"),
         ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(AssertionError, expected):
                     exec(
                         compile(
-                            first.replace(
+                            source.replace(
                                 'COMMIT_CARRY_FORWARD_FROM = ""',
                                 f'COMMIT_CARRY_FORWARD_FROM = "{value}"',
                             ),
