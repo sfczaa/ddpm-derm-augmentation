@@ -70,6 +70,24 @@ def load_synthetic(directory: Path) -> list[Image.Image]:
     return [Image.open(p).convert("RGB") for p in paths]
 
 
+def colour_stats(images) -> dict:
+    """Saturation, contrast and channel means.
+
+    Kept alongside the distance measurements because a distance says only that
+    two sets differ, not how. These three say whether the difference is in
+    colour and dynamic range, which a nearest-neighbour number cannot.
+    """
+    arr = np.stack([
+        np.asarray(im.resize((64, 64)), dtype=np.float32) / 255.0 for im in images
+    ])
+    return {
+        "saturation": float((arr.max(-1) - arr.min(-1)).mean()),
+        "contrast_std": float(arr.std()),
+        "mean_rgb": [float(arr[..., channel].mean()) for channel in range(3)],
+        "n": len(images),
+    }
+
+
 def pixel_features(images, size: int) -> np.ndarray:
     """Flat [0,1] RGB vectors at the generator's native resolution."""
     out = []

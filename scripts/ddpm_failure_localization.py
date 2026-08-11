@@ -39,8 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ddpm_derm import config, manifests  # noqa: E402
 from ddpm_memorization_diagnostic import (  # noqa: E402
-    embedding_features, load_real_data_judge, load_synthetic, nn_distance,
-    pixel_features,
+    colour_stats, embedding_features, load_real_data_judge, load_synthetic,
+    nn_distance, pixel_features,
 )
 
 BALANCE_SEED = 0
@@ -131,6 +131,50 @@ def test_b(synth, val_df, train_df, results) -> None:
     results["test_b_resolution_ladder"] = block
 
 
+def test_d(synth, train_df, by_class, results) -> None:
+    """What the difference is made of, which a distance alone cannot say.
+
+    Reported against two references: real train df, and the whole training set.
+    If the synthetic images were a blend of the seven classes they would sit
+    near the all-class figures; sitting away from both instead points at output
+    regressing toward the centre of the normalised range rather than at the
+    generator averaging over classes.
+    """
+    print("\n=== Test D: colour and dynamic range ===")
+    all_real = [im for imgs in by_class.values() for im in imgs]
+    block = {
+        "real_train_df": colour_stats(train_df),
+        "real_train_all_classes_balanced": colour_stats(all_real),
+        "synthetic": colour_stats(synth),
+    }
+    for name, s in block.items():
+        rgb = ", ".join(f"{v:.3f}" for v in s["mean_rgb"])
+        print(f"  {name:34} n={s['n']:4}  saturation={s['saturation']:.4f}  "
+              f"contrast={s['contrast_std']:.4f}  mean_rgb=({rgb})")
+    ratio_sat = block["synthetic"]["saturation"] / block["real_train_df"]["saturation"]
+    ratio_con = (block["synthetic"]["contrast_std"]
+                 / block["real_train_df"]["contrast_std"])
+    block["synthetic_over_real_df"] = {"saturation": ratio_sat,
+                                       "contrast_std": ratio_con}
+    print(f"  synthetic / real df: saturation={ratio_sat:.3f}  "
+          f"contrast={ratio_con:.3f}")
+
+    def rgb_gap(a, b):
+        return float(np.linalg.norm(np.asarray(a["mean_rgb"])
+                                    - np.asarray(b["mean_rgb"])))
+
+    block["mean_rgb_distance"] = {
+        "synthetic_to_real_df": rgb_gap(block["synthetic"], block["real_train_df"]),
+        "synthetic_to_all_classes": rgb_gap(
+            block["synthetic"], block["real_train_all_classes_balanced"]),
+        "real_df_to_all_classes": rgb_gap(
+            block["real_train_df"], block["real_train_all_classes_balanced"]),
+    }
+    for k, v in block["mean_rgb_distance"].items():
+        print(f"  mean-RGB distance {k:26} = {v:.4f}")
+    results["test_d_colour"] = block
+
+
 def test_c(synth, train_df, model, img_size, out_path, results) -> None:
     print("\n=== Test C: montage ===")
     flipped = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in train_df]
@@ -194,6 +238,7 @@ def main() -> None:
 
     test_a(synth, val_df, by_class, model, img_size, results)
     test_b(synth, val_df, train_df, results)
+    test_d(synth, train_df, by_class, results)
     test_c(synth, train_df, model, img_size, Path(args.montage), results)
 
     out = Path(args.out)
