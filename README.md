@@ -264,6 +264,76 @@ free-tier cold start briefly returned Render's `x-render-routing: no-server`
 404; the following health request woke the service and returned 200. Local
 `docker build` remains unrun and must not be described as locally validated.
 
+## Does the synthetic data actually help? A generator diagnostic
+
+The sqrt-balanced exploratory comparison added 500 synthetic `df` images in C4 rather than duplicating the
+85 real train images as C1 did. Test df F1 moved by `+0.0223`. This is a small difference, so the first
+question was whether the generator was adding anything at all.
+
+The DDPM had only 85 real train `df` images. If it had memorised them, C4 would be functionally equivalent
+to C1, and a near-zero gap would be the expected result. Memorisation therefore had to be measured before
+interpreting the downstream comparison.
+
+The original check reported a 32px nearest-neighbour distance of `min=3.20` without a reference scale, so
+there was no basis for deciding whether that was close. It also compared only with unflipped originals,
+while DDPM training uses `RandomHorizontalFlip`, leaving memorisation up to a mirror image undetected.
+
+### Building a reference scale from the fixed split
+
+The 14 validation `df` are real lesions that the generator never saw, so their distance to the train set
+is a reference for a genuinely new `df`. Leave-one-out distances among the 85 real train `df` provide a
+second reference. Both come from the fixed split without deriving a new one.
+
+Distances were measured flip-aware in two independent spaces: pixels at the generator's native 64px
+resolution, and penultimate features from the project's real-data-only C1 ResNet-18. The feature-space
+judge therefore does not depend on synthetic training data.
+
+| Median nearest-neighbour distance into the 85 real train df | pixel @64px | C1 embedding |
+|---|---:|---:|
+| synthetic (500) | 11.94 | 1.086 |
+| real val df (14) - genuinely new lesions | 7.77 | 0.368 |
+| real train df - leave-one-out | 8.36 | 0.154 |
+
+The synthetic images are farther from the training set than genuinely new real `df` are. None of the 500
+falls inside the closest validation `df` in either space. These measurements rule out memorisation as the
+explanation for the small C4-C1 difference.
+
+### The diagnostic instead points to distribution shift
+
+Cosine similarity to the nearest real `df` is `0.988` for train-to-train comparisons and `0.932` for new
+real `df`, but `0.410` for the synthetic set. The synthetic samples sit outside the real `df` distribution.
+Their within-set spacing is `0.61x` in pixel space and `0.76x` in embedding space, so they are less varied.
+
+A resolution ladder found a synthetic-to-new-real-`df` distance ratio of `1.54` at 64px and `1.58` at 8px.
+At 8px, only coarse colour and shape remain, so the gap is not high-frequency detail and raising generator
+resolution would not close it. This ruled out a costly higher-resolution retrain before it was spent.
+
+Saturation is `0.053` against `0.188` for real `df`, contrast is `0.064` against `0.145`, and mean RGB is
+approximately `0.5` in every channel, at the centre of the normalised range. This is a sample regressing
+toward the data mean rather than a model that learned the wrong thing. Passing real validation `df` through
+the same 64px bottleneck moves cosine similarity only from `0.932` to `0.905`, so that control does not
+reproduce the synthetic gap.
+
+### Limits of interpretation
+
+- The reference distribution contains only 14 validation `df`, and the test split contains only 16 real `df`. Every df-level metric here rests on very few images, and the `+0.0223` difference is well inside that noise.
+- Distance in a classifier's feature space does not measure visual realism or clinical validity.
+- This diagnostic is descriptive: it defines no thresholds or pass/fail rule and performs no significance testing, consistent with the project constraints.
+- Distribution shift may explain the weak downstream difference, but the evidence does not demonstrate that it caused the result.
+
+### Next diagnostic and reproducibility
+
+The published set used DDIM with 50 steps and eta 0. Too few steps or a fully deterministic trajectory can
+produce the same signature. Because every training checkpoint is retained, a sweep over sampler settings
+and training epochs can separate a sampler artefact, a training-length shortfall, and a limit of the trained
+model without retraining. The notebook is `notebooks/colab_ddpm_sampling_sweep_diagnostic.ipynb`.
+
+The supporting scripts are read-only against the fixed train and validation manifests and never use the test split:
+
+- `scripts/ddpm_memorization_diagnostic.py`
+- `scripts/ddpm_failure_localization.py`
+- `scripts/ddpm_sampling_sweep.py`
+
 ## Constraints honored
 
 - Fixed `lesion_id` split is read, never re-derived (smoke test asserts no leakage).
