@@ -32,6 +32,7 @@ opened. Descriptive output only -- no thresholds, no pass/fail.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -68,6 +69,37 @@ def load_synthetic(directory: Path) -> list[Image.Image]:
     if not paths:
         raise FileNotFoundError(f"no synthetic images under {directory}")
     return [Image.open(p).convert("RGB") for p in paths]
+
+
+def synthetic_provenance(directory: Path) -> dict:
+    """Identify the batch that was actually measured.
+
+    Two different 500-image batches exist under identical filenames, and an
+    earlier diagnostic measured one while quoting the other's metadata. The
+    content hash is computed over the image bytes, so a record can always be
+    tied back to the exact set it describes regardless of what any neighbouring
+    metadata file claims.
+    """
+    directory = Path(directory)
+    paths = sorted(directory.glob("*.png"))
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    record = {
+        "directory": str(directory),
+        "image_count": len(paths),
+        "content_sha256": digest.hexdigest(),
+        "metadata": None,
+    }
+    # The generator writes metadata.json beside the images it produced; a batch
+    # that has none cannot state its own checkpoint or sampler settings.
+    for candidate in (directory.parent / "metadata.json",):
+        if candidate.is_file():
+            record["metadata"] = json.loads(candidate.read_text(encoding="utf-8"))
+            record["metadata_path"] = str(candidate)
+            break
+    return record
 
 
 def colour_stats(images) -> dict:
@@ -251,7 +283,14 @@ def resolution_control(synth_imgs, train_imgs, val_imgs, model, img_size,
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--synthetic-dir", default="outputs/synthetic_df/images")
+    # The published epoch-100 set, which is what the formal C4 condition trains
+    # on (`colab_classifier_baseline.py` pins the manifest to this directory and
+    # gates on its `_READY.json`). `outputs/synthetic_df/images` holds an older
+    # epoch-60 batch under identical filenames and must not be the default:
+    # measuring it while quoting epoch-100 provenance is exactly the mistake
+    # that produced a wrong entry once already.
+    p.add_argument("--synthetic-dir",
+                   default="outputs/synthetic_df/epoch0100_seed0/images")
     p.add_argument(
         "--judge-checkpoint",
         default="outputs/classifier_df585/checkpoints/C1_seed2/best.pt",
@@ -269,6 +308,7 @@ def main() -> None:
           f"synthetic={len(synth_imgs)}  synthetic size={synth_imgs[0].size}")
 
     results: dict = {
+        "synthetic_provenance": synthetic_provenance(Path(args.synthetic_dir)),
         "counts": {
             "train_df": len(train_imgs),
             "val_df": len(val_imgs),
