@@ -346,6 +346,13 @@ samples onto the real `df` manifold, which is the measurement that matters for a
 sweep at the published setting shows saturation still climbing at the end of training (`0.054` at epoch 60,
 `0.069` at 80, `0.094` at 100), so the run was also stopped while it was still improving.
 
+Inspecting the sweep images rather than only its statistics changes how the eta result should be read. The
+highest-saturation configuration produces frames in fluorescent cyan, magenta and flat orange that are not
+skin at all, and the 1000-step deterministic setting produces colour speckle. The recovered saturation is
+noise rather than restored skin tone, which is consistent with distance never improving, and it is a
+reminder that a single summary statistic can move in the right direction while the underlying samples get
+worse. The published setting is washed out but every image still reads as skin.
+
 ### Limits of interpretation
 
 - The reference distribution contains only 14 validation `df`, and the test split contains only 16 real `df`. Every df-level metric here rests on very few images, and the `+0.0223` difference is well inside that noise.
