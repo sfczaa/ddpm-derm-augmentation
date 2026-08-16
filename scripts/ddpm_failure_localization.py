@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ddpm_derm import config, manifests  # noqa: E402
 from ddpm_memorization_diagnostic import (  # noqa: E402
     colour_stats, embedding_features, load_real_data_judge, load_synthetic,
-    nn_distance, pixel_features,
+    nn_distance, pixel_features, synthetic_provenance,
 )
 
 BALANCE_SEED = 0
@@ -193,7 +193,11 @@ def test_c(synth, train_df, model, img_size, out_path, results) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--synthetic-dir", default="outputs/synthetic_df/images")
+    # See ddpm_memorization_diagnostic.py: this must stay the published
+    # epoch-100 set that the formal C4 condition actually trains on, not the
+    # older epoch-60 batch sitting at outputs/synthetic_df/images.
+    p.add_argument("--synthetic-dir",
+                   default="outputs/synthetic_df/epoch0100_seed0/images")
     p.add_argument("--judge-checkpoint",
                    default="outputs/classifier_df585/checkpoints/C1_seed2/best.pt")
     p.add_argument("--out", default="outputs/figures/ddpm_failure_localization.json")
@@ -212,6 +216,7 @@ def main() -> None:
     img_size = int(cfg.get("img_size", 128))
 
     results: dict = {
+        "synthetic_provenance": synthetic_provenance(Path(args.synthetic_dir)),
         "balanced_per_class": len(train_df),
         "balance_seed": BALANCE_SEED,
         "judge": {"variant": cfg.get("variant"), "seed": cfg.get("seed"),
