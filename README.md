@@ -288,31 +288,63 @@ Distances were measured flip-aware in two independent spaces: pixels at the gene
 resolution, and penultimate features from the project's real-data-only C1 ResNet-18. The feature-space
 judge therefore does not depend on synthetic training data.
 
+All figures below describe the published epoch-100 set at
+`outputs/synthetic_df/epoch0100_seed0/` (500 images, `run_seed0_epoch0100.pt`, EMA weights, DDIM 50 steps,
+eta 0, seed 0), which is what the formal C4 condition trains on. An earlier revision of this section
+reported the same diagnostics run against a different 500-image batch that shares the directory tree and
+the filenames but not the bytes; the conclusions were unchanged but several figures were not. Each
+diagnostic record now carries a content hash of the images it opened, so a result can be tied to its batch
+without trusting an adjacent metadata file.
+
 | Median nearest-neighbour distance into the 85 real train df | pixel @64px | C1 embedding |
 |---|---:|---:|
-| synthetic (500) | 11.94 | 1.086 |
+| synthetic (500) | 12.04 | 0.999 |
 | real val df (14) - genuinely new lesions | 7.77 | 0.368 |
 | real train df - leave-one-out | 8.36 | 0.154 |
 
-The synthetic images are farther from the training set than genuinely new real `df` are. None of the 500
-falls inside the closest validation `df` in either space. These measurements rule out memorisation as the
-explanation for the small C4-C1 difference.
+The synthetic images are farther from the training set than genuinely new real `df` are. Only `0.2%` of the
+500 falls inside the closest validation `df` in the embedding and none does in pixel space, and the
+probability that a synthetic image is closer to the training set than a random genuinely-new real `df` is
+`0.060` and `0.038` in the two spaces, against `0.5` for indistinguishable. These measurements rule out
+memorisation as the explanation for the small C4-C1 difference.
 
 ### The diagnostic instead points to distribution shift
 
 Cosine similarity to the nearest real `df` is `0.988` for train-to-train comparisons and `0.932` for new
-real `df`, but `0.410` for the synthetic set. The synthetic samples sit outside the real `df` distribution.
-Their within-set spacing is `0.61x` in pixel space and `0.76x` in embedding space, so they are less varied.
+real `df`, but `0.501` for the synthetic set: the synthetic samples sit outside the real `df` distribution.
+Nearest-class assignment says the same thing more directly. Against galleries balanced to 85 images per
+class, genuinely new real `df` land nearest to `df` `71.4%` of the time; the synthetic do so `5.8%` of the
+time, landing mostly on `nv` and `bcc` instead.
 
-A resolution ladder found a synthetic-to-new-real-`df` distance ratio of `1.54` at 64px and `1.58` at 8px.
+Within-set spacing is `0.77x` of the real set in pixel space but `1.28x` in the embedding. Those point in
+opposite directions and the disagreement is itself informative: the images are tightly grouped in raw
+colour while being scattered in semantic content, which is not the same failure as a mode-collapsed
+generator producing near-duplicates.
+
+A resolution ladder found a synthetic-to-new-real-`df` distance ratio of `1.550` at 64px and `1.532` at 8px.
 At 8px, only coarse colour and shape remain, so the gap is not high-frequency detail and raising generator
 resolution would not close it. This ruled out a costly higher-resolution retrain before it was spent.
 
-Saturation is `0.053` against `0.188` for real `df`, contrast is `0.064` against `0.145`, and mean RGB is
+Saturation is `0.093` against `0.188` for real `df`, contrast is `0.088` against `0.145`, and mean RGB is
 approximately `0.5` in every channel, at the centre of the normalised range. This is a sample regressing
-toward the data mean rather than a model that learned the wrong thing. Passing real validation `df` through
-the same 64px bottleneck moves cosine similarity only from `0.932` to `0.905`, so that control does not
-reproduce the synthetic gap.
+toward the data mean rather than a model that learned the wrong thing. Two controls support that reading:
+passing real validation `df` through the same 64px bottleneck moves cosine similarity only from `0.932` to
+`0.905`, so resolution does not reproduce the gap; and real `df` sit `0.053` from the all-class mean RGB
+while the synthetic sit `0.239` from it, so this is not the generator averaging over its seven classes.
+
+### What the sampler sweep found
+
+The published set was drawn with DDIM at 50 steps and eta 0. A sweep over sampler settings on the same
+checkpoint isolates how much of the above is a sampling artefact, and it contradicted the initial guess.
+Step count was not the lever: 1000 steps at eta 0 gives saturation `0.090`, no better than 50 steps at
+`0.094`. Stochasticity was. Moving eta from 0 to 1 at 50 steps raises saturation to `0.253`, `1.35x` real
+`df` and therefore past it rather than onto it.
+
+Colour is recoverable, distance is not. Every configuration tested leaves the embedding nearest-neighbour
+median between `0.97` and `1.07`, against `0.368` for genuinely new real `df`. No sampler setting moved the
+samples onto the real `df` manifold, which is the measurement that matters for augmentation. The epoch
+sweep at the published setting shows saturation still climbing at the end of training (`0.054` at epoch 60,
+`0.069` at 80, `0.094` at 100), so the run was also stopped while it was still improving.
 
 ### Limits of interpretation
 
@@ -321,14 +353,26 @@ reproduce the synthetic gap.
 - This diagnostic is descriptive: it defines no thresholds or pass/fail rule and performs no significance testing, consistent with the project constraints.
 - Distribution shift may explain the weak downstream difference, but the evidence does not demonstrate that it caused the result.
 
-### Next diagnostic and reproducibility
+### Where this leaves the generator
 
-The published set used DDIM with 50 steps and eta 0. Too few steps or a fully deterministic trajectory can
-produce the same signature. Because every training checkpoint is retained, a sweep over sampler settings
-and training epochs can separate a sampler artefact, a training-length shortfall, and a limit of the trained
-model without retraining. The notebook is `notebooks/colab_ddpm_sampling_sweep_diagnostic.ipynb`.
+Three candidate explanations have now been excluded on evidence rather than intuition: memorisation, a
+high-frequency resolution deficit, and class averaging. The sweep adds a fourth, that sampler settings alone
+would fix it. Colour and contrast respond to eta, but nothing moves the samples onto the real `df` manifold,
+so a sampler change would produce more saturated images that are still off-distribution.
 
-The supporting scripts are read-only against the fixed train and validation manifests and never use the test split:
+What remains consistent with all of it is a capacity or data limit: 85 real training images is very little
+to learn a lesion class from, and the epoch sweep shows the run had not converged. Neither claim is
+established here, and no retrain, architecture change, or new condition is proposed on this evidence alone.
+
+A follow-up condition is pre-registered in `C4_FILTERED_EXPERIMENT_DESIGN.md`: whether the subset of
+synthetic images closest to the real `df` manifold is more useful as augmentation than the pool as a whole,
+with the acceptance threshold and judge fixed in advance. It is deliberately gated on a better pool, since
+under the pre-registered threshold only a small fraction of the current set qualifies.
+
+### Reproducibility
+
+The sweep notebook is `notebooks/colab_ddpm_sampling_sweep_diagnostic.ipynb`. The supporting scripts are
+read-only against the fixed train and validation manifests and never use the test split:
 
 - `scripts/ddpm_memorization_diagnostic.py`
 - `scripts/ddpm_failure_localization.py`
