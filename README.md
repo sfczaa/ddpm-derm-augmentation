@@ -10,8 +10,8 @@ imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
 > seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
 > safety paths are locally verified. Real deployment-only checkpoint inference
 > and the FastAPI runtime were exercised in Colab. The Render Free remote Docker
-> build and public demo endpoints were validated on 2026-07-14; a local Docker
-> build was not run because Docker CLI is unavailable on the local machine.
+> build and public demo endpoints were validated on 2026-07-14; the local Docker
+> build and a container smoke test were completed on 2026-08-18.
 
 ## What exists now
 
@@ -236,8 +236,12 @@ docker run --rm -p 7860:7860 `
   ddpm-derm-demo
 ```
 
-Then check `http://localhost:7860/health`, `/docs`, and the upload UI. This
-repository has not yet been Docker-built locally.
+Then check `http://localhost:7860/health`, `/docs`, and the upload UI. A local
+Docker build and smoke validation were completed on 2026-08-18: the image
+built, `GET /health` and one `POST /api/predict` with a generated non-patient
+fixture both returned HTTP 200, and the served identity was C1 seed 2. This
+validates local container serving only; it does not validate model accuracy,
+load/concurrency, other platforms, or public deployment.
 See `deploy/README_SPACE.md` for the Hugging Face Spaces handoff.
 
 Hugging Face currently requires a paid plan for Docker Spaces, so the free
@@ -261,8 +265,11 @@ checks passed for `/health`, OpenAPI, one valid prediction, MIME mismatch 415,
 damaged-image 400, the 24-item gallery API, an actual PNG gallery response,
 visible attribution, and the medical disclaimer. The first request during a
 free-tier cold start briefly returned Render's `x-render-routing: no-server`
-404; the following health request woke the service and returned 200. Local
-`docker build` remains unrun and must not be described as locally validated.
+404; the following health request woke the service and returned 200. Separately,
+the local `docker build` was run on 2026-08-18: `GET /health` and one
+`POST /api/predict` with a generated non-patient fixture each returned 200 from
+the C1 seed 2 container. That covers local build and serving only, not model
+accuracy, load/concurrency, other platforms, or public deployment.
 
 ## Does the synthetic data actually help? A generator diagnostic
 
