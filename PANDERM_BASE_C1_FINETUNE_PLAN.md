@@ -52,7 +52,7 @@ this decision accepts that risk rather than resolving it.
 | Upstream commit | `fd7a80748ba7fc3e203fed88f909f4689d0d6f24` |
 | Model | `PanDerm_Base` / `panderm_base_patch16_224_finetune` |
 | Checkpoint | `panderm_bb_data6_checkpoint-499.pth` |
-| Drive file id | `removed-from-public-history` |
+| Checkpoint source | Upstream PanDerm repository README (direct download URL intentionally not committed) |
 | License | `CC-BY-NC-ND 4.0`, non-commercial academic research only |
 | Published checkpoint hash | none |
 

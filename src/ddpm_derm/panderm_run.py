@@ -55,10 +55,9 @@ UPSTREAM_MODEL_FACTORY = "panderm_base_patch16_224_finetune"
 UPSTREAM_MODEL_MODULE = "classification/models/modeling_finetune.py"
 
 CHECKPOINT_FILENAME = "panderm_bb_data6_checkpoint-499.pth"
-CHECKPOINT_DRIVE_FILE_ID = "removed-from-public-history"
-CHECKPOINT_SOURCE_URL = (
-    "https://github.com/SiyuanYan1/PanDerm"
-)
+# Keep the public provenance pointer, but do not commit a provider-specific
+# file ID or direct download URL.
+CHECKPOINT_SOURCE_URL = UPSTREAM_REPO
 
 # Upstream publishes no digest for any checkpoint, so this is the reviewed
 # trust-on-first-use digest from the Drive file id in the pinned README. Keep

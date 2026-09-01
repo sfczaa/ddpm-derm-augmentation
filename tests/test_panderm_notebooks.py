@@ -2032,7 +2032,7 @@ class ProtectedArtifactTests(unittest.TestCase):
         for required in (
             panderm_run.UPSTREAM_COMMIT,
             panderm_run.CHECKPOINT_FILENAME,
-            panderm_run.CHECKPOINT_DRIVE_FILE_ID,
+            "direct download URL intentionally not committed",
             "CC-BY-NC-ND 4.0",
             "REPLACE_AFTER_FIRST_DOWNLOAD",
             "REPLACE_AFTER_PUSH",
@@ -2046,6 +2046,7 @@ class ProtectedArtifactTests(unittest.TestCase):
             panderm_run.PROHIBITED_FORMAL_TEST_REASON,
         ):
             self.assertIn(required, plan)
+        self.assertNotIn("drive.google.com", plan)
 
 
 if __name__ == "__main__":
