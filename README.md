@@ -8,10 +8,8 @@ imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
 > Status: **The formal matched-585 experiment is complete and the Stage 4
 > deployment MVP is implemented.** The selected deploy candidate is C1@585
 > seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
-> safety paths are locally verified. Real deployment-only checkpoint inference
-> and the FastAPI runtime were exercised in Colab. The Render Free remote Docker
-> build and public demo endpoints were validated on 2026-07-14; the local Docker
-> build and a container smoke test were completed on 2026-08-18.
+> safety paths are locally verified. The public Render demo and local Docker
+> build have both been validated.
 
 ## What exists now
 
@@ -236,40 +234,26 @@ docker run --rm -p 7860:7860 `
   ddpm-derm-demo
 ```
 
-Then check `http://localhost:7860/health`, `/docs`, and the upload UI. A local
-Docker build and smoke validation were completed on 2026-08-18: the image
-built, `GET /health` and one `POST /api/predict` with a generated non-patient
-fixture both returned HTTP 200, and the served identity was C1 seed 2. This
-validates local container serving only; it does not validate model accuracy,
-load/concurrency, other platforms, or public deployment.
-See `deploy/README_SPACE.md` for the Hugging Face Spaces handoff.
+Then check `http://localhost:7860/health`, `/docs`, and the upload UI.
 
 Hugging Face currently requires a paid plan for Docker Spaces, so the free
 public deployment route uses `Dockerfile.render` and the root `render.yaml`.
 The image build downloads pinned public Hub revisions: a 42.7 MB
 deployment-only checkpoint derived without retraining, and a SHA-verified 3 MB
 archive containing the exact 500-image gallery. The single-archive asset path
-was downloaded and safely extracted locally. See `deploy/README_RENDER.md`.
+was downloaded and safely extracted locally. See `deploy/README_RENDER.md` and
+`deploy/README_SPACE.md`.
 
 Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
-In Colab, the deployment-only checkpoint produced seven probabilities with no
-pandas import. A full Uvicorn/FastAPI health and prediction request returned
-HTTP 200 with the disclaimer; measured RSS was 385.5 MB current and 408.9 MB
-peak. These are user-run Colab results, not a completed Render validation.
-
 ## Deployment validation status
 
-The Render Blueprint built commit `df75c05` on the explicit free plan. Public
-checks passed for `/health`, OpenAPI, one valid prediction, MIME mismatch 415,
-damaged-image 400, the 24-item gallery API, an actual PNG gallery response,
-visible attribution, and the medical disclaimer. The first request during a
-free-tier cold start briefly returned Render's `x-render-routing: no-server`
-404; the following health request woke the service and returned 200. Separately,
-the local `docker build` was run on 2026-08-18: `GET /health` and one
-`POST /api/predict` with a generated non-patient fixture each returned 200 from
-the C1 seed 2 container. That covers local build and serving only, not model
-accuracy, load/concurrency, other platforms, or public deployment.
+The public Render deployment was verified on 2026-07-14, including health,
+prediction, invalid-input, gallery, attribution, and disclaimer checks. A local
+Docker build and one prediction smoke test passed on 2026-08-18. These checks
+confirm serving behavior, not model accuracy or load performance. On Render's
+free tier, the first request after a cold start may briefly return 404 while the
+service wakes.
 
 ## Does the synthetic data actually help? A generator diagnostic
 
