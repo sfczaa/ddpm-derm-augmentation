@@ -1,8 +1,58 @@
 # C4-filtered — pre-registered design (not yet executed)
 
-Status: **design only.** Nothing here has been run. Execution is deliberately
-gated on the sampling sweep (`notebooks/colab_ddpm_sampling_sweep_diagnostic.ipynb`),
-for the reason given under "Why this is gated" below.
+Status: **gate evaluated 2026-09-05; the condition is cleared to run, on the
+current published pool.** Nothing has been trained yet. The acceptance rule in
+§4 and every other rule below are unchanged from pre-registration — only the
+gate in §2 has been resolved, and it resolved against the reasoning that
+created it. See "Gate outcome" immediately below.
+
+## Gate outcome (2026-09-05)
+
+Two things settle the gate, and they point the same way.
+
+**1. §2's numbers came from the wrong batch.** This document was written
+2026-08-11, five days before the batch mix-up was found. Its quoted synthetic
+distribution — range `0.160`–`1.180`, median `1.086`, `p1 = 0.6564`,
+`p5 = 0.8293` — matches `outputs/figures/ddpm_memorization_diagnostic.json`
+exactly, which measured the earlier **epoch-60** batch. On the published
+epoch-100 pool that C4 actually trains on
+(`ddpm_memorization_diagnostic_epoch100.json`, content SHA-256
+`e0bb7015...`), the same distribution is `p0 = 0.1290`, `p1 = 0.3211`,
+`p5 = 0.4724`, `p25 = 0.8508`, `p50 = 0.9990`, `p100 = 1.1843`.
+
+The §4 threshold is unchanged at `0.901291012763977` — it is derived from the
+14 real val `df`, which no batch correction touches.
+
+Since `p25 = 0.8508` is at or below that threshold and `p50 = 0.9990` is above
+it, **between 125 and 250 of the 500 published images clear the bar**, i.e.
+25–50% of the pool. §2 predicted "somewhere in the region of one to five per
+cent" and "a few dozen images at most". That prediction was about a different
+batch and is void. The §4 shortfall rule (fewer than 50 accepted ⇒ do not run)
+is cleared with a wide margin.
+
+The exact count is not computable here: the distance is a ResNet-18 embedding
+and this machine is deliberately torch-free. Recompute it on Colab as the
+first step of execution — the bound above is read off recorded percentiles, and
+the count, fraction and accepted-image manifest required by §5 must come from
+an actual run of the filter.
+
+**2. The "strong version" in §2 no longer exists.** Its step 2 was "regenerate a
+larger pool under whichever sampler configuration recovers the most saturation
+and contrast". The sweep ran on 2026-08-16 and found no such configuration
+worth regenerating under: every setting sits at `embed_nn` 0.97–1.07 against
+the real-val reference of `0.3678`, so none moves samples onto the real `df`
+manifold, and the configurations that do recover saturation (`eta 1.0`) produce
+fluorescent cyan, magenta and orange frames that are not skin. Regenerating
+under them would produce a pool that is worse on the exact distance the filter
+uses.
+
+**Therefore the current pool is not the weak version of this experiment — it is
+the only version.** Running it on today's pool no longer burns the
+pre-registration on a likely null; the gate was constructed on a number that
+turned out to belong to another batch.
+
+**Execution still needs Colab** (3 seeds × 20 epochs, plus the filter pass).
+Nothing about §3–§7 changes on the way there.
 
 This document fixes every rule *before* any number is seen, so the result
 cannot be chosen after the fact. That is the whole point: a filtering step that
@@ -26,6 +76,11 @@ criterion, and the improvement is attributable to a measurement rather than to
 luck. If no, that is a clean negative and costs one classifier training run.
 
 ## 2. Why this is gated on the sweep
+
+> **Superseded 2026-09-05 — see "Gate outcome" above.** The numbers in this
+> section were measured on the epoch-60 batch, not the published epoch-100 pool
+> they claim to describe. Retained unedited as the original pre-registered
+> reasoning.
 
 The current pool is a poor candidate for filtering, and the numbers already on
 record say so.
