@@ -8,8 +8,9 @@ imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
 > Status: **The formal matched-585 experiment is complete and the Stage 4
 > deployment MVP is implemented.** The selected deploy candidate is C1@585
 > seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
-> safety paths are locally verified. The public Render demo and local Docker
-> build have both been validated.
+> safety paths are locally verified. The public Render demo (2026-07-14) and a
+> local Docker build (2026-08-18) each passed a serving check; neither validates
+> model accuracy or load behavior.
 
 ## What exists now
 
@@ -248,12 +249,23 @@ Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
 ## Deployment validation status
 
-The public Render deployment was verified on 2026-07-14, including health,
-prediction, invalid-input, gallery, attribution, and disclaimer checks. A local
-Docker build and one prediction smoke test passed on 2026-08-18. These checks
-confirm serving behavior, not model accuracy or load performance. On Render's
-free tier, the first request after a cold start may briefly return 404 while the
-service wakes.
+The Render Blueprint built commit `df75c05` on the explicit free plan, and on
+2026-07-14 public checks passed for `/health`, OpenAPI, one valid prediction,
+MIME mismatch 415, damaged-image 400, the 24-item gallery API, an actual PNG
+gallery response, visible attribution, and the medical disclaimer. On the free
+tier the first request after a cold start briefly returned Render's
+`x-render-routing: no-server` 404; the following health request woke the service
+and returned 200.
+
+Separately, `docker build` was run locally on 2026-08-18: `GET /health` and one
+`POST /api/predict` with a generated non-patient fixture each returned 200 from
+the C1 seed 2 container, whose startup checkpoint integrity guard passed. Under
+Colab the same deployment-only checkpoint measured 385.5 MB RSS current and
+408.9 MB peak.
+
+**What this does not cover:** model accuracy, load or concurrency behavior,
+platforms other than these two, and any deployment state later than the dates
+above.
 
 ## Does the synthetic data actually help? A generator diagnostic
 
