@@ -21,3 +21,8 @@ data/
 /EXPERIMENT_LOG.docx
 /EXPERIMENT_LOG.md
 /HANDOFF.md
+/PANDERM_HANDOFF.md
+/archive/
+
+# executed run copy; its cells are the tracked runbook COLAB_BALANCED_DDPM.md
+/notebooks/colab_balanced_ddpm.ipynb
