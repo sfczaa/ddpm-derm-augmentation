@@ -374,10 +374,39 @@ What remains consistent with all of it is a capacity or data limit: 85 real trai
 to learn a lesion class from, and the epoch sweep shows the run had not converged. Neither claim is
 established here, and no retrain, architecture change, or new condition is proposed on this evidence alone.
 
-A follow-up condition is pre-registered in `C4_FILTERED_EXPERIMENT_DESIGN.md`: whether the subset of
-synthetic images closest to the real `df` manifold is more useful as augmentation than the pool as a whole,
-with the acceptance threshold and judge fixed in advance. It is deliberately gated on a better pool, since
-under the pre-registered threshold only a small fraction of the current set qualifies.
+### Turning the diagnostic into a selection rule: C4-filtered
+
+The distance above is a distribution, not a single number, so the pre-registered follow-up in
+`C4_FILTERED_EXPERIMENT_DESIGN.md` asks whether the subset closest to the real `df` manifold is more useful
+than the pool as a whole. Judge, distance, threshold and gate were all fixed before any outcome was seen.
+
+That design had deferred itself on the grounds that only one to five per cent of the pool would clear the
+threshold. Those percentiles came from the earlier epoch-60 batch: the document was written five days
+before the batch mix-up was found. On the published epoch-100 pool the quartiles are `p25 = 0.851` and
+`p50 = 0.999` against an unchanged threshold of `0.901`, so **155 of the 500 images clear it (31%)**, and
+the gate's own reasoning no longer applies.
+
+Accepted images fill the df slots and real duplication fills the rest, so df stays at 585 and the condition
+differs from C1 only in the source of those rows.
+
+| condition | test df F1 | macro F1 | df recall |
+|---|---:|---:|---:|
+| C1@585 - duplicate the 85 real df | 0.6598 +/- 0.0423 | 0.6511 | 0.6042 |
+| C4@585 - all 500 synthetic | 0.6115 +/- 0.0423 | 0.6450 | 0.5208 |
+| C4-filtered - the 155 accepted | 0.6657 +/- 0.0182 | 0.6532 | 0.6250 |
+
+Read against the pre-registered rules, the result is **parity with C1 and a real gap over C4**. The
+`+0.0059` over C1 is about a seventh of C1's own seed spread, and one test image moves df F1 by roughly
+`0.03`, so it is less than a single image: the accepted synthetic images did not beat duplicating the real
+ones. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, so the
+unfiltered pool was actively costing accuracy and filtering removed that cost.
+
+So the distance criterion works as a filter of harm, not as a source of benefit. It is worth noting that
+this is not explained by the filter collapsing variety: within-set spacing in the accepted subset is
+`1.820x` the real `df` set, so the accepted images are more spread out than the real ones, not less.
+
+With 16 real `df` in test, none of these differences can be significant and none was tested. The
+deliverable is the procedure and the measured distances, not the delta.
 
 ### Reproducibility
 
@@ -387,6 +416,10 @@ read-only against the fixed train and validation manifests and never use the tes
 - `scripts/ddpm_memorization_diagnostic.py`
 - `scripts/ddpm_failure_localization.py`
 - `scripts/ddpm_sampling_sweep.py`
+
+The C4-filtered condition is `notebooks/colab_c4_filtered_classifier.ipynb` with
+`scripts/c4_filtered_select.py`. The selection step is also read-only against train and val, but the
+condition it feeds is a downstream classifier run and does evaluate the test split, once.
 
 ## Constraints honored
 
