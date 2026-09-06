@@ -72,8 +72,30 @@ class SpaceAppTests(unittest.TestCase):
 
     def test_assets_are_fetched_before_the_service_is_built(self):
         self.assertLess(
-            self.app.index("fetch_assets()\n\nfrom ddpm_derm.deploy import"),
+            self.app.index("fetch_assets()"),
+            self.app.index("from ddpm_derm.deploy import"),
+        )
+        self.assertLess(
+            self.app.index("from ddpm_derm.deploy import"),
             self.app.index("SERVICE = ClassifierService("),
+        )
+
+    def test_data_sentinel_is_staged_before_the_deploy_import(self):
+        # ddpm_derm.config runs DATA_DIR = resolve_data_dir() at *import* time
+        # and raises unless it finds manifests/class_to_idx.json. The Render
+        # image satisfies this with a Dockerfile COPY; the Space has no build
+        # step, so app.py must stage it itself. Verified in an isolated copy of
+        # the Space layout: without this the import raises FileNotFoundError,
+        # with it the import succeeds. Ordering is the whole point, so it is
+        # asserted rather than assumed.
+        self.assertIn("def stage_data_sentinel()", self.app)
+        self.assertIn('os.environ["DDPM_DERM_DATA_DIR"]', self.app)
+        self.assertIn('manifests / "class_to_idx.json"', self.app)
+        call = self.app.index("stage_data_sentinel()", self.app.index("fetch_assets()"))
+        self.assertLess(call, self.app.index("from ddpm_derm.deploy import"))
+        self.assertLess(
+            self.app.index("def stage_data_sentinel()"),
+            self.app.index("from ddpm_derm.deploy import"),
         )
 
     def test_readme_declares_a_gradio_space(self):
