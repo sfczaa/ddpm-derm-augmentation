@@ -1,0 +1,12 @@
+# Hugging Face Space (Gradio, ZeroGPU tier).
+#
+# Unlike requirements-deploy.txt this does NOT pin the CPU-only torch wheels:
+# the free tier is ZeroGPU-gated, so the CUDA build from PyPI is what belongs
+# here. Inference itself still runs on CPU (see app.py).
+spaces>=0.30
+gradio>=4.44,<6
+torch>=2.2,<3
+torchvision>=0.17,<1
+numpy>=1.24,<3
+pillow>=9.0,<12
+huggingface_hub>=0.23,<1

@@ -1,66 +1,74 @@
----
-title: HAM10000 Classifier Portfolio Demo
-emoji: 🔬
-colorFrom: green
-colorTo: gray
-sdk: docker
-app_port: 7860
-license: cc-by-nc-4.0
----
+# Hugging Face Space handoff (Gradio on ZeroGPU)
 
-# HAM10000 classifier portfolio demo
+This replaces the earlier Docker-Space handoff. Hugging Face changed its pricing
+in 2026: Gradio and Docker Spaces both run on compute and **require a paid plan
+to create** — PRO for personal accounts — with one exception the docs state
+plainly:
 
-Educational portfolio demonstration only. Not for diagnosis or treatment.
-The model can be wrong, and its training data and population coverage are limited.
+> Static Spaces are free for everyone. Gradio and Docker Spaces run on compute
+> and require a paid plan to create: PRO for personal accounts, Team or
+> Enterprise for organizations. **Free personal accounts in good standing can
+> still host up to 2 Gradio Spaces running on ZeroGPU.**
 
-Non-commercial use only. Data attribution: HAM10000 Dataset © ViDIR Group,
-Department of Dermatology, Medical University of Vienna; distributed with the
-ISIC 2018 data under CC BY-NC 4.0. Cite Tschandl, Rosendahl & Kittler,
-*Scientific Data* 5, 180161 (2018), https://doi.org/10.1038/sdata.2018.161.
-Project changes include a fixed lesion-level split, resizing, classifier
-training, and generation of the derived synthetic gallery. No endorsement by
-the dataset creators is implied.
+So the free route to a Space that actually runs the model is Gradio on ZeroGPU,
+not Docker. The Render deployment is unaffected and stays as it is; the two
+serve the same pinned checkpoint, which `tests/test_space.py` enforces.
 
-## Space repository contents
+`deploy/space/` holds everything specific to the Space.
 
-Copy this file to `README.md` at the root of the Space repository, then upload
-only `app/`, `src/`, `deploy/`, `Dockerfile`, `requirements-deploy.txt`, and
-`.dockerignore`. Do not commit the `.pt`, HAM10000 data, user uploads, or the
-500 gallery images to the Space Git repository.
+## Assemble the Space repository
 
-## Publish and mount assets
-
-1. Create a Hugging Face **model repository** and upload the selected
-   `C1_seed2/best.pt` as `best.pt`.
-2. Create a Hugging Face **dataset repository** and upload the complete
-   `epoch0100_seed0/` directory, including `images/`, `synthetic_df.csv`,
-   `metadata.json`, and `_READY.json`.
-3. In the Space settings, attach the model repository as a read-only volume at
-   `/models` and the dataset repository as a read-only volume at `/gallery`.
-4. Add these non-secret Space variables:
+Create the Space with **SDK: Gradio**, then set hardware to **ZeroGPU** in
+Settings. Upload:
 
 ```text
-DDPM_DERM_MODEL_PATH=/models/best.pt
-DDPM_DERM_MODEL_MANIFEST=/app/deploy/model_manifest.json
-DDPM_DERM_CLASS_MAP_PATH=/app/deploy/class_to_idx.json
-DDPM_DERM_GALLERY_DIR=/gallery/epoch0100_seed0
+README.md          <- deploy/space/README.md   (carries the Space metadata block)
+app.py             <- deploy/space/app.py
+requirements.txt   <- deploy/space/requirements.txt
+src/ddpm_derm/     <- deploy.py, model.py, config.py and their package files
+deploy/model_manifest.json
+deploy/class_to_idx.json
+deploy/download_render_assets.py
 ```
 
-No token is required at application runtime when the repositories are attached
-as volumes. If private assets are used, configure the volume permissions in the
-Space settings; never hard-code an HF token.
+`app.py` expects `src/` and `deploy/` as siblings, exactly as in this
+repository, so copying those two directories in place is enough.
+
+**Do not upload** the `.pt` files, the HAM10000 data, or the 500 gallery images.
+`app.py` fetches the checkpoint and the gallery at startup by pinned revision
+and the download script hash-checks the archive; that is what keeps the Space
+repository small and its provenance auditable.
+
+No token is needed at runtime: both source repositories are public. Never
+hard-code an HF token.
+
+## Why the app looks the way it does
+
+- Inference is the same `ClassifierService` the FastAPI deployment uses, so the
+  Space cannot drift from Render in preprocessing, class order, or checkpoint
+  validation.
+- `@spaces.GPU` is present because the free tier is ZeroGPU-gated, not because
+  the model needs a GPU. It is a 42.7 MB ResNet-18; the service stays on CPU so
+  a between-call GPU deallocation cannot strand the weights on a dead device.
+- The guarded `import spaces` degrades to a no-op decorator, so the module stays
+  importable outside a Space.
 
 ## Acceptance checks after the Space builds
 
-1. `/health` returns `status=ok`, `variant=C1`, `seed=2`, and the gallery version.
-2. `/docs` shows the `/api/predict` response schema.
-3. A valid JPG/PNG/WebP below 5 MB returns exactly seven finite probabilities
-   that sum to approximately 1 and includes the medical disclaimer.
-4. A damaged file, MIME mismatch, unsupported extension, and oversized upload
-   each return a clear 4xx response.
-5. The gallery renders the deterministic first 24 manifest rows.
-6. Confirm the app never writes uploaded images and performs no request-time DDPM.
-7. Confirm the visible page includes HAM10000/ViDIR attribution, the paper DOI,
-   CC BY-NC 4.0 link, modification notice, and non-commercial-use statement.
+1. The Space starts and the log shows `RENDER_ASSETS_OK` with the pinned
+   revisions and `gallery_pngs=500`.
+2. The header reports `C1 seed 2` and the gallery version `epoch0100_seed0`.
+3. Uploading a dermatoscopic image returns exactly seven finite probabilities.
+   Verified locally against the pinned assets on 2026-09-06: they sum to
+   `1.0`, and the first gallery image scores `nv 0.9434` / `df 0.0000` — which
+   is the distribution shift the diagnostics already record, not a bug.
+4. The gallery tab shows 24 images.
+5. The page carries the medical disclaimer, the CC BY-NC 4.0 link, the ViDIR
+   attribution, the DOI, and the statement of modifications.
+6. An oversized image (over 20,000,000 pixels) is refused with a clear message.
 
-Only after all checks pass should the public Space URL be recorded as validated.
+## Boundary
+
+A successful build proves the Space serves the pinned checkpoint. It does not
+say anything about model accuracy, and nothing here changes the deployed
+classifier, which remains C1 seed 2 selected on validation df F1.
