@@ -1,10 +1,20 @@
-# C4-filtered — pre-registered design (not yet executed)
+# C4-filtered — pre-registered design (executed 2026-09-06)
 
-Status: **gate evaluated 2026-09-05; the condition is cleared to run, on the
-current published pool.** Nothing has been trained yet. The acceptance rule in
-§4 and every other rule below are unchanged from pre-registration — only the
-gate in §2 has been resolved, and it resolved against the reasoning that
-created it. See "Gate outcome" immediately below.
+Status: **executed.** The gate was resolved on 2026-09-05 and the condition ran
+on 2026-09-06 under run version `v1_c4_filtered`, implementation commit
+`e68b3a7`. 155 of the 500 images cleared the threshold; the test split was
+evaluated once, across seeds 0/1/2.
+
+Result: **parity with C1, a real gap over C4** — test df F1 `0.6657 +/- 0.0182`
+against C1 `0.6598 +/- 0.0423` and C4 `0.6115 +/- 0.0423`. The `+0.0059` over C1
+is less than one test image's worth on 16 df; the `+0.0541` over C4 exceeds
+either seed spread. The distance criterion removed the harm the unfiltered pool
+was doing without beating plain duplication. Full entry, limits and disclosures:
+`EXPERIMENT_LOG.md`, 2026-09-06.
+
+Every rule below is as pre-registered. Nothing in §3 to §7 was changed at any
+point; only the gate in §2 was resolved, and it resolved against the reasoning
+that created it. See "Gate outcome" immediately below.
 
 ## Gate outcome (2026-09-05)
 
