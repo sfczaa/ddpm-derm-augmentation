@@ -18,6 +18,7 @@ between-call GPU deallocation cannot strand the weights on a dead device.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -65,9 +66,26 @@ def fetch_assets() -> None:
     )
 
 
-fetch_assets()
+def stage_data_sentinel() -> None:
+    """Give `ddpm_derm.config` a data directory before anything imports it.
 
-from ddpm_derm.deploy import (  # noqa: E402  (import after assets exist)
+    `config.py` runs `DATA_DIR = resolve_data_dir()` at *import* time and raises
+    unless it finds a directory containing `manifests/class_to_idx.json`. The
+    Render image satisfies this by copying the class map into `data/manifests/`
+    in its Dockerfile; the Space has no build step, so it is staged here instead.
+    Without this the Space crashes on startup with a FileNotFoundError that says
+    nothing about the real cause.
+    """
+    manifests = ASSET_ROOT / "data" / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT / "deploy" / "class_to_idx.json", manifests / "class_to_idx.json")
+    os.environ["DDPM_DERM_DATA_DIR"] = str(ASSET_ROOT / "data")
+
+
+fetch_assets()
+stage_data_sentinel()
+
+from ddpm_derm.deploy import (  # noqa: E402  (import after assets and data dir exist)
     DISCLAIMER,
     MAX_IMAGE_PIXELS,
     ClassifierService,
