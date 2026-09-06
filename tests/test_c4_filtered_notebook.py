@@ -147,6 +147,26 @@ class C4FilteredNotebookTests(unittest.TestCase):
         self.assertIn("results_C4_FILTERED_seed", self.code)
         self.assertIn("evaluates the test split once", self.code)
 
+    def test_selection_is_run_all_safe(self):
+        # A real Colab attempt died here: phase 2 had already written a valid
+        # record, and re-running the notebook hit an unconditional
+        # "assert not SELECTION_RECORD.exists()" that refused to continue. The
+        # selection rule is deterministic and the record carries the hash of the
+        # pool it measured, so an existing complete record must be reused rather
+        # than block the run.
+        self.assertNotIn("assert not SELECTION_RECORD.exists()", self.code)
+        self.assertIn("if SELECTION_RECORD.exists():", self.code)
+        self.assertIn("reusing the existing selection", self.code)
+
+    def test_a_partial_selection_record_is_still_refused(self):
+        # Reuse is safe only for a finished selection. A record without the
+        # gate verdict, or one that measured a different candidate pool, cannot
+        # be trusted to describe what is on disk.
+        self.assertIn('assert "condition_runnable" in existing', self.code)
+        self.assertIn("a partial selection record exists", self.code)
+        self.assertIn("existing[\"candidate_manifest\"].endswith(CANDIDATE_MANIFEST.name)", self.code)
+        self.assertIn("assert ACCEPTED_MANIFEST.is_file()", self.code)
+
     def test_the_published_pool_directory_is_not_written_to(self):
         # The accepted manifest goes into the run root; the images are still
         # resolved out of the published pool through --generated-root.
