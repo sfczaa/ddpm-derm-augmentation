@@ -360,7 +360,8 @@ def classifier_output_paths(base_dir, arch: str, variant: str, seed: int):
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a downstream HAM10000 classifier.")
-    p.add_argument("--variant", default="C0", choices=["C0", "C1", "C4"])
+    p.add_argument("--variant", default="C0",
+                   choices=["C0", "C1", "C4", "C4_FILTERED"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=32)
@@ -414,10 +415,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--evaluation-scope", default="full",
         choices=["full", "validation_only"],
     )
+    p.add_argument(
+        "--accepted-manifest", default=None,
+        help="C4_FILTERED only: the accepted-subset manifest written by "
+             "scripts/c4_filtered_select.py. Selection happens there, against "
+             "the judge; this flag only names the result.",
+    )
     args = p.parse_args(argv)
     if args.variant == "C4" and not args.generated_manifest:
         p.error("--variant C4 requires --generated-manifest "
                 "(no default synthetic dir is read)")
+    if args.variant == "C4_FILTERED" and not args.accepted_manifest:
+        p.error("--variant C4_FILTERED requires --accepted-manifest "
+                "(the selected subset, not the full candidate pool)")
+    if args.accepted_manifest and args.variant != "C4_FILTERED":
+        p.error("--accepted-manifest is only valid with --variant C4_FILTERED")
+    if args.accepted_manifest and args.mixture_synthetic_count is not None:
+        p.error("--accepted-manifest and --mixture-synthetic-count are "
+                "different selection rules; use one")
     if args.run_label and not args.output_dir:
         p.error("--run-label requires an explicit isolated --output-dir")
     if args.mixture_synthetic_count is not None:
@@ -484,7 +499,16 @@ def main(argv=None) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)
 
     data_intervention = None
-    if args.mixture_synthetic_count is None:
+    if args.accepted_manifest is not None:
+        full_train_frame, data_intervention = (
+            manifests.build_classifier_filtered_frame(
+                df_target_count=args.df_target_count,
+                seed=args.seed,
+                accepted_manifest=args.accepted_manifest,
+                generated_root=args.generated_root,
+            )
+        )
+    elif args.mixture_synthetic_count is None:
         full_train_frame = manifests.build_classifier_frame(
             args.variant, split="train", df_target_count=args.df_target_count,
             seed=args.seed, limit=None,

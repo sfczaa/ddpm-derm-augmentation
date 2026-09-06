@@ -28,6 +28,10 @@ GENERATED_REQUIRED_COLUMNS = REQUIRED_COLUMNS + ["source"]
 GENERATED_SOURCE = "synthetic"
 MIXTURE_SELECTION_ALGORITHM = "sha256_image_id_prefix_v1"
 MIXTURE_REAL_DUPLICATION_ALGORITHM = "sha256_real_image_id_cycle_prefix_v1"
+FILTERED_SELECTION_ALGORITHM = "nn_distance_threshold_accepted_set_v1"
+# C4_FILTERED_EXPERIMENT_DESIGN.md section 4: below this many accepted images
+# the condition is not run and the shortfall is reported as the result.
+FILTERED_MINIMUM_ACCEPTED = 50
 
 
 def load_split(split: str) -> pd.DataFrame:
@@ -261,6 +265,95 @@ def build_classifier_mixture_frame(
         "original_real_df_count": n_real,
         "duplicated_real_df_count": duplicated_real_count,
         "duplicated_real_image_ids_sha256": identity_hash(duplicated_real_ids),
+        "total_df_count": df_target_count,
+    }
+    return out, intervention
+
+
+def build_classifier_filtered_frame(
+    *,
+    df_target_count: int,
+    seed: int,
+    accepted_manifest: str | Path,
+    generated_root: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Build the C4-filtered frame from an already-selected synthetic subset.
+
+    ``accepted_manifest`` is the output of ``scripts/c4_filtered_select.py``:
+    the synthetic rows whose nearest-neighbour distance into the real train df
+    clears the threshold fixed in C4_FILTERED_EXPERIMENT_DESIGN.md section 4.
+    Selection happens there, against the judge; this function only composes the
+    frame, so the acceptance rule has exactly one implementation.
+
+    Every accepted row is used -- there is no top-N -- and the remaining df
+    slots are filled by the same deterministic real duplication the mixture
+    path uses. df totals ``df_target_count`` either way, so C4-filtered differs
+    from C1 only in where those df rows come from.
+    """
+    frame = load_split("train")
+    gen = load_generated_manifest(accepted_manifest, root=generated_root)
+    if gen["image_id"].isna().any() or (gen["image_id"].astype(str).str.len() == 0).any():
+        raise ValueError("accepted manifest image_id must be non-null and non-empty")
+    if gen["image_id"].duplicated().any():
+        raise ValueError("accepted manifest image_id values must be unique")
+
+    n_real = int((frame["label_idx"] == config.TARGET_CLASS_IDX).sum())
+    if n_real == 0:
+        raise ValueError("fixed train split has no real df rows")
+    max_synthetic = df_target_count - n_real
+    if max_synthetic <= 0:
+        raise ValueError(
+            f"df_target_count={df_target_count} must exceed the {n_real} real train df rows"
+        )
+    if len(gen) > max_synthetic:
+        raise ValueError(
+            f"accepted manifest has {len(gen)} rows but at most {max_synthetic} "
+            f"synthetic df rows fit under df_target_count={df_target_count}"
+        )
+    if len(gen) < FILTERED_MINIMUM_ACCEPTED:
+        raise ValueError(
+            f"only {len(gen)} synthetic rows accepted; the pre-registered design "
+            f"does not run this condition below {FILTERED_MINIMUM_ACCEPTED}. "
+            "Report the shortfall as the result instead of training on it."
+        )
+
+    selected = gen.sort_values("image_id", kind="mergesort").reset_index(drop=True)
+
+    real_target_count = df_target_count - len(selected)
+    real_df = frame[frame["label_idx"] == config.TARGET_CLASS_IDX].copy()
+    real_df["_filtered_order_key"] = real_df["image_id"].astype(str).map(
+        lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    )
+    real_df = real_df.sort_values(
+        ["_filtered_order_key", "image_id"], kind="mergesort"
+    ).drop(columns=["_filtered_order_key"]).reset_index(drop=True)
+    duplicated_real_count = real_target_count - n_real
+    duplicate_indices = np.arange(duplicated_real_count) % n_real
+    duplicated_real = real_df.iloc[duplicate_indices].copy()
+    real = pd.concat([frame, duplicated_real], ignore_index=True)
+    real["source"] = "real"
+    out = pd.concat([real, selected], ignore_index=True)
+    out = out.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    def identity_hash(values: list[str]) -> str:
+        payload = json.dumps(
+            values, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    intervention = {
+        "name": "synthetic_distance_threshold_filter",
+        "selection_algorithm": FILTERED_SELECTION_ALGORITHM,
+        "accepted_synthetic_count": len(selected),
+        "accepted_synthetic_image_ids_sha256": identity_hash(
+            selected["image_id"].astype(str).tolist()
+        ),
+        "real_duplication_algorithm": MIXTURE_REAL_DUPLICATION_ALGORITHM,
+        "original_real_df_count": n_real,
+        "duplicated_real_df_count": duplicated_real_count,
+        "duplicated_real_image_ids_sha256": identity_hash(
+            duplicated_real["image_id"].astype(str).tolist()
+        ),
         "total_df_count": df_target_count,
     }
     return out, intervention
