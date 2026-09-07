@@ -237,13 +237,19 @@ docker run --rm -p 7860:7860 `
 
 Then check `http://localhost:7860/health`, `/docs`, and the upload UI.
 
-Hugging Face currently requires a paid plan for Docker Spaces, so the free
-public deployment route uses `Dockerfile.render` and the root `render.yaml`.
-The image build downloads pinned public Hub revisions: a 42.7 MB
+Hugging Face made both Gradio and Docker Spaces paid for personal accounts in
+2026, so the public deployment route is Render: `Dockerfile.render` and the root
+`render.yaml`. The image build downloads pinned public Hub revisions: a 42.7 MB
 deployment-only checkpoint derived without retraining, and a SHA-verified 3 MB
 archive containing the exact 500-image gallery. The single-archive asset path
-was downloaded and safely extracted locally. See `deploy/README_RENDER.md` and
-`deploy/README_SPACE.md`.
+was downloaded and safely extracted locally. See `deploy/README_RENDER.md`.
+
+**There is no Hugging Face Space.** The free exception is up to two Gradio
+Spaces on ZeroGPU, and an entry point for exactly that is implemented and tested
+in `deploy/space/` (see `deploy/README_SPACE.md`) — but it has not been
+deployed, so nothing here should be read as a running Space. The project's
+Hugging Face presence is the Hub: the model and gallery repositories the demo
+downloads at build time.
 
 Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
