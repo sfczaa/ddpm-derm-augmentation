@@ -4,7 +4,7 @@
 # the free tier is ZeroGPU-gated, so the CUDA build from PyPI is what belongs
 # here. Inference itself still runs on CPU (see app.py).
 spaces>=0.30
-gradio>=6.16.0,<7
+gradio>=6.26.0,<7
 torch>=2.13.0,<3
 torchvision>=0.17,<1
 numpy>=1.24,<3
