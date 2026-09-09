@@ -54,7 +54,8 @@ def _default_ckpt() -> Path:
 def load_model(ckpt_path: Path, device):
     # Trusted checkpoint produced by train_ddpm; it contains full training
     # state, so PyTorch 2.6's weights_only=True default cannot load it.
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    from ddpm_derm.checkpoint import load_checkpoint
+    ckpt = load_checkpoint(ckpt_path, map_location=device)
     img_size = int(ckpt.get("img_size", 64))
     tiny = bool(ckpt.get("tiny", False))
     model = build_unet(img_size=img_size, tiny=tiny).to(device)

@@ -1,9 +1,9 @@
 # ddpm-derm-augmentation
 
-Portfolio project: **can a DDPM actually help a downstream classifier** on the
-imbalanced HAM10000 skin-lesion dataset? Target minority class is **df**
-(dermatofibroma, only 115 images). End goal is a deployable demo
-(FastAPI + Docker, with versioned assets on Hugging Face Hub).
+An experimental comparison of DDPM augmentation and real-image duplication
+for classification on the imbalanced HAM10000 dataset. The target minority
+class is **df** (dermatofibroma, 115 images). The repository also contains a
+FastAPI demo with Docker packaging and versioned assets on Hugging Face Hub.
 
 > Status: **The formal matched-585 experiment is complete and the Stage 4
 > deployment MVP is implemented.** The selected deploy candidate is C1@585
@@ -198,7 +198,8 @@ ineffective. The existing C1 seed-2 deployment remains unchanged.
 ## Stage 4 deployment MVP
 
 The service provides `/health`, `/api/predict`, `/api/gallery`, OpenAPI docs,
-and a browser UI. Uploads are held in memory only. Extension, MIME type,
+and a browser UI. Upload requests are bounded before multipart parsing; a single image is held
+in memory and closed after processing. Extension, MIME type,
 content format, dimensions, and a 5 MB size limit are enforced before
 inference. Startup fails on missing or mismatched checkpoint hash, class map,
 gallery `_READY.json`, metadata, manifest, or image files.
@@ -237,19 +238,12 @@ docker run --rm -p 7860:7860 `
 
 Then check `http://localhost:7860/health`, `/docs`, and the upload UI.
 
-Hugging Face made both Gradio and Docker Spaces paid for personal accounts in
-2026, so the public deployment route is Render: `Dockerfile.render` and the root
-`render.yaml`. The image build downloads pinned public Hub revisions: a 42.7 MB
-deployment-only checkpoint derived without retraining, and a SHA-verified 3 MB
-archive containing the exact 500-image gallery. The single-archive asset path
-was downloaded and safely extracted locally. See `deploy/README_RENDER.md`.
-
-**There is no Hugging Face Space.** The free exception is up to two Gradio
-Spaces on ZeroGPU, and an entry point for exactly that is implemented and tested
-in `deploy/space/` (see `deploy/README_SPACE.md`) — but it has not been
-deployed, so nothing here should be read as a running Space. The project's
-Hugging Face presence is the Hub: the model and gallery repositories the demo
-downloads at build time.
+The Render deployment uses `Dockerfile.render` and `render.yaml`. The image
+build downloads pinned Hub revisions: a deployment-only checkpoint and a
+SHA-verified archive of the 500-image gallery. See `deploy/README_RENDER.md`.
+An optional Gradio entry point is available in `deploy/space/`; its presence
+in this repository does not establish that a Space is deployed. Hosting
+availability and pricing should be checked with the provider before deployment.
 
 Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
@@ -314,8 +308,8 @@ without trusting an adjacent metadata file.
 The synthetic images are farther from the training set than genuinely new real `df` are. Only `0.2%` of the
 500 falls inside the closest validation `df` in the embedding and none does in pixel space, and the
 probability that a synthetic image is closer to the training set than a random genuinely-new real `df` is
-`0.060` and `0.038` in the two spaces, against `0.5` for indistinguishable. These measurements rule out
-memorisation as the explanation for the small C4-C1 difference.
+`0.060` and `0.038` in the two spaces, against `0.5` for indistinguishable. These measurements do not indicate close copying under the tested distance
+measures; they do not rule out all forms of memorisation or privacy leakage.
 
 ### The diagnostic instead points to distribution shift
 
@@ -332,7 +326,7 @@ generator producing near-duplicates.
 
 A resolution ladder found a synthetic-to-new-real-`df` distance ratio of `1.550` at 64px and `1.532` at 8px.
 At 8px, only coarse colour and shape remain, so the gap is not high-frequency detail and raising generator
-resolution would not close it. This ruled out a costly higher-resolution retrain before it was spent.
+resolution would not close it. This finding did not support prioritising a higher-resolution retrain.
 
 Saturation is `0.093` against `0.188` for real `df`, contrast is `0.088` against `0.145`, and mean RGB is
 approximately `0.5` in every channel, at the centre of the normalised range. This is a sample regressing
@@ -371,9 +365,9 @@ worse. The published setting is washed out but every image still reads as skin.
 
 ### Where this leaves the generator
 
-Three candidate explanations have now been excluded on evidence rather than intuition: memorisation, a
-high-frequency resolution deficit, and class averaging. The sweep adds a fourth, that sampler settings alone
-would fix it. Colour and contrast respond to eta, but nothing moves the samples onto the real `df` manifold,
+The diagnostics did not support close copying, a high-frequency resolution deficit, or class averaging
+as the main explanation under the tested measures. The sampler sweep also did not recover the measured
+real-df distribution. Colour and contrast respond to eta, but nothing moves the samples onto the real `df` manifold,
 so a sampler change would produce more saturated images that are still off-distribution.
 
 What remains consistent with all of it is a capacity or data limit: 85 real training images is very little
@@ -407,12 +401,12 @@ Read against the pre-registered rules, the result is **parity with C1 and a real
 ones. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, so the
 unfiltered pool was actively costing accuracy and filtering removed that cost.
 
-So the distance criterion works as a filter of harm, not as a source of benefit. It is worth noting that
-this is not explained by the filter collapsing variety: within-set spacing in the accepted subset is
+In this experiment, filtering improved the mean relative to unfiltered C4, with little difference
+from C1. Within-set spacing did not indicate reduced variety: within-set spacing in the accepted subset is
 `1.820x` the real `df` set, so the accepted images are more spread out than the real ones, not less.
 
-With 16 real `df` in test, none of these differences can be significant and none was tested. The
-deliverable is the procedure and the measured distances, not the delta.
+No significance test was performed. The 16 real `df` test cases and three seeds limit
+precision, so these differences remain descriptive and do not establish a reliable benefit.
 
 ### Reproducibility
 

@@ -79,7 +79,8 @@ def _set_rng_state(state: dict) -> None:
 
 def _load_trusted_checkpoint(path, device) -> dict:
     """Load a checkpoint produced by this trainer, including its RNG state."""
-    return torch.load(path, map_location=device, weights_only=False)
+    from ddpm_derm.checkpoint import load_checkpoint
+    return load_checkpoint(path, map_location=device)
 
 
 def _checkpoint_format(run_identity: dict) -> str:

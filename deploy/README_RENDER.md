@@ -1,15 +1,15 @@
 # Render Free deployment
 
-This route preserves the FastAPI service without a paid Hugging Face Space.
+This route packages the FastAPI service for Render.
 The public Hugging Face model and dataset repositories remain the versioned
 asset source. `Dockerfile.render` downloads only pinned revisions during the
 image build; no HF token is required or stored.
 
 ## Free-tier constraints
 
-Render Free currently provides 512 MB RAM and 0.1 CPU. It spins down after 15
-minutes without inbound traffic, so the first request after idle can take about
-one minute. The filesystem is ephemeral. This demo does not save uploads or
+The original deployment targeted a free instance with limited memory and
+CPU. Cold starts were observed after idle periods. Confirm current plan limits
+and availability with Render before deploying. The filesystem is ephemeral. This demo does not save uploads or
 write application state, so ephemeral storage is acceptable.
 
 The deployment-only checkpoint was exported from the formal C1 seed-2

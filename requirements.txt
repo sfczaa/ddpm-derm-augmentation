@@ -5,10 +5,10 @@
 
 pandas>=2.0
 numpy>=1.24
-pillow>=9.0
+pillow>=12.3.0
 
 # --- Colab / GPU training (already present on Colab, listed for reproducibility) ---
-torch>=2.0
+torch>=2.13.0
 torchvision>=0.15
 
 # --- frozen CoCa second classifier (Colab validation downloads real weights) ---
@@ -22,10 +22,10 @@ scikit-learn==1.8.0
 # supplies both the model definition and the training preprocessing. gdown fetches
 # the official checkpoint; its SHA-256 is verified before any training runs.
 timm==0.9.16
-gdown>=5.1
+gdown>=5.2.2
 
 # --- stage 2: DDPM generator (Colab) ---
-diffusers>=0.27      # UNet2DModel (class-conditional noise predictor)
+diffusers>=0.38.0      # UNet2DModel (class-conditional noise predictor)
 
 # --- stage 4 deployment ---
 # See requirements-deploy.txt for the CPU FastAPI container dependencies.
