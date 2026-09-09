@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_post_failure_embedding_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "1a6cc0bf46e7ae6b37b42afedcdc017ca4f6d340"
+PINNED_GIT_COMMIT = "7783c3a9fb360dc459ec02e2d742d3361bdcd88d"
 
 
 class CoCaEmbeddingNotebookTests(unittest.TestCase):

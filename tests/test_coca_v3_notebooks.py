@@ -159,7 +159,7 @@ class CoCaV3NotebookTests(unittest.TestCase):
             "20260720T085738Z",
             '"v2_weighted_ce"',
             "inverse_sqrt_train_frequency",
-            "f14b041d691c9a6fa9dc7e407e574b69c753ada1",
+            "0da029e8452aceaa7817e48ad6a02ec33ca03c5e",
             "v2_failure_evidence",
         ):
             self.assertIn(required, code)

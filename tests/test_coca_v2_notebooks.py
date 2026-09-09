@@ -12,7 +12,7 @@ NAMES = (
     "colab_coca_v2_weighted_validation.ipynb",
     "colab_coca_v2_weighted_classifier.ipynb",
 )
-IMPLEMENTATION_COMMIT = "f14b041d691c9a6fa9dc7e407e574b69c753ada1"
+IMPLEMENTATION_COMMIT = "6e2c60c52b367d864a3f96d75cfd401076b72186"
 
 
 def load(name):

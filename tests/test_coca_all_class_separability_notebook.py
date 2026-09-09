@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_all_class_separability_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "e687d253f2824d6815d41cc43bdb2ab3443be188"
+PINNED_GIT_COMMIT = "77262576c836ea69a5f1c2d6be5fadbccf17e3e4"
 
 
 class AllClassSeparabilityNotebookTests(unittest.TestCase):

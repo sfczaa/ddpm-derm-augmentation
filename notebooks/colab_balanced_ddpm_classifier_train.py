@@ -12,7 +12,7 @@ RUN_MODE = "fresh"  # "fresh" or "resume"
 RUN_VERSION = "c4_sqrt_balanced_v1"
 
 # %%
-EXPECTED_COMMIT = "2ea7a63834f55473ebaf6477bad3b33a538eb083"
+EXPECTED_COMMIT = "a6fc90c8f946c0d11e3e5e22d65131a092be361a"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
 BRANCH = "balanced-ddpm-exploration"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
