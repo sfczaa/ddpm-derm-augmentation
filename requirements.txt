@@ -15,7 +15,7 @@ torchvision>=0.15
 open_clip_torch==3.3.0
 
 # --- frozen-CoCa representation diagnostic: fixed logistic-regression probe only ---
-scikit-learn==1.8.0
+scikit-learn==1.9.0
 
 # --- PanDerm-Base C1 full fine-tuning (Colab; weights are NOT redistributable) ---
 # timm is pinned to the version required by the upstream PanDerm checkout, which
