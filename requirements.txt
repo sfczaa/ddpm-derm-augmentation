@@ -25,7 +25,7 @@ timm==0.9.16
 gdown>=5.2.2
 
 # --- stage 2: DDPM generator (Colab) ---
-diffusers>=0.38.0      # UNet2DModel (class-conditional noise predictor)
+diffusers>=0.40.0      # UNet2DModel (class-conditional noise predictor)
 
 # --- stage 4 deployment ---
 # See requirements-deploy.txt for the CPU FastAPI container dependencies.
