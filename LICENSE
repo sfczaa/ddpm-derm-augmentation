@@ -1,0 +1,65 @@
+MIT License
+
+Copyright (c) 2026 MengXuan Yu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+SCOPE: WHAT THE MIT LICENSE ABOVE DOES AND DOES NOT COVER
+================================================================================
+
+The MIT license above covers the source code in this repository: everything
+under src/, app/, scripts/, tests/, deploy/, and notebooks/.
+
+It does NOT cover the data this project trains on, nor the artifacts derived
+from that data. Those carry the upstream dataset's terms, which are more
+restrictive.
+
+HAM10000 (training data, not committed here)
+--------------------------------------------
+The ISIC 2018 distribution identifies HAM10000 as Creative Commons
+Attribution-NonCommercial 4.0 International (CC BY-NC 4.0):
+https://creativecommons.org/licenses/by-nc/4.0/
+
+    HAM10000 Dataset (c) by ViDIR Group, Department of Dermatology,
+    Medical University of Vienna.
+    Tschandl, P., Rosendahl, C. & Kittler, H. The HAM10000 dataset, a large
+    collection of multi-source dermatoscopic images of common pigmented skin
+    lesions. Scientific Data 5, 180161 (2018).
+    https://doi.org/10.1038/sdata.2018.161
+
+Derived artifacts are non-commercial
+------------------------------------
+Trained classifier and DDPM weights, generated synthetic images, and the
+published gallery are all derived from HAM10000. They inherit the
+NonCommercial restriction, and any redistribution must retain attribution, a
+link to the license, and an indication that changes were made. Use of this
+repository's code to train on other data is not restricted by that term.
+
+PanDerm backbone weights
+------------------------
+Not redistributed here. The fine-tuning path downloads the official upstream
+checkpoint at run time; its own terms apply and should be checked upstream
+before use.
+
+Not for clinical use
+--------------------
+This is an educational and portfolio project. Nothing here is a medical
+device, and no output is medical advice or fit for diagnosis or treatment.
