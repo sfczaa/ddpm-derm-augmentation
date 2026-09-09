@@ -25,6 +25,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pandas numpy pillow pydantic fastapi python-multipart scikit-learn pytest
+          # starlette's TestClient, which tests/test_deploy.py uses, needs this
+          python -m pip install httpx2
 
       - name: stage the data sentinel
         # ddpm_derm.config resolves DATA_DIR at *import* time and raises unless it
