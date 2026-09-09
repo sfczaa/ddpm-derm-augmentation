@@ -463,10 +463,9 @@ def main(argv=None) -> None:
     start_epoch = 1
     history = []
     if args.resume:
-        # This is our own full training checkpoint (optimizer + RNG state), not
-        # an untrusted weights-only artifact. PyTorch 2.6 defaults to
-        # weights_only=True, which cannot deserialize the saved NumPy RNG state.
-        ckpt = torch.load(last_path, map_location=device, weights_only=False)
+        # Restore full training state with a restricted NumPy RNG allowlist.
+        from ddpm_derm.checkpoint import load_checkpoint
+        ckpt = load_checkpoint(last_path, map_location=device)
         ddpm_sampler.require_matching_checkpoint_strategy(
             ckpt, args.sampler_strategy
         )

@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
+
+from .uploads import image_upload
 
 from ddpm_derm.deploy import (
     DISCLAIMER,
@@ -93,8 +95,14 @@ def create_app(service=None, settings: DeploymentSettings | None = None) -> Fast
             raise HTTPException(status_code=404, detail="gallery image not found") from exc
         return FileResponse(path)
 
-    @app.post("/api/predict", response_model=PredictionResponse)
-    async def predict(request: Request, image: UploadFile = File(...)) -> PredictionResponse:
+    @app.post(
+        "/api/predict", response_model=PredictionResponse,
+        openapi_extra={"requestBody": {"required": True, "content": {
+            "multipart/form-data": {"schema": {"type": "object", "required": ["image"],
+                "properties": {"image": {"type": "string", "format": "binary"}}}},
+        }}},
+    )
+    async def predict(request: Request, image: UploadFile = Depends(image_upload)) -> PredictionResponse:
         try:
             data = await image.read(MAX_UPLOAD_BYTES + 1)
             decoded = decode_uploaded_image(image.filename, image.content_type, data)

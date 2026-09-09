@@ -258,10 +258,10 @@ class ClassifierService:
 
         self._torch = torch
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(
+        from ddpm_derm.checkpoint import load_checkpoint
+        checkpoint = load_checkpoint(
             self.assets.settings.model_path,
-            map_location=self._device,
-            weights_only=False,
+            map_location=self._device
         )
         for key in ("model_state_dict", "config", "class_to_idx"):
             if key not in checkpoint:

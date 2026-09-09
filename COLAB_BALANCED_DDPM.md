@@ -130,11 +130,11 @@ assert SMOKE_SNAPSHOTS.is_dir() and SMOKE_PREVIEWS.is_dir()
 
 ~~~python
 import json
-import torch
+from ddpm_derm.checkpoint import load_checkpoint
 
 smoke_ckpt_path = SMOKE_LOCAL_CKPT / "run_seed0_last.pt"
-smoke_ckpt = torch.load(
-    smoke_ckpt_path, map_location="cpu", weights_only=False
+smoke_ckpt = load_checkpoint(
+    smoke_ckpt_path, map_location="cpu"
 )
 assert smoke_ckpt["sampler_strategy"] == "sqrt_balanced"
 assert smoke_ckpt["sampler_generator_state"] is not None

@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def sha256(path: Path) -> str:
@@ -66,7 +68,8 @@ def main() -> None:
 
     import torch
 
-    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    from ddpm_derm.checkpoint import load_checkpoint
+    checkpoint = load_checkpoint(source, map_location="cpu")
     required = ("model_state_dict", "config", "class_to_idx")
     missing = [key for key in required if key not in checkpoint]
     if missing:

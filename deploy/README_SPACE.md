@@ -1,18 +1,9 @@
 # Optional Hugging Face Space deployment
 
-This replaces the earlier Docker-Space handoff. Hugging Face changed its pricing
-in 2026: Gradio and Docker Spaces both run on compute and **require a paid plan
-to create** — PRO for personal accounts — with one exception the docs state
-plainly:
-
-> Static Spaces are free for everyone. Gradio and Docker Spaces run on compute
-> and require a paid plan to create: PRO for personal accounts, Team or
-> Enterprise for organizations. **Free personal accounts in good standing can
-> still host up to 2 Gradio Spaces running on ZeroGPU.**
-
-So the free route to a Space that actually runs the model is Gradio on ZeroGPU,
-not Docker. The Render deployment is unaffected and stays as it is; the two
-serve the same pinned checkpoint, which `tests/test_space.py` enforces.
+This is the optional Gradio entry point for the same pinned checkpoint used
+by Render. Confirm current account, hardware, and pricing requirements in
+Hugging Face before creating a Space. The repository does not establish that
+this entry point is deployed.
 
 `deploy/space/` holds everything specific to the Space.
 
@@ -25,7 +16,7 @@ Settings. Upload:
 README.md          <- deploy/space/README.md   (carries the Space metadata block)
 app.py             <- deploy/space/app.py
 requirements.txt   <- deploy/space/requirements.txt
-src/ddpm_derm/     <- deploy.py, model.py, config.py and their package files
+src/ddpm_derm/     <- deploy.py, checkpoint.py, model.py, config.py and their package files
 deploy/model_manifest.json
 deploy/class_to_idx.json
 deploy/download_render_assets.py

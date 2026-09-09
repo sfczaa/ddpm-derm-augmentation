@@ -118,7 +118,8 @@ def load_real_data_judge(checkpoint: Path) -> nn.Module:
     disqualified because its pretraining corpus cannot be shown to exclude
     HAM10000.
     """
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    from ddpm_derm.checkpoint import load_checkpoint
+    payload = load_checkpoint(checkpoint, map_location="cpu")
     state = payload.get("model_state_dict", payload)
     model = models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, state["fc.weight"].shape[0])
