@@ -21,7 +21,7 @@ scikit-learn==1.8.0
 # timm is pinned to the version required by the upstream PanDerm checkout, which
 # supplies both the model definition and the training preprocessing. gdown fetches
 # the official checkpoint; its SHA-256 is verified before any training runs.
-timm==0.9.16
+timm==1.0.29
 gdown>=5.2.2
 
 # --- stage 2: DDPM generator (Colab) ---
