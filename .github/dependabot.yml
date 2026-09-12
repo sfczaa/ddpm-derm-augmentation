@@ -1,10 +1,38 @@
+# Routine version-update pull requests are switched off here; security updates
+# are a repository setting and are unaffected by open-pull-requests-limit.
+#
+# This repository is a finished experiment record rather than a maintained
+# library. Every formal run stores its dependency versions inside an immutable
+# run identity, so a re-run under upgraded packages produces artifacts that no
+# longer match the archived ones. Floating the versions would quietly break the
+# thing the repository exists to preserve.
+#
+# The ignore entries below are the hard pins, kept so the reason travels with
+# the constraint instead of living only in a commit message.
 version: 2
 updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      # src/ddpm_derm/panderm.py raises unless timm is exactly this version: the
+      # pinned upstream PanDerm checkout supplies both the model definition and
+      # the training preprocessing through it.
+      - dependency-name: "timm"
+      # The frozen-CoCa diagnostics record scikit-learn's version in their
+      # immutable identity, and the fixed logistic probe's numerics are part of
+      # what the archived records certify.
+      - dependency-name: "scikit-learn"
+
   - package-ecosystem: "pip"
     directory: "/deploy/space"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      # deploy/space/README.md declares the Space's Gradio runtime in its
+      # sdk_version frontmatter. Raising the requirement without editing that
+      # field leaves the two disagreeing about which Gradio actually runs.
+      - dependency-name: "gradio"
