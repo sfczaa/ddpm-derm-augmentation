@@ -48,12 +48,13 @@ visible attribution, and recovery after a free-tier cold start.
 ## Public validation record
 
 Validated on 2026-07-14 at
-https://ddpm-derm-augmentation-demo.onrender.com from commit `df75c05` on the
-explicit Render Free plan. `/health` reported C1 seed 2 and
-`epoch0100_seed0`; a synthetic-gallery upload returned seven probabilities
-summing to approximately one and included the medical disclaimer. OpenAPI,
-the 24-item gallery response, a real `image/png` gallery route, attribution,
-MIME-mismatch 415, and damaged-image 400 checks passed.
+https://ddpm-derm-augmentation-demo.onrender.com from the Stage 4 demo commit
+(`96477f4` on `main`) on the explicit Render Free plan. `/health` reported C1
+seed 2 and `epoch0100_seed0`; a synthetic-gallery upload returned seven
+probabilities summing to approximately one and included the medical
+disclaimer. OpenAPI, the 24-item gallery response, a real `image/png`
+gallery route, attribution, MIME-mismatch 415, and damaged-image 400 checks
+passed.
 
 During a free-tier cold start, the first root request briefly returned Render's
 `x-render-routing: no-server` 404. The next health request woke the service and

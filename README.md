@@ -249,13 +249,13 @@ Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
 ## Deployment validation status
 
-The Render Blueprint built commit `df75c05` on the explicit free plan, and on
-2026-07-14 public checks passed for `/health`, OpenAPI, one valid prediction,
-MIME mismatch 415, damaged-image 400, the 24-item gallery API, an actual PNG
-gallery response, visible attribution, and the medical disclaimer. On the free
-tier the first request after a cold start briefly returned Render's
-`x-render-routing: no-server` 404; the following health request woke the service
-and returned 200.
+The Render Blueprint built the Stage 4 demo commit (`96477f4` on `main`) on
+the explicit free plan, and on 2026-07-14 public checks passed for `/health`,
+OpenAPI, one valid prediction, MIME mismatch 415, damaged-image 400, the
+24-item gallery API, an actual PNG gallery response, visible attribution, and
+the medical disclaimer. On the free tier the first request after a cold start
+briefly returned Render's `x-render-routing: no-server` 404; the following
+health request woke the service and returned 200.
 
 Separately, `docker build` was run locally on 2026-08-18: `GET /health` and one
 `POST /api/predict` with a generated non-patient fixture each returned 200 from
