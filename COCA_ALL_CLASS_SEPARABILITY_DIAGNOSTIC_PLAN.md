@@ -108,9 +108,8 @@ the priority. Prior synthetic domain-gap evidence is described separately and
 must not be generalized into a claim that synthetic data is universally
 ineffective for other backbones.
 
-## Delivery and runtime estimate
+## Execution
 
-- Local implementation and independent review: one code acceptance cycle.
-- Colab: one pass, encode 6995 + 1510 images once and run the four analyses;
-  estimated 10-25 minutes on a GPU plus model download/setup time. There are no
-  training epochs, optimizer, or checkpoints.
+Colab runs one pass: it encodes the 6995 train and 1510 validation images once
+and runs the four analyses. There are no training epochs, optimizer, or
+checkpoints.

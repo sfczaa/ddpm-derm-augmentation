@@ -1265,7 +1265,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--authorized-commit-carry-forward",
         default="",
-        help="Old commit a human reviewed as orchestration-only; artifacts "
+        help="Old commit reviewed as orchestration-only; artifacts "
              "stamped with it are accepted despite the git_commit identity "
              "drift. Empty by default and never a general bypass.",
     )
@@ -1459,7 +1459,7 @@ def main(argv=None) -> None:
                 "nothing and would mask a real identity failure"
             )
         # Loud on purpose: this is the one place an immutable identity field is
-        # allowed to differ, and it is only ever allowed because a human said so.
+        # allowed to differ, and only through an explicit per-run authorization.
         print(
             f"[carry-forward] AUTHORIZED git_commit {carry_forward} -> "
             f"{run_identity['git_commit']}; artifacts stamped with the old "

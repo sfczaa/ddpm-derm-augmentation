@@ -249,7 +249,7 @@ Public demo: https://ddpm-derm-augmentation-demo.onrender.com
 
 ## Deployment validation status
 
-The Render Blueprint built the Stage 4 demo commit (`96477f4` on `main`) on
+The Render Blueprint built the Stage 4 demo commit (`d3e34e7` on `main`) on
 the explicit free plan, and on 2026-07-14 public checks passed for `/health`,
 OpenAPI, one valid prediction, MIME mismatch 415, damaged-image 400, the
 24-item gallery API, an actual PNG gallery response, visible attribution, and

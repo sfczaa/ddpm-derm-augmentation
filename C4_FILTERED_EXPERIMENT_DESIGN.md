@@ -9,8 +9,8 @@ Result: **parity with C1, a real gap over C4** — test df F1 `0.6657 +/- 0.0182
 against C1 `0.6598 +/- 0.0423` and C4 `0.6115 +/- 0.0423`. The `+0.0059` over C1
 is less than one test image's worth on 16 df; the `+0.0541` over C4 exceeds
 either seed spread. The distance criterion removed the harm the unfiltered pool
-was doing without beating plain duplication. Full entry, limits and disclosures:
-`EXPERIMENT_LOG.md`, 2026-09-06.
+was doing without beating plain duplication. The full result and its limits are in
+`README.md`, section Turning the diagnostic into a selection rule: C4-filtered.
 
 Every rule below is as pre-registered. Nothing in §3 to §7 was changed at any
 point; only the gate in §2 was resolved, and it resolved against the reasoning

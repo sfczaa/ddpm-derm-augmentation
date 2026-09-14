@@ -5013,7 +5013,7 @@ NEW_COMMIT = "d" * 40
 
 
 class CommitCarryForwardTests(unittest.TestCase):
-    """The one narrow, human-authorized exception to git_commit immutability.
+    """The one narrow, explicitly authorized exception to git_commit immutability.
 
     git_commit is a deliberate identity-drift field: shipping any code fix
     normally orphans every artifact written before it. These tests pin the
@@ -5131,7 +5131,7 @@ class CommitCarryForwardTests(unittest.TestCase):
             panderm_run.require_matching_identity(
                 saved, current, authorized_commit_carry_forward=""
             )
-        # A different old commit is not the one the human reviewed.
+        # A different old commit is not the reviewed one.
         with self.assertRaisesRegex(ValueError, "PanDerm identity mismatch"):
             panderm_run.require_matching_identity(
                 saved, current, authorized_commit_carry_forward="e" * 40
@@ -5373,7 +5373,7 @@ class CommitCarryForwardTests(unittest.TestCase):
                     train_panderm.main(argv + ["--resume"])
             self.assertIn("identity mismatch", str(unauthorized.exception))
 
-            # Authorized by a human who reviewed that exact diff.
+            # Authorized after a review of that exact diff.
             with mock_runner_environment(git_commit=NEW_COMMIT, models=1):
                 train_panderm.main(
                     argv

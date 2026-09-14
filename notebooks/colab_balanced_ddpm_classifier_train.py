@@ -198,7 +198,7 @@ print("data/candidate preflight passed; candidate SHA256", CANDIDATE_SHA256)
 # `last.pt` is atomically replaced on Drive after every completed epoch. The
 # worst-case lost work is one unfinished epoch. Never run this `RUN_VERSION`
 # from two accounts at the same time. A leftover marker requires an explicit
-# human confirmation; the notebook never silently overwrites it.
+# manual confirmation; the notebook never silently overwrites it.
 
 # %%
 FIXED_CONFIG = {

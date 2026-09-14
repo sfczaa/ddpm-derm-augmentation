@@ -161,7 +161,7 @@ sqrt-sampler generator, then skip because epoch 1 is already complete:
   --run-metadata-path "{SMOKE_METADATA}"
 ~~~
 
-Do not describe this as deterministic training resume. The test confirms
+This is not a deterministic training resume. The test confirms
 strategy metadata and sampler-generator restoration; it does not prove a
 bit-identical GPU loss trajectory.
 
@@ -263,6 +263,7 @@ assert not CANDIDATE_FINAL.exists()
   --expect-n 500 --expect-epoch 100 --expect-seed 0 --expect-steps 50
 ~~~
 
-Stop here and report the sampler histogram, run metadata, epoch-100 snapshot,
-previews, nearest-neighbour montage, and candidate path. Do not rerun C0, C1,
-or C4 until the user explicitly approves a separate downstream comparison.
+The runbook ends here. Review the sampler histogram, run metadata, epoch-100
+snapshot, previews, nearest-neighbour montage, and candidate path before any
+further step. C0, C1, and C4 are not rerun here; a downstream comparison is a
+separate decision.

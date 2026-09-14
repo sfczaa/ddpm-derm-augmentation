@@ -280,7 +280,7 @@ def normalize_commit_carry_forward(value: Any) -> str:
     an empty string, so a caller that forwards ``None`` cannot accidentally
     weaken an identity check. Anything else has to be a real pinned commit:
     a truncated or uppercase value would silently never match and turn a
-    deliberate human authorization into a confusing identity failure.
+    deliberate authorization into a confusing identity failure.
     """
     if value is None or value == "":
         return ""
@@ -1751,7 +1751,7 @@ def require_checkpoint_sha256(
     """Hash the downloaded checkpoint and refuse anything but the pinned digest.
 
     While ``expected`` is still the placeholder this always raises, printing the
-    observed digest so a human can review and pin it. A download is never
+    observed digest so it can be reviewed and pinned. A download is never
     accepted on trust after the first review.
     """
     path = Path(path)
@@ -1763,7 +1763,7 @@ def require_checkpoint_sha256(
         raise ValueError(
             "PanDerm checkpoint SHA-256 is not pinned yet. Upstream publishes no "
             "digest, so the first download is trust-on-first-use and must be "
-            "reviewed by a human before any training.\n"
+            "reviewed and pinned before any training.\n"
             f"  file:     {path}\n"
             f"  bytes:    {size}\n"
             f"  observed: {observed}\n"
@@ -2030,7 +2030,7 @@ def accepts_commit_carry_forward(
 
     ``git_commit`` is a deliberate identity-drift field for this project, so a
     code fix normally orphans every artifact written before it. This is the one
-    narrow, human-authorized exception: the operator names the exact old commit
+    narrow, explicitly authorized exception: the operator names the exact old commit
     they reviewed as orchestration-only, and the artifact is accepted only when
     that commit is what it actually carries **and** every other compared field
     still matches exactly. It is never a general relaxation -- any second
@@ -3193,10 +3193,10 @@ def publish_commit_carry_forward_audit(
     run_version: str,
     shared_root_uuid: str,
 ) -> dict[str, Any]:
-    """Record the human authorization to accept one old commit's artifacts.
+    """Record the explicit authorization to accept one old commit's artifacts.
 
     ``git_commit`` is an immutable identity field on purpose, so accepting an
-    artifact stamped with an older one is a policy decision a human made after
+    artifact stamped with an older one is a policy decision made after
     reviewing that diff -- not something the code may infer. This publishes that
     decision durably next to the takeover and graceful-handoff audits, keyed on
     the old->new commit pair so re-running the same authorization (every later

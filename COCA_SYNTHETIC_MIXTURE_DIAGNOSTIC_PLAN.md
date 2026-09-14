@@ -37,10 +37,8 @@ If a coherent dose response appears, preregister one separate candidate and
 validation gate before any formal training. If it does not, stop synthetic-ratio
 tuning and investigate representation/model mismatch without test access.
 
-## Delivery and runtime estimate
+## Execution and checkpointing
 
-- Local implementation and independent review: one code acceptance cycle.
-- Colab: five sequential five-epoch validation-only runs, estimated 45-75
-  minutes on a GPU plus model download/setup time.
+- Colab: five sequential five-epoch validation-only runs.
 - Checkpoint cadence: every completed epoch; worst-case loss is one unfinished
   epoch. Resume must use the same attempt identity and no concurrent runtime.

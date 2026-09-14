@@ -40,9 +40,9 @@ outputs/
   directly.)
 - **Trained model checkpoints** → `outputs/classifier/checkpoints/<run>/`.
   `train_classifier.py` writes these automatically. `best.pt` is the one to keep
-  for the FastAPI/HF deployment later.
-- **The dataset itself** → NOT here. It stays in the top-level `data/` folder
-  (a sibling of this project). It is git-ignored and non-commercially licensed;
+  for evaluation and deployment.
+- **The dataset itself** → NOT here. It lives in `data/` inside the project
+  (a sibling `../data` also resolves). It is git-ignored and non-commercially licensed;
   never commit it. On Colab, upload it to Drive and set `DDPM_DERM_DATA_DIR`.
 - **Stage 4 deploy checkpoint** → the selected local candidate is
   `outputs/classifier_df585/checkpoints/C1_seed2/best.pt`. It remains ignored

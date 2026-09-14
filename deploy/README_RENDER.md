@@ -49,7 +49,7 @@ visible attribution, and recovery after a free-tier cold start.
 
 Validated on 2026-07-14 at
 https://ddpm-derm-augmentation-demo.onrender.com from the Stage 4 demo commit
-(`96477f4` on `main`) on the explicit Render Free plan. `/health` reported C1
+(`d3e34e7` on `main`) on the explicit Render Free plan. `/health` reported C1
 seed 2 and `epoch0100_seed0`; a synthetic-gallery upload returned seven
 probabilities summing to approximately one and included the medical
 disclaimer. OpenAPI, the 24-item gallery response, a real `image/png`

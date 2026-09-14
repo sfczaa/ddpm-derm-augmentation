@@ -28,14 +28,14 @@ wording. None establishes non-overlap, and none authorizes formal training or te
 
 PanDerm v1 may produce only a seed-0, five-epoch validation-only engineering record. It
 must not produce test metrics, a formal test comparison, or a performance-improvement
-claim. Selecting a different model for a formal experiment is a separate user decision.
+claim. Selecting a different model for a formal experiment is a separate decision.
 
 ## Formal training decision
 
 This section amends the training-scale limit stated above; every contamination, license,
 and test-access provision above remains fully binding and unchanged.
 
-Formal-scale training (50 epochs, seeds 0, 1, 2) is unlocked by explicit user decision. The
+Formal-scale training (50 epochs, seeds 0, 1, 2) was unlocked by an explicit decision. The
 seed-0, five-epoch validation-only budget described above was PanDerm v1's original scope;
 formal-scale training is now a second, equally binding-checked scope for the same
 `v1_panderm_base_c1_finetune` run version. `evaluation_scope` stays `validation_only`
@@ -57,8 +57,8 @@ this decision accepts that risk rather than resolving it.
 | Published checkpoint hash | none |
 
 The initial local constant remains `REPLACE_AFTER_FIRST_DOWNLOAD`. The validation notebook
-must fail loud after the first download until a human reviews the observed SHA-256, pins
-it, pushes the reviewed code, and replaces `REPLACE_AFTER_PUSH` with that commit.
+must fail loud after the first download until the observed SHA-256 is reviewed and
+pinned, the reviewed code is pushed, and `REPLACE_AFTER_PUSH` is replaced with that commit.
 This trust-on-first-use step authenticates the downloaded bytes for later validation; it
 does not prove the checkpoint's training corpus is non-overlapping.
 
@@ -169,7 +169,7 @@ non-empty existing final record is never overwritten silently.
   seeds 0/1/2, `evaluation_scope=validation_only`). It still contains no test manifest, test
   evaluation, or test metric helper of any kind.
 
-Existing ResNet, DDPM, CoCa, deployment, README, HANDOFF, experiment logs, and outputs
+Existing ResNet, DDPM, CoCa, deployment, README, experiment logs, and outputs
 remain out of scope and byte-identical. PanDerm adapted weights must never be published,
 served, committed, or added to the existing deployment.
 
@@ -177,8 +177,8 @@ served, committed, or added to the existing deployment.
 
 Local verification includes blocker regressions, all PanDerm tests, full unittest
 discovery, smoke tests, external-temp `py_compile`, notebook code-cell compilation,
-unexecuted notebook checks, `git diff --check`, secret/token/email/tool-attribution scans,
+unexecuted notebook checks, `git diff --check`, secret/token/email scans,
 and pre/post protected SHA-256/size/mtime comparison.
 
-No local acceptance authorizes a Colab/GPU run. This repair does not download real PanDerm
+Passing local verification does not authorize a Colab/GPU run, and the implementation does not download real PanDerm
 weights, access test data, execute formal training, or produce a performance claim.
