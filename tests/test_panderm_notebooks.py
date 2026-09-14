@@ -1860,7 +1860,7 @@ class FormalNotebookTests(unittest.TestCase):
             f'EXPECTED_GIT_COMMIT = "{"a" * 40}"',
         )
 
-    def test_commit_carry_forward_is_an_empty_human_set_cell_zero_variable(self):
+    def test_commit_carry_forward_is_an_empty_manually_set_cell_zero_variable(self):
         """The carve-out is only ever opened explicitly, per run.
 
         git_commit is a deliberate immutable identity field, so a default that
