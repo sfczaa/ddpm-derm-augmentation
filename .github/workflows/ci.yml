@@ -57,7 +57,7 @@ jobs:
             --ignore=tests/test_panderm_base_c1_finetune.py \
             --ignore=tests/test_panderm_notebooks.py
 
-      - name: deployment app imports and serves its health check
+      - name: deployment app imports
         env:
           PYTHONPATH: src
           DDPM_DERM_DATA_DIR: ${{ github.workspace }}/ci-data
