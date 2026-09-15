@@ -33,9 +33,7 @@ SEEDS = [0, 1, 2]          # experiment seeds
 EPOCHS = 20
 
 def run(variant, seed, extra=None):
-    # OUTPUTS_DIR points at Drive (cell 3), so best.pt/last.pt survive a disconnect.
-    # --resume is safe to always pass: it only kicks in if last.pt already exists,
-    # so re-running this cell after a drop continues instead of restarting.
+    # Checkpoints persist on Drive; --resume continues from an existing last.pt.
     cmd = [sys.executable, '-m', 'ddpm_derm.train_classifier',
            '--variant', variant, '--seed', str(seed), '--epochs', str(EPOCHS),
            '--resume']
@@ -44,17 +42,14 @@ def run(variant, seed, extra=None):
     subprocess.run(cmd, cwd=f'{PROJECT_DIR}/src', check=True,
                    env={**os.environ, 'PYTHONPATH': f'{PROJECT_DIR}/src'})
 
-# --- Stage-1 baseline (C0 + C1 target=500): COMPLETED 2026-07-11, results in
-# --- outputs/classifier/. Left commented so it is never accidentally re-run
-# --- (which would --resume the old checkpoints). Uncomment only to reproduce.
+# Stage 1 (C0 + C1 target=500) completed on 2026-07-11 in outputs/classifier/.
+# The loop is disabled; enabling it resumes the original checkpoints.
 # for s in SEEDS:
 #     run('C0', s)
 #     run('C1', s, extra=['--df-target-count', '500'])
 
-# --- Matched-585: the formal C1-vs-C4 comparison. C4 = fixed train split + the
-# --- published epoch-100 synthetic set (85 real + 500 generated = 585 df); C1
-# --- is matched to the same total. New base so Stage-1 outputs are untouched;
-# --- C0 is reused from Stage 1. Requires the DDPM notebook's publish step.
+# Matched-585 compares C1 duplication with C4 (85 real + 500 epoch-100 synthetic df).
+# Results use a separate base; C0 is reused from Stage 1. Requires the published set.
 DF_TARGET_585 = 585
 DF585_BASE    = OUTPUTS_DIR + '/classifier_df585'
 SYN_MANIFEST  = OUTPUTS_DIR + '/synthetic_df/epoch0100_seed0/synthetic_df.csv'
