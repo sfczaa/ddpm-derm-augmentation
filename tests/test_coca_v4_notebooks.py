@@ -115,12 +115,12 @@ class CoCaV4NotebookTests(unittest.TestCase):
         self.assertNotIn("run_queue =", code)
         self.assertNotIn("FORMAL_ROOT =", code)
         for phase in (
-            "## Phase 0 CHECK",
-            "## Phase 1 CHECK",
-            "## Phases 2-3 CHECK",
-            "## Phase 4 RUN",
-            "## Phase 5 RUN",
-            "## Phase 6 REVIEW",
+            "## Phase 0:",
+            "## Phase 1:",
+            "## Phases 2-3:",
+            "## Phase 4:",
+            "## Phase 5:",
+            "## Phase 6:",
         ):
             self.assertIn(phase, all_source)
         for required in (

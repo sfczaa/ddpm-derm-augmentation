@@ -1,11 +1,7 @@
 # %% [markdown]
-# # C4-sqrt-balanced@585 — formal classifier training
-# Run only after the executed validation notebook has been reviewed. This
-# notebook trains seeds 0/1/2 sequentially, resumes from Drive, validates every
-# completed seed, aggregates results, and writes descriptive comparisons only.
-# Shared project files are read-only inputs; checkpoints go to the signed-in
-# account's own MyDrive. Resume with that same account unless the run folder has
-# first been shared or copied to another account.
+# # C4-sqrt-balanced@585: classifier training
+#
+# Descriptive comparisons only.
 
 # %%
 RUN_MODE = "fresh"  # "fresh" or "resume"
@@ -24,7 +20,7 @@ assert len(EXPECTED_COMMIT) == 40 and EXPECTED_COMMIT != "REPLACE_AFTER_PUSH", (
 )
 
 # %% [markdown]
-# ## 1. GPU, Drive, exact code, fixed data, and candidate
+# ## 1. Runtime and data setup
 
 # %%
 import os
@@ -194,11 +190,8 @@ for path in candidate_images:
 print("data/candidate preflight passed; candidate SHA256", CANDIDATE_SHA256)
 
 # %% [markdown]
-# ## 2. Fresh/resume gate and cross-account concurrency marker
-# `last.pt` is atomically replaced on Drive after every completed epoch. The
-# worst-case lost work is one unfinished epoch. Never run this `RUN_VERSION`
-# from two accounts at the same time. A leftover marker requires an explicit
-# manual confirmation; the notebook never silently overwrites it.
+# ## 2. Fresh or resume gate and run marker
+# Never run this `RUN_VERSION` from two accounts at the same time.
 
 # %%
 FIXED_CONFIG = {
@@ -300,7 +293,7 @@ print("concurrency marker created:", RUNNING_MARKER)
 print("checkpoint cadence: every epoch; worst-case loss: one unfinished epoch")
 
 # %% [markdown]
-# ## 3. Sequential training with live output and heartbeat
+# ## 3. Sequential training with heartbeat
 
 # %%
 import queue
@@ -415,7 +408,7 @@ for seed in FIXED_CONFIG["seeds"]:
     print(f"[seed {seed}] result + best.pt + last.pt verified")
 
 # %% [markdown]
-# ## 4. Post-run verification, aggregation, and frozen matched-585 comparison
+# ## 4. Verify, aggregate, and compare with matched-585
 
 # %%
 import numpy as np
@@ -491,7 +484,7 @@ print(aggregate)
 print(json.dumps(comparison["mean_difference_test_df_f1"], indent=2))
 
 # %% [markdown]
-# ## 5. Final artifact inventory and completion marker
+# ## 5. Artifact inventory and completion marker
 
 # %%
 checkpoint_inventory = []

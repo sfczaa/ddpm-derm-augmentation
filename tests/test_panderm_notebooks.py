@@ -1379,12 +1379,11 @@ class ValidationNotebookTests(unittest.TestCase):
         self.assertNotIn("--resume", initial_call)
         self.assertIn('"--fixed-split-identity", fixed_split_identity, "--resume"]', run)
 
-    def test_notebook_is_account_neutral_with_shared_root_prerequisites(self):
+    def test_notebook_is_account_neutral_with_shared_root_guards(self):
         notebook, code = load(VALIDATION)
-        markdown = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "markdown")
-        for required in ("/content/drive/MyDrive/ddpm-derm-augmentation", "/content/drive/MyDrive/ddpm-derm-panderm-runs", "Editor permission", "GH_TOKEN", "run only in sequence"):
+        for required in ("/content/drive/MyDrive/ddpm-derm-augmentation", "/content/drive/MyDrive/ddpm-derm-panderm-runs", "GH_TOKEN"):
             with self.subTest(required=required):
-                self.assertIn(required, markdown)
+                self.assertIn(required, code)
         self.assertNotRegex(json.dumps(notebook), r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
         for forbidden in (
             "MyDrive/ddpm-derm-panderm-runs-",

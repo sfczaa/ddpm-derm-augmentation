@@ -1,5 +1,5 @@
 # Colab classifier baseline runner with percent-format cell markers.
-# Canonical notebook: colab_classifier_baseline.ipynb. Requires a GPU runtime.
+# Canonical notebook: colab_classifier_baseline.ipynb.
 
 # %% [1] GPU check
 # !nvidia-smi

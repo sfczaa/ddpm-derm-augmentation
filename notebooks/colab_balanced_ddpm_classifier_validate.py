@@ -1,10 +1,5 @@
 # %% [markdown]
-# # C4-sqrt-balanced@585 — validation only
-# Safe to **Run all** in a fresh Colab T4 runtime. This notebook validates the
-# exact code, fixed data, candidate, checkpoint guards, and a tiny one-epoch
-# classifier run. It cannot start the formal 3-seed × 20-epoch experiment.
-# Shared project files are read-only inputs; new artifacts go to the signed-in
-# account's own MyDrive so a shortcut mount cannot split or drop directories.
+# # C4-sqrt-balanced@585: validation
 
 # %%
 EXPECTED_COMMIT = "a6fc90c8f946c0d11e3e5e22d65131a092be361a"
@@ -14,7 +9,7 @@ CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed34
 RUN_STORAGE_DIRNAME = "ddpm-derm-classifier-runs"
 
 # %% [markdown]
-# ## 1. GPU, Drive, and an exact private-Git checkout
+# ## 1. Runtime setup
 
 # %%
 import os
@@ -70,7 +65,7 @@ print("exact clean commit:", commit)
 print("remote contains token: False")
 
 # %% [markdown]
-# ## 2. Fixed data, candidate, and protected-output inventory
+# ## 2. Data, candidate, and protected-output inventory
 
 # %%
 import hashlib
@@ -241,7 +236,7 @@ subprocess.run(
 print("repository smoke + torch-free classifier guards passed; GPU:", torch.cuda.get_device_name(0))
 
 # %% [markdown]
-# ## 4. Tiny C4-sqrt run, strict resume, mismatch rejection, Drive-only restore
+# ## 4. Tiny run, resume, and mismatch checks
 
 # %%
 import time
