@@ -1,8 +1,8 @@
 """Classifier backbones. Requires torch + torchvision.
 
-ResNet-18 (ImageNet-pretrained by default) with a fresh 7-way head. Kept
-deliberately small so C0/C1/C4 all train quickly on a free Colab T4 with
-identical architecture and only the df-augmentation strategy differing.
+ResNet-18 (ImageNet-pretrained by default) with a fresh 7-way head, kept
+deliberately small; C0/C1/C4 share this architecture so only the
+df-augmentation strategy differs.
 """
 
 from __future__ import annotations

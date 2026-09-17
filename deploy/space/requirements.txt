@@ -1,8 +1,8 @@
 # Hugging Face Space (Gradio, ZeroGPU tier).
 #
-# Unlike requirements-deploy.txt this does NOT pin the CPU-only torch wheels:
-# the free tier is ZeroGPU-gated, so the CUDA build from PyPI is what belongs
-# here. Inference itself still runs on CPU (see app.py).
+# Unlike requirements-deploy.txt this does not pin the CPU-only torch wheels:
+# ZeroGPU hardware uses the CUDA build from PyPI. Inference itself still runs
+# on CPU (see app.py).
 spaces>=0.30
 gradio>=6.16.0,<7
 torch>=2.13.0,<3

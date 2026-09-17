@@ -1,15 +1,13 @@
 """Static checks for the Hugging Face Space entry point.
 
-The Space exists because a Docker Space needs a paid plan while a free personal
-account may host two Gradio Spaces on ZeroGPU. Everything guarded here is a
-mistake that would only surface after a Space build, or worse, would build fine
-while quietly serving something other than the published artifacts:
+The Space entry point targets the Gradio SDK on ZeroGPU hardware. Everything
+guarded here is a mistake that would only surface after a Space build, or worse,
+would build fine while quietly serving something other than the published artifacts:
 
   - the pinned asset revisions drifting away from the ones the Render image
     builds from, which would break the claim that both demos serve the same
     checkpoint;
-  - the SDK reverting to `docker`, which is the paid path this design exists to
-    avoid;
+  - the SDK reverting to `docker`, which this entry point is not built for;
   - the asset paths not matching the layout `download_render_assets.py`
     actually writes;
   - the requirements pinning the CPU-only torch index, which is correct for
@@ -99,7 +97,7 @@ class SpaceAppTests(unittest.TestCase):
         )
 
     def test_readme_declares_a_gradio_space(self):
-        # sdk: docker is the paid path this entry point exists to avoid.
+        # The entry point is a Gradio app, not a Docker Space.
         self.assertRegex(self.readme, r"(?m)^sdk: gradio$")
         self.assertRegex(self.readme, r"(?m)^app_file: app\.py$")
         self.assertNotRegex(self.readme, r"(?m)^sdk: docker$")
@@ -112,8 +110,8 @@ class SpaceAppTests(unittest.TestCase):
         self.assertRegex(self.requirements, r"(?m)^spaces>=")
         self.assertRegex(self.requirements, r"(?m)^gradio>=")
         self.assertRegex(self.requirements, r"(?m)^torch>=")
-        # Render installs from the CPU wheel index; doing that here would
-        # defeat the tier the Space runs on.
+        # Render installs from the CPU wheel index; the ZeroGPU Space needs
+        # the CUDA build.
         self.assertNotIn("download.pytorch.org/whl/cpu", self.requirements)
 
     def test_zerogpu_decorator_degrades_when_the_package_is_absent(self):

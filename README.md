@@ -108,7 +108,7 @@ continues from `last.pt`. Results JSON lands in `outputs/classifier/results/`.
 Point `DDPM_DERM_OUTPUTS_DIR` at Google Drive so checkpoints survive disconnects.
 See `outputs/README.md` for the output layout.
 
-## Experiment plan (from the project brief)
+## Experiment design
 
 | Variant | Treatment | Purpose |
 |---|---|---|
@@ -118,7 +118,7 @@ See `outputs/README.md` for the output layout.
 
 **Fairness knob:** C1's `--df-target-count` must equal C4's total df count
 (real + synthetic) so the two only differ in *how* the extra df is produced.
-The agreed composition is **585 = 85 real train df + 500 generated**, so both
+The composition is **585 = 85 real train df + 500 generated**, so both
 C1 and C4 run with `--df-target-count 585`.
 
 **C4 status:** the formal epoch-100 synthetic dataset and matched-585 C1/C4
@@ -395,11 +395,11 @@ differs from C1 only in the source of those rows.
 | C4@585 - all 500 synthetic | 0.6115 +/- 0.0423 | 0.6450 | 0.5208 |
 | C4-filtered - the 155 accepted | 0.6657 +/- 0.0182 | 0.6532 | 0.6250 |
 
-Read against the pre-registered rules, the result is **parity with C1 and a real gap over C4**. The
+Read against the pre-registered rules, the result is **parity with C1 and a higher mean than C4**. The
 `+0.0059` over C1 is about a seventh of C1's own seed spread, and one test image moves df F1 by roughly
 `0.03`, so it is less than a single image: the accepted synthetic images did not beat duplicating the real
-ones. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, so the
-unfiltered pool was actively costing accuracy and filtering removed that cost.
+ones. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, which is
+consistent with the unfiltered pool lowering df F1 and filtering removing that loss in these runs.
 
 In this experiment, filtering improved the mean relative to unfiltered C4, with little difference
 from C1. Within-set spacing did not indicate reduced variety: within-set spacing in the accepted subset is

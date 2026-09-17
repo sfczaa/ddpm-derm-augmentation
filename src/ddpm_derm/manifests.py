@@ -378,7 +378,7 @@ def build_classifier_frame(
         minus the real train df count rows.
 
     C1 and C4 must use the same ``df_target_count`` so the two differ only in
-    where the extra df rows come from. The default matches the agreed C4
+    where the extra df rows come from. The default matches the fixed C4
     composition: 585 = 85 real train df + 500 generated.
     """
     variant = variant.upper()

@@ -1,7 +1,7 @@
 """Tiny end-to-end DDPM smoke test (requires torch + diffusers).
 
-Proves the Stage 2 pipeline runs before spending T4 time on a real train:
-builds a small class-conditional UNet, does a couple of training steps on a few
+Checks that the Stage 2 pipeline runs at tiny scale: builds a small
+class-conditional UNet, does a couple of training steps on a few
 real train images, then DDIM-samples a couple of images and checks shapes and
 value ranges. Runs on CPU.
 

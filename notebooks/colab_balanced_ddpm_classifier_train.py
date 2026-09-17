@@ -16,7 +16,7 @@ RUN_STORAGE_DIRNAME = "ddpm-derm-classifier-runs"
 assert RUN_MODE in {"fresh", "resume"}
 assert RUN_VERSION == "c4_sqrt_balanced_v1"
 assert len(EXPECTED_COMMIT) == 40 and EXPECTED_COMMIT != "REPLACE_AFTER_PUSH", (
-    "Notebook is not pinned yet. Stop: Phase 2 commit/push must happen first."
+    "Notebook is not pinned to a pushed commit."
 )
 
 # %% [markdown]

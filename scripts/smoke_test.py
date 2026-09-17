@@ -124,7 +124,7 @@ def check_variants(c: Check):
     c0 = manifests.build_classifier_frame("C0")
     c.ok(manifests.class_counts(c0) == base, "C0 equals raw train counts")
 
-    target = 585  # agreed C1/C4 alignment: 85 real + 500 generated
+    target = 585  # fixed C1/C4 composition: 85 real + 500 generated
     c1 = manifests.build_classifier_frame("C1", df_target_count=target, seed=0)
     c1_counts = manifests.class_counts(c1)
     c.ok(c1_counts["df"] == target, f"C1 df oversampled to {target} (got {c1_counts['df']})")

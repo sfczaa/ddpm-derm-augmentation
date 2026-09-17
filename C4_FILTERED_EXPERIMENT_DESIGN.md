@@ -5,11 +5,12 @@ on 2026-09-06 under run version `v1_c4_filtered`, implementation commit
 `e68b3a7`. 155 of the 500 images cleared the threshold; the test split was
 evaluated once, across seeds 0/1/2.
 
-Result: **parity with C1, a real gap over C4** — test df F1 `0.6657 +/- 0.0182`
+Result: **parity with C1, a higher mean than C4** — test df F1 `0.6657 +/- 0.0182`
 against C1 `0.6598 +/- 0.0423` and C4 `0.6115 +/- 0.0423`. The `+0.0059` over C1
 is less than one test image's worth on 16 df; the `+0.0541` over C4 exceeds
-either seed spread. The distance criterion removed the harm the unfiltered pool
-was doing without beating plain duplication. The full result and its limits are in
+either seed spread. This is consistent with the distance criterion removing a loss
+from the unfiltered pool without beating plain duplication; no significance test
+was performed. The full result and its limits are in
 `README.md`, section Turning the diagnostic into a selection rule: C4-filtered.
 
 Every rule below is as pre-registered. Nothing in §3 to §7 was changed at any

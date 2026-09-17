@@ -34,14 +34,13 @@ outputs/
 
 ## Where do I put things?
 
-- **Classifier results I ran on Colab** → drop the `results_*.json` files into
-  `outputs/classifier/results/`. Then run `python scripts/aggregate_results.py`
-  to get the mean ± std table. (Or just point Drive here and Colab writes them
-  directly.)
+- **Classifier results** → `results_*.json` files go in
+  `outputs/classifier/results/`; `python scripts/aggregate_results.py` builds
+  the mean ± std table.
 - **Trained model checkpoints** → `outputs/classifier/checkpoints/<run>/`.
   `train_classifier.py` writes these automatically. `best.pt` is the one to keep
   for evaluation and deployment.
-- **The dataset itself** → NOT here. It lives in `data/` inside the project
+- **The dataset itself** → not here. It lives in `data/` inside the project
   (a sibling `../data` also resolves). It is git-ignored and non-commercially licensed;
   never commit it. On Colab, upload it to Drive and set `DDPM_DERM_DATA_DIR`.
 - **Stage 4 deploy checkpoint** → the selected local candidate is

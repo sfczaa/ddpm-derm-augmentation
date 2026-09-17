@@ -5,14 +5,11 @@ the Render demo serve identical predictions from identical assets: the pinned
 public checkpoint and the pinned synthetic gallery, both fetched by revision at
 startup and hash-checked by the shared download script.
 
-Why Gradio and not Docker: as of 2026 a Docker Space requires a paid plan, while
-a free personal account may host up to two Gradio Spaces on ZeroGPU. That is the
-only reason the entry point differs from the Render deployment.
-
-`@spaces.GPU` is present because the free tier is ZeroGPU-gated, not because the
-model needs a GPU. This is a 42.7 MB ResNet-18 doing single-image inference; it
-runs on CPU in milliseconds, and the service stays on CPU deliberately so a
-between-call GPU deallocation cannot strand the weights on a dead device.
+This entry point targets a Gradio Space on ZeroGPU hardware, which is why it
+differs from the Render deployment. `@spaces.GPU` is there for that hardware,
+not because the model needs a GPU: this 42.7 MB ResNet-18 serves single-image
+inference on CPU, and stays on CPU deliberately so a between-call GPU
+deallocation cannot strand the weights on a dead device.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 # PanDerm-Base C1 exploratory validation plan (`v1_panderm_base_c1_finetune`)
 
-Status: **implemented locally, not run in Colab/GPU, and not a formal experiment.**
-No PanDerm checkpoint has been downloaded and no performance result or improvement claim
-has been produced.
+Status: **exploratory; validation-only evaluation.** The checkpoint digest was reviewed and
+pinned after the first download, and formal-scale training was later enabled (see
+"Formal training decision"). No test metric or improvement claim is published.
 
 ## Binding v1 decision
 
@@ -56,7 +56,8 @@ this decision accepts that risk rather than resolving it.
 | License | `CC-BY-NC-ND 4.0`, non-commercial academic research only |
 | Published checkpoint hash | none |
 
-The initial local constant remains `REPLACE_AFTER_FIRST_DOWNLOAD`. The validation notebook
+`REPLACE_AFTER_FIRST_DOWNLOAD` remains the placeholder for fail-loud tests; the reviewed
+digest is pinned separately in `EXPECTED_CHECKPOINT_SHA256`. The validation notebook
 must fail loud after the first download until the observed SHA-256 is reviewed and
 pinned, the reviewed code is pushed, and `REPLACE_AFTER_PUSH` is replaced with that commit.
 This trust-on-first-use step authenticates the downloaded bytes for later validation; it

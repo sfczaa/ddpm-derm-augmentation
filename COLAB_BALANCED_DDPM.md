@@ -5,8 +5,7 @@ DDPM or the formal epoch-100 synthetic dataset. The strategy is deliberately
 named sqrt_balanced: each train row in class c has weight 1 / sqrt(n_c).
 Sampling uses replacement and draws len(train) indices per epoch.
 
-Do not run these cells until the implementation is committed and pushed to
-origin/balanced-ddpm-exploration. The trainer requires a clean Git checkout so
+The trainer requires a clean Git checkout of balanced-ddpm-exploration so
 run_metadata.json records the code commit that actually ran.
 
 ## 1. Sync code and prepare the runtime

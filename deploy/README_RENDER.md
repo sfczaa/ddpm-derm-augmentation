@@ -29,7 +29,7 @@ not a guarantee of Render runtime behavior.
 - Deployment archive: `gallery_epoch0100_seed0.zip`
 - Archive SHA-256: `da3d582082323728e2b0558c27e26af124c683dacf336915d1212acd8abd0bc5`
 
-## Deploy after the intended Git changes are committed and pushed
+## Deploy
 
 1. Sign in to Render and create a new Blueprint.
 2. Connect `https://github.com/sfczaa/ddpm-derm-augmentation`.
