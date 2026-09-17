@@ -2539,9 +2539,9 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
                 patch.stop()
             return False
 
-    # --- blocker 3 ---------------------------------------------------------
+    # --- retries after a crash and takeover adoption -----------------------
     def test_graceful_completion_is_idempotent_after_a_crash(self):
-        """probe graceful_completion_retry_after_crash must be True.
+        """Graceful completion can be retried after a crash.
 
         A fresh ``completed_utc`` on every retry made the already published
         audit payload drift, so a crashed handoff could never be finished.
@@ -2649,7 +2649,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             self.assertEqual(completion_path.read_bytes(), before)
 
     def test_manual_takeover_is_idempotent_after_a_crash(self):
-        """probe manual_takeover_retry_after_crash must be True.
+        """A manual takeover can be retried after a crash.
 
         The audit path used to embed the replacement session id, so every retry
         minted a new id and a new audit file instead of finishing one event.
@@ -2725,7 +2725,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
         return session_a, session_b
 
     def test_cross_runtime_lost_response_retry_adopts_the_published_marker(self):
-        """probe cross_runtime_lost_response_retry must be True.
+        """A retry from a restarted runtime adopts the published marker.
 
         B's runtime restart mints a brand new candidate UUID, so UUID equality
         alone read the finished A->B transition as a fresh B takeover subject
@@ -3249,7 +3249,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
         ]
 
     def test_delayed_marker_visibility_after_replace_converges_on_exact_json(self):
-        """probe delayed_marker_visibility must be tolerated.
+        """A marker that Drive shows late after os.replace is still verified.
 
         Google Drive FUSE answered ENOENT for active_session.json immediately
         after os.replace had published it, so a takeover that had already
@@ -3463,7 +3463,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
         )
 
     def test_durable_write_guard_survives_delayed_marker_visibility(self):
-        """probe delayed_guard_read must be tolerated.
+        """The durable-write guard tolerates a delayed marker read.
 
         A real Phase 5 published its marker, passed the guard twice, then was
         refused its own session by an ENOENT for a record the shared root still
@@ -3547,7 +3547,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             self.assertEqual(self._heartbeats(printed), [])
 
     def test_manual_takeover_is_still_refused_without_confirmation(self):
-        """probe manual_takeover_forced_false must not become an auto-takeover."""
+        """A takeover still requires explicit confirmation."""
         with tempfile.TemporaryDirectory() as temporary:
             marker, history, run_hash = self._session_paths(temporary)
             session_a = str(uuid.uuid4())
@@ -3564,7 +3564,7 @@ class SequentialHandoffBlockerRegressionTests(unittest.TestCase):
             self.assertEqual(taken_over["session_id"], session_b)
             self.assertEqual(taken_over["account_label"], "B")
 
-    # --- blocker 1 (runner side) -------------------------------------------
+    # --- resume across sessions, accounts and hosts (runner side) ----------
     def test_resume_survives_session_account_and_hostname_change(self):
         """A different session/account/host must never block the same run resume."""
         run_identity = identity()

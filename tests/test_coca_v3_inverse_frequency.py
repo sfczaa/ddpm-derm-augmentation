@@ -191,7 +191,7 @@ class _FakeOpenClip:
 
 
 class CoCaV3InverseFrequencyTests(unittest.TestCase):
-    # --- exact formula, order, weights (reqs 6-11) ---------------------------
+    # --- exact formula, order, weights ---------------------------------------
     def test_inverse_frequency_formula_order_and_expected_values(self):
         objective, weights = classifier_objective.build_training_objective(
             "inverse_frequency", matched_frame()
@@ -230,7 +230,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
         # every class contributes the *same* amount -> spread is ~0
         self.assertLess(float(contributions.max() - contributions.min()), 1e-6)
 
-    # --- v1 (none) and v2 (inverse_sqrt) stay identical (reqs 4, 5) ----------
+    # --- v1 (none) and v2 (inverse_sqrt) stay identical ----------------------
     def test_v2_inverse_sqrt_objective_is_byte_for_byte_unchanged(self):
         objective, weights = classifier_objective.build_training_objective(
             "inverse_sqrt", matched_frame()
@@ -251,7 +251,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             (None, None),
         )
 
-    # --- counts sourced from the train frame only (reqs 12-14) ---------------
+    # --- counts sourced from the train frame only ----------------------------
     def test_c1_c4_and_smoke_limit_use_the_same_full_frame_weights(self):
         c1 = matched_frame()
         c4 = matched_frame().sample(frac=1.0, random_state=4).reset_index(drop=True)
@@ -277,7 +277,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             classifier_objective.ordered_class_counts(matched_frame()),
         )
 
-    # --- fail-loud guards (req 15) -------------------------------------------
+    # --- fail-loud guards ----------------------------------------------------
     def test_missing_zero_noninteger_unknown_or_wrong_order_fail_loudly(self):
         missing = matched_frame().query("label_idx != 6")
         with self.assertRaisesRegex(ValueError, "missing or zero"):
@@ -302,7 +302,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, pattern):
                 classifier_objective.inverse_frequency_weights(bad_counts)
 
-    # --- criterion tensor + unsupported mode (req 16) ------------------------
+    # --- criterion tensor + unsupported mode ---------------------------------
     def test_criterion_none_and_inverse_frequency_tensor_dtype_device(self):
         unweighted = build_criterion("none", None, torch.device("cpu"))
         self.assertIsNone(unweighted.weight)
@@ -319,7 +319,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported class weighting"):
             build_criterion("focal", weights, torch.device("cpu"))
 
-    # --- CLI surface (reqs 1-3) ----------------------------------------------
+    # --- CLI surface ---------------------------------------------------------
     def test_cli_supports_three_modes_and_defaults_to_none(self):
         self.assertEqual(parse_args([]).class_weighting, "none")
         self.assertEqual(parse_args([]).evaluation_scope, "full")
@@ -347,7 +347,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             identity, copy.deepcopy(identity)
         )
 
-    # --- identity records evaluation scope (reqs 18-19) ----------------------
+    # --- identity records evaluation scope -----------------------------------
     def test_build_identity_records_v3_full_and_validation_scope(self):
         full = build_v3_identity("full")
         validation = build_v3_identity("validation_only")
@@ -358,7 +358,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
         )
         self.assertEqual(validation["evaluation_scope"], "validation_only")
 
-    # --- objective persisted in checkpoint + result; head-only (reqs 20, 24) -
+    # --- objective persisted in checkpoint + result; head-only ---------------
     def test_v3_objective_round_trips_and_checkpoint_is_head_only(self):
         identity = build_v3_identity("full")
         objective = inverse_frequency_objective()
@@ -389,7 +389,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             any("encoder" in key or "text" in key for key in checkpoint)
         )
 
-    # --- resume never mixes modes/objectives/scope/version (reqs 21, 22) -----
+    # --- resume never mixes modes/objectives/scope/version -------------------
     def test_resume_rejects_cross_mode_objective_and_scope_or_version(self):
         saved = build_v3_identity("validation_only")
         none_identity = copy.deepcopy(saved)
@@ -438,7 +438,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             )
             self.assertEqual(before, after)
 
-    # --- validation_only never touches test (reqs 25, 26) --------------------
+    # --- validation_only never touches test ----------------------------------
     def test_validation_only_never_calls_test_evaluator(self):
         with patch("ddpm_derm.train_classifier.evaluate") as evaluator:
             self.assertIsNone(
@@ -454,7 +454,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
             )
             evaluator.assert_called_once()
 
-    # --- aggregation refuses validation-only and v1/v2/v3 mixing (reqs 27,28) -
+    # --- aggregation refuses validation-only and v1/v2/v3 mixing --------------
     def test_aggregate_rejects_validation_only_and_mixed_versions(self):
         validation_only = aggregate_runs()
         validation_only[0]["evaluation_scope"] = "validation_only"
@@ -491,7 +491,7 @@ class CoCaV3InverseFrequencyTests(unittest.TestCase):
         for value in aggregate["paired_c4_minus_c1"]["seed_differences"]:
             self.assertAlmostEqual(value, 0.1)
 
-    # --- mocked encoder: frozen, head-only optimizer, real criterion (17,42,43)
+    # --- mocked encoder: frozen, head-only optimizer, real criterion ----------
     def test_mocked_coca_freeze_optimizer_and_inverse_frequency_criterion(self):
         model = build_model(
             arch="coca_vit_b32", freeze_backbone=True,

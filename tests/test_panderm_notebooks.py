@@ -775,7 +775,7 @@ class ValidationNotebookTests(unittest.TestCase):
         return "".join(phase0[start : end + 1])
 
     def test_phase0_rebinds_every_durable_path_to_the_resolved_basis(self):
-        """probe shared_root_path_basis must have exactly one spelling.
+        """Phase 0 rebinds every durable path to the resolved shared root.
 
         `ensure_tree` builds its result on `require_existing_shared_root`, which
         resolves. The notebook kept the My Drive alias bound, so a value that
@@ -835,7 +835,7 @@ class ValidationNotebookTests(unittest.TestCase):
             self.assertEqual(sessions.parent, attempt)
 
     def test_live_notebooks_rebind_before_any_shared_root_relative_to(self):
-        """probe shared_root_path_basis must not be reintroduced.
+        """Notebooks that can still run rebind before any shared-root relative_to.
 
         The frozen notebooks carry the same alias-basis pattern, but they are
         records of finished runs and `test_frozen_notebooks_are_unmodified`
@@ -1576,9 +1576,9 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
             )
         return checkpoint_dir, result_path
 
-    # --- blocker 1 ---------------------------------------------------------
+    # --- continuing an attempt started by another session ------------------
     def test_phase6_verifies_and_skips_an_existing_complete_pair(self):
-        """probe phase6_rejects_existing_complete_last must be False.
+        """Phase 6 verifies an existing complete pair instead of rejecting it.
 
         Account B used to be unable to continue account A's attempt at all: the
         notebook asserted that no last.pt/best.pt/result existed before it would
@@ -1718,7 +1718,7 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
             )
 
     def test_initial_gate_call_passes_resume(self):
-        """probe initial_gate_call_has_resume must be True.
+        """The first gate call passes --resume.
 
         Without --resume on the very first invocation, account B's run started
         from epoch 1 and account A's durable checkpoint was never continued.
@@ -1779,9 +1779,9 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
             "path.is_file() and path not in resumable_attempt_artifacts", phase0
         )
 
-    # --- blocker 2 ---------------------------------------------------------
+    # --- manual takeover confirmation --------------------------------------
     def test_manual_takeover_confirmation_is_reachable(self):
-        """probe manual_takeover_forced_false must be False.
+        """The first-cell guards accept an explicit takeover confirmation.
 
         The first cell asserted the flag could only ever be False, so the
         reviewed manual-takeover path was unreachable from the notebook.
@@ -1805,7 +1805,7 @@ class Phase6SequentialResumeBlockerTests(unittest.TestCase):
         self.assertIn("manual_takeover_confirmed=MANUAL_TAKEOVER_CONFIRMED", code)
         self.assertNotIn("manual_takeover_confirmed=True", code)
 
-    # --- blocker 5 ---------------------------------------------------------
+    # --- session id after a takeover retry ---------------------------------
     def test_effective_session_id_comes_from_the_reopened_marker(self):
         """An idempotent takeover retry may reuse a published replacement id."""
         notebook, _ = load(VALIDATION)

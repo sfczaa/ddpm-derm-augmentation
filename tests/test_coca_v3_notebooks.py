@@ -19,7 +19,7 @@ NAMES = (
     "colab_coca_v3_inverse_frequency_validation.ipynb",
     "colab_coca_v3_inverse_frequency_classifier.ipynb",
 )
-# The untracked user notebook must never be touched by this work.
+# Local-only notebook: if present it must match this digest; it must stay untracked.
 PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = (
     "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
