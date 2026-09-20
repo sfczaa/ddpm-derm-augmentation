@@ -4,6 +4,7 @@ import ast
 import json
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -79,6 +80,50 @@ class NotebookSecurityTests(unittest.TestCase):
             sentinel_calls = [line for line in code.splitlines() if "create_or_validate_sentinel(" in line or "require_shared_root_sentinel_identity(" in line]
             self.assertEqual(len(sentinel_calls), 2)
             self.assertTrue(all('run_version="v1_panderm_base_c1_finetune"' in line for line in sentinel_calls))
+
+    def test_balanced_validation_does_not_create_the_formal_run(self):
+        source = dict((name, code) for name, _, code in notebooks())["colab_balanced_ddpm_classifier_validate.ipynb"]
+        tree = ast.parse(source)
+        assignments = [node for node in tree.body if isinstance(node, ast.Assign)
+                       and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id in {"VALIDATION_ROOT", "FORMAL_RUN_DIR"}]
+        self.assertEqual(len(assignments), 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            def create(path):
+                path.mkdir(parents=True)
+                return path
+            namespace = {"RUNNER_DOWNSTREAM_ROOT": Path(temporary),
+                         "RUN_VERSION": "c4_sqrt_balanced_v1_safe_v2",
+                         "ensure_runner_tree": create}
+            exec(compile(ast.Module(body=assignments, type_ignores=[]), "paths", "exec"), namespace)
+            self.assertTrue(namespace["VALIDATION_ROOT"].is_dir())
+            self.assertFalse(namespace["FORMAL_RUN_DIR"].exists())
+            self.assertNotIn(namespace["FORMAL_RUN_DIR"], namespace["VALIDATION_ROOT"].parents)
+
+    def test_balanced_formal_gate_rejects_validation_from_the_old_identity(self):
+        code = dict((name, code) for name, _, code in notebooks())["colab_balanced_ddpm_classifier_train.ipynb"]
+        gate = code[code.index("SOURCE_MANIFEST_SHA256 ="):code.index("protected =")]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            version = "c4_sqrt_balanced_v1_safe_v2"
+            record_path = root / "validation_runs" / version / "validation_record.json"
+            record_path.parent.mkdir(parents=True)
+            record = {"status": "passed", "formal_training_started": False,
+                      "run_version": version, "git_commit": "a" * 40,
+                      "candidate_manifest_sha256": "candidate", "source_manifest_sha256": "source",
+                      "runner_output_root": str(root)}
+            namespace = {"LOCAL_DATA_DIR": root, "sha256": lambda path: "source", "json": json,
+                         "RUNNER_DOWNSTREAM_ROOT": root, "RUNNER_OUTPUTS_DIR": root,
+                         "RUN_VERSION": version, "EXPECTED_COMMIT": "a" * 40,
+                         "CANDIDATE_SHA256": "candidate"}
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            exec(compile(gate, "validation-gate", "exec"), namespace.copy())
+            for key, wrong in (("run_version", "c4_sqrt_balanced_v1"),
+                               ("git_commit", "b" * 40), ("source_manifest_sha256", "changed")):
+                with self.subTest(key=key):
+                    record_path.write_text(json.dumps({**record, key: wrong}), encoding="utf-8")
+                    with self.assertRaises(AssertionError):
+                        exec(compile(gate, "validation-gate", "exec"), namespace.copy())
 
 
 if __name__ == "__main__":
