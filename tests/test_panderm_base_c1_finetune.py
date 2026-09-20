@@ -126,7 +126,7 @@ class SharedRootSentinelIdentityTests(unittest.TestCase):
             "shared_root_uuid": self.UUID,
             "shortcut_alias": self.ALIAS,
             "resolved_path": str(stored_path),
-            "run_version": panderm_run.RUN_VERSION,
+            "run_version": panderm_run.SENTINEL_RUN_VERSION,
         }
         value.update(overrides)
         return value

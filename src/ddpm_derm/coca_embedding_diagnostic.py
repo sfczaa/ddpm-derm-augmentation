@@ -14,7 +14,7 @@ import numpy as np
 from . import config, manifests
 
 
-DIAGNOSTIC_VERSION = "v1_frozen_coca_df_embeddings"
+DIAGNOSTIC_VERSION = "v1_frozen_coca_df_embeddings_safe_v2"
 GROUP_ORDER = ("real_train_df", "synthetic_df", "validation_df")
 EXPECTED_GROUP_COUNTS = {
     "real_train_df": 85,

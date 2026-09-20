@@ -45,7 +45,8 @@ from .coca_run import (  # noqa: F401  (re-exported arch-neutral helpers)
 
 # --- pinned upstream identity ------------------------------------------------
 ARCH = "panderm_base_vit_b16"
-RUN_VERSION = "v1_panderm_base_c1_finetune"
+RUN_VERSION = "v1_panderm_base_c1_finetune_safe_v2"
+SENTINEL_RUN_VERSION = "v1_panderm_base_c1_finetune"
 CHECKPOINT_FORMAT = "panderm_full_model_v1"
 
 UPSTREAM_REPO = "https://github.com/SiyuanYan1/PanDerm"
@@ -2184,7 +2185,7 @@ def require_shared_root_sentinel_identity(
     *,
     shortcut_alias: str,
     resolved_root: str | Path,
-    run_version: str = RUN_VERSION,
+    run_version: str = SENTINEL_RUN_VERSION,
 ) -> str:
     """Require one shared root even when Drive shortcut strings differ."""
     if not isinstance(sentinel, Mapping):

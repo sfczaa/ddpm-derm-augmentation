@@ -49,7 +49,7 @@ from .coca_embedding_diagnostic import (
 )
 
 
-DIAGNOSTIC_VERSION = "v1_all_class_separability"
+DIAGNOSTIC_VERSION = "v1_all_class_separability_safe_v2"
 FEATURE_DIM = 512
 KNN_K_VALUES = (1, 5, 10)
 INPUT_RESOLUTION = (224, 224)
