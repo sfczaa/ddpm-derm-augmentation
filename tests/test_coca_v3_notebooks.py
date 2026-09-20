@@ -88,7 +88,7 @@ class CoCaV3NotebookTests(unittest.TestCase):
     def test_v1_v2_read_only_and_v3_paths_isolated(self):
         for name in NAMES:
             _, code = load(name)
-            self.assertIn('RUN_VERSION = "v3_inverse_frequency_ce"', code)
+            self.assertIn('RUN_VERSION = "v3_inverse_frequency_ce_safe_v2"', code)
             self.assertIn('/ "v1"', code)
             self.assertIn('/ "v2_weighted_ce"', code)
             self.assertIn("v1 must remain present and read-only", code)
@@ -106,7 +106,7 @@ class CoCaV3NotebookTests(unittest.TestCase):
         self.assertNotIn("run_queue =", code)
         self.assertNotIn("FORMAL_ROOT =", code)
         for required in (
-            'RUN_VERSION = "v3_inverse_frequency_ce"',
+            'RUN_VERSION = "v3_inverse_frequency_ce_safe_v2"',
             '"--class-weighting", "inverse_frequency"',
             '"--evaluation-scope", "validation_only"',
             '"--epochs", "5"',

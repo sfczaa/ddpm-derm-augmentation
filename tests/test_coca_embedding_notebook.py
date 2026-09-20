@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_post_failure_embedding_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "7783c3a9fb360dc459ec02e2d742d3361bdcd88d"
+PINNED_GIT_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 
 
 class CoCaEmbeddingNotebookTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class CoCaEmbeddingNotebookTests(unittest.TestCase):
 
     def test_scope_is_descriptive_embedding_only_without_test_or_formal(self):
         for required in (
-            'DIAGNOSTIC_VERSION = "v1_frozen_coca_df_embeddings"',
+            'DIAGNOSTIC_VERSION = "v1_frozen_coca_df_embeddings_safe_v2"',
             '"real_train_df": 85',
             '"synthetic_df": 500',
             '"validation_df": 14',

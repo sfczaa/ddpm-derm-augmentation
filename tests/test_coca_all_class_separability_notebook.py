@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_all_class_separability_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "77262576c836ea69a5f1c2d6be5fadbccf17e3e4"
+PINNED_GIT_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 
 
 class AllClassSeparabilityNotebookTests(unittest.TestCase):
@@ -49,7 +49,7 @@ class AllClassSeparabilityNotebookTests(unittest.TestCase):
 
     def test_scope_is_descriptive_all_class_representation_only(self):
         for required in (
-            'DIAGNOSTIC_VERSION = "v1_all_class_separability"',
+            'DIAGNOSTIC_VERSION = "v1_all_class_separability_safe_v2"',
             "EXPECTED_TRAIN_ROWS = 6995",
             "EXPECTED_VALIDATION_ROWS = 1510",
             '"df": 85',

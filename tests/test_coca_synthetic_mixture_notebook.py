@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "colab_coca_v4_synthetic_mixture_diagnostic.ipynb"
-PINNED_GIT_COMMIT = "10188c3fb4c7d0c101556e73612593b4c0343dcb"
+PINNED_GIT_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 
 
 class SyntheticMixtureNotebookTests(unittest.TestCase):

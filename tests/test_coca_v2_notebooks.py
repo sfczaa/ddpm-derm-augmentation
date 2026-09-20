@@ -12,7 +12,7 @@ NAMES = (
     "colab_coca_v2_weighted_validation.ipynb",
     "colab_coca_v2_weighted_classifier.ipynb",
 )
-IMPLEMENTATION_COMMIT = "6e2c60c52b367d864a3f96d75cfd401076b72186"
+IMPLEMENTATION_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 
 
 def load(name):
@@ -49,7 +49,7 @@ class CoCaV2NotebookTests(unittest.TestCase):
         self.assertNotIn("run_queue =", code)
         self.assertNotIn("FORMAL_ROOT =", code)
         for required in (
-            'RUN_VERSION = "v2_weighted_ce"',
+            'RUN_VERSION = "v2_weighted_ce_safe_v2"',
             '"--class-weighting", "inverse_sqrt"',
             '"--evaluation-scope", "validation_only"',
             '"--epochs", "5"',
@@ -104,7 +104,7 @@ class CoCaV2NotebookTests(unittest.TestCase):
         for name in NAMES:
             _, code = load(name)
             self.assertIn('/ "v1"', code)
-            self.assertIn('RUN_VERSION = "v2_weighted_ce"', code)
+            self.assertIn('RUN_VERSION = "v2_weighted_ce_safe_v2"', code)
             self.assertIn("v1_before", code)
             self.assertIn("v1_after == v1_before", code)
             self.assertNotIn("ensure_tree(SHARED_RUN_ROOT, V1_ROOT", code)

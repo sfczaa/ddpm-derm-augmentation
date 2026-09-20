@@ -24,7 +24,7 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = (
     "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 )
-PINNED_GIT_COMMIT = "5b93e5233ba559f1ba2f8eb7ba4c447fb6a9e8fa"
+PINNED_GIT_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 HEAD_MATCH_NOTEBOOKS = (
     "colab_coca_validation.ipynb",
     "colab_coca_classifier.ipynb",
@@ -91,7 +91,7 @@ class CoCaV4NotebookTests(unittest.TestCase):
         for name in NAMES:
             _, code = load(name)
             for required in (
-                'RUN_VERSION = "v4_focal_inverse_frequency"',
+                'RUN_VERSION = "v4_focal_inverse_frequency_safe_v2"',
                 'LOSS_NAME = "focal_cross_entropy"',
                 "FOCAL_GAMMA = 2.0",
                 '"--loss-name", "focal_cross_entropy"',

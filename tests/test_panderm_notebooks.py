@@ -45,8 +45,8 @@ PHASE2_VAL_SHA256 = "22a87a1ab4009c9e87462381f9ef35ad7a5eae7217057049fc24e5531df
 PHASE2_MAPPING_SHA256 = "5a034b7dc0c6f44543f558aa589b8e1cba12a05b71a18ff0e2d2029a2ad2e66c"
 
 PIN_PLACEHOLDER = "REPLACE_AFTER_PUSH"
-PINNED_IMPLEMENTATION_COMMIT = "a70a344e2c18f081a554bfd26886157dac9c3f34"
-PINNED_FORMAL_IMPLEMENTATION_COMMIT = "a70a344e2c18f081a554bfd26886157dac9c3f34"
+PINNED_IMPLEMENTATION_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
+PINNED_FORMAL_IMPLEMENTATION_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
 
 FROZEN_NOTEBOOKS = (
     "colab_balanced_ddpm_classifier_train.ipynb",
@@ -618,7 +618,7 @@ class Phase2ManifestBindingTests(unittest.TestCase):
             ),
             (
                 ["--run-version", "v2_other"],
-                "--run-version must be v1_panderm_base_c1_finetune",
+                "--run-version must be v1_panderm_base_c1_finetune_safe_v2",
             ),
             (["--df-target-count", "586"], "--df-target-count must be 585"),
             (
