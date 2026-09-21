@@ -31,6 +31,7 @@ class NotebookSecurityTests(unittest.TestCase):
                 self.assertIsNotNone(match)
                 pins.add(match[1])
                 self.assertNotIn('BRANCH = "balanced-ddpm-exploration"', code)
+                self.assertIn("require_training_runtime()", code)
         for pin in pins:
             with self.subTest(pin=pin):
                 source = subprocess.check_output(
