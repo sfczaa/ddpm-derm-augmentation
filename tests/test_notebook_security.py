@@ -40,6 +40,11 @@ class NotebookSecurityTests(unittest.TestCase):
                 )
                 self.assertIn("weights_only=True", source)
                 self.assertNotIn("weights_only=False", source)
+                runtime = subprocess.check_output(
+                    ["git", "show", f"{pin}:src/ddpm_derm/notebook_runtime.py"],
+                    cwd=ROOT, text=True,
+                )
+                self.assertIn("def require_training_runtime():", runtime)
 
     def test_notebooks_do_not_request_unrestricted_torch_loading(self):
         for name, notebook, _ in notebooks():

@@ -24,7 +24,7 @@ PROTECTED_NOTEBOOK = "colab_balanced_ddpm.ipynb"
 PROTECTED_SHA256 = (
     "ef8bb8be8fa0865a3297e361f1984631141eadca073cc1451ad5223ce27882b8"
 )
-PINNED_GIT_COMMIT = "42c76c229028988de59cbe95c701348cfecc5824"
+PINNED_GIT_COMMIT = "b584bd321dd11258469f8c564bcc8a82a3ae11ac"
 HEAD_MATCH_NOTEBOOKS = (
     "colab_coca_validation.ipynb",
     "colab_coca_classifier.ipynb",
