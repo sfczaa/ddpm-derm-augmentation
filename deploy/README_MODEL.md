@@ -9,7 +9,7 @@ tags:
   - non-commercial
 ---
 
-# HAM10000 ResNet-18 — C1@585 seed 2
+# HAM10000 ResNet-18 - C1@585 seed 2
 
 This repository contains the deployment checkpoint `best.pt` for an educational,
 non-commercial portfolio demonstration. It is not a medical device and must not

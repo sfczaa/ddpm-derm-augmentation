@@ -1,6 +1,6 @@
 # PanDerm-Base C1 exploratory validation plan (`v1_panderm_base_c1_finetune`)
 
-Status: **exploratory; validation-only evaluation.** The checkpoint digest was reviewed and
+Status: exploratory; validation-only evaluation. The checkpoint digest was reviewed and
 pinned after the first download, and formal-scale training was later enabled (see
 "Formal training decision"). No test metric or improvement claim is published.
 
@@ -37,14 +37,15 @@ and test-access provision above remains fully binding and unchanged.
 
 Formal-scale training (50 epochs, seeds 0, 1, 2) was unlocked by an explicit decision. The
 seed-0, five-epoch validation-only budget described above was PanDerm v1's original scope;
-formal-scale training is now a second, equally binding-checked scope for the same
-`v1_panderm_base_c1_finetune` run version. `evaluation_scope` stays `validation_only`
+formal-scale training was added to the original
+`v1_panderm_base_c1_finetune` run version. Current notebooks use a separate
+safe-version directory and cannot resume historical runs with a different identity. `evaluation_scope` stays `validation_only`
 everywhere and test-split access remains permanently prohibited
 (`TEST_ACCESS_ALLOWED = False`). `claim_boundary` stays `suggestive_exploratory_only` in
-every formal record too. The pretraining contamination risk is unchanged by training scale —
+every formal record too. The pretraining contamination risk is unchanged by training scale -
 this decision accepts that risk rather than resolving it.
 
-## Phase 0 CHECK — provenance needed for validation only
+## Phase 0: Validation provenance
 
 | Item | Fixed value |
 |---|---|
@@ -56,12 +57,11 @@ this decision accepts that risk rather than resolving it.
 | License | `CC-BY-NC-ND 4.0`, non-commercial academic research only |
 | Published checkpoint hash | none |
 
-`REPLACE_AFTER_FIRST_DOWNLOAD` remains the placeholder for fail-loud tests; the reviewed
-digest is pinned separately in `EXPECTED_CHECKPOINT_SHA256`. The validation notebook
-must fail loud after the first download until the observed SHA-256 is reviewed and
-pinned, the reviewed code is pushed, and `REPLACE_AFTER_PUSH` is replaced with that commit.
-This trust-on-first-use step authenticates the downloaded bytes for later validation; it
-does not prove the checkpoint's training corpus is non-overlapping.
+`REPLACE_AFTER_FIRST_DOWNLOAD` and `REPLACE_AFTER_PUSH` are placeholder values rejected
+by validation. The current notebook has a concrete code pin and the reviewed digest in
+`EXPECTED_CHECKPOINT_SHA256`. Digest matching verifies consistency with the previously
+reviewed bytes; it does not independently authenticate their origin or establish
+non-overlap with the checkpoint's training corpus.
 
 `require_provenance_clearance(..., purpose="validation_only")` checks the license verdict,
 pinned upstream/checkpoint identity, the exploratory claim boundary, and that the record
@@ -79,9 +79,9 @@ unconditionally with:
 PanDerm v1 formal training and test access are prohibited because exact pretraining overlap is independently unauditable.
 ```
 
-## Phase 1 RUN — validation-only engineering check
+## Phase 1: Validation-only engineering check
 
-The only executable v1 run is:
+The validation entry point uses:
 
 - C1 real train data only; no synthetic images;
 - seed `0`;
@@ -101,7 +101,7 @@ manifest mutation, or is included from the runtime value in the immutable identi
 `--drop-path` and `--no-amp` are not supported overrides.
 
 The trainer has no executable `full` scope, test manifest load, test frame, test loader,
-test evaluation, or test metric path — this remains true for the formal-scale training path
+test evaluation, or test metric path - this remains true for the formal-scale training path
 added below too. A forged `VALIDATION PASSED` record cannot unlock test access: there is a
 downstream v1 formal *training* notebook path (see "Formal training decision" above), but it
 carries the identical `evaluation_scope=validation_only` restriction and has no test
@@ -146,7 +146,7 @@ scheduler, scaler, or RNG state mutation.
 Formal aggregation (`panderm_run.aggregate_results`) is enabled per the "Formal training
 decision" above, but only across exactly the three formal seed runs, and it independently
 refuses any run whose `evaluation_scope` is not `validation_only` or whose `test_metrics` is
-not `None` — aggregation carries its own test-access refusal, not just a policy note.
+not `None` - aggregation carries its own test-access refusal, not just a policy note.
 
 ## Persistence contract
 
@@ -161,8 +161,8 @@ non-empty existing final record is never overwritten silently.
 
 ## Notebook scope
 
-- `notebooks/colab_panderm_base_c1_finetune_validation.ipynb` remains unexecuted and
-  Run-all-safe only after `REPLACE_AFTER_PUSH` and the checkpoint hash are pinned. It runs
+- `notebooks/colab_panderm_base_c1_finetune_validation.ipynb` has code and checkpoint
+  pins configured. A new environment still requires runtime validation. It runs
   seed 0 for five epochs with `evaluation_scope=validation_only`.
 - `notebooks/colab_panderm_base_c1_finetune_classifier.ipynb` was originally a STOP/DECISION
   notebook whose first substantive cell failed loud with the binding prohibition. Per the
@@ -170,8 +170,8 @@ non-empty existing final record is never overwritten silently.
   seeds 0/1/2, `evaluation_scope=validation_only`). It still contains no test manifest, test
   evaluation, or test metric helper of any kind.
 
-Existing ResNet, DDPM, CoCa, deployment, README, experiment logs, and outputs
-remain out of scope and byte-identical. PanDerm adapted weights must never be published,
+The PanDerm experiment does not change the existing ResNet, DDPM, CoCa, or deployment
+conditions. PanDerm adapted weights must never be published,
 served, committed, or added to the existing deployment.
 
 ## Required verification boundary

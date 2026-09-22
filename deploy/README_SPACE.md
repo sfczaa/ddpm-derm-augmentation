@@ -9,7 +9,7 @@ this entry point is deployed.
 
 ## Assemble the Space repository
 
-Create the Space with **SDK: Gradio**, then set hardware to **ZeroGPU** in
+Create the Space with SDK: Gradio, then set hardware to ZeroGPU in
 Settings. Upload:
 
 ```text
@@ -25,7 +25,7 @@ deploy/download_render_assets.py
 `app.py` expects `src/` and `deploy/` as siblings, exactly as in this
 repository, so copying those two directories in place is enough.
 
-**Do not upload** the `.pt` files, the HAM10000 data, or the 500 gallery images.
+Do not upload the `.pt` files, the HAM10000 data, or the 500 gallery images.
 `app.py` fetches the checkpoint and the gallery at startup by pinned revision
 and the download script hash-checks the archive; that is what keeps the Space
 repository small and its provenance auditable.

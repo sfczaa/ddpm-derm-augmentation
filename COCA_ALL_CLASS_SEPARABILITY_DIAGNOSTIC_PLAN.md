@@ -26,7 +26,9 @@ authorize picking a ratio or starting a formal run.
 
 ## Preregistered design (fixed; not tuned on validation)
 
-- Diagnostic version `v1_all_class_separability`.
+- Historical diagnostic version `v1_all_class_separability`. Current notebook
+  reruns use the separate safe-version directory defined by the implementation;
+  historical results are retained.
 - Use the fixed `original` train split (6995 rows) and `validation` split
   (1510 rows) only. Never load the test split, C1 duplication, or any synthetic
   image or candidate.
@@ -43,20 +45,20 @@ authorize picking a ratio or starting a formal run.
 
 ## Four fixed analyses
 
-- **A. Seven-class nearest centroid.** Centroids are built from train
+- A. Seven-class nearest centroid. Centroids are built from train
   embeddings only (per-class mean of normalized embeddings, then re-normalized);
   validation predictions take the highest cosine similarity, breaking exact ties
   by the canonical class index.
-- **B. Cosine k-NN, k = (1, 5, 10).** Reference = train, query = validation,
+- B. Cosine k-NN, k = (1, 5, 10). Reference = train, query = validation,
   cosine descending with a deterministic stable order. Vote ties break first by
   the higher summed neighbour cosine similarity of the tied class, then by the
   canonical class index. All three k are reported in full; no "best k" is picked.
-- **C. Validation-df representation margin.** For the 14 validation df only:
+- C. Validation-df representation margin. For the 14 validation df only:
   `nearest_train_non_df_cosine_distance - nearest_train_df_cosine_distance`
   (positive means closer to train df), summarized with
   count/min/p10/median/mean/p90/max plus positive count/fraction, and the df
   purity of each query's k = (1, 5, 10) train neighbours.
-- **D. One balanced multinomial logistic-regression probe.** A single fixed
+- D. One balanced multinomial logistic-regression probe. A single fixed
   sklearn configuration (l2, C=1.0, lbfgs, class_weight="balanced",
   fit_intercept=True, tol=1e-6, max_iter=5000, random_state=0), fit on train
   labels only; validation labels are used once for metrics after the fit.
@@ -91,11 +93,11 @@ scope; `validate_diagnostic_identity` rejects any missing/empty field, any drift
 between the record and the identity file, and any internally-consistent identity
 that disagrees with the runtime-expected identity.
 
-The three formal records share identical bytes, certified by a non-circular
+The three diagnostic records share identical bytes, checked by a non-circular
 `record_integrity.json` sidecar that records each file's SHA-256 and byte length
 (the records never embed their own hash). The eight-key embedding NPZ is
 validated before and after writing for exact dtype (float32 embeddings, int64
-labels, unicode — never object — id arrays), shape, finite unit-norm embeddings,
+labels, unicode - never object - id arrays), shape, finite unit-norm embeddings,
 unique/non-empty image ids, and no cross-split id overlap. All NPZ and JSON
 writes are atomic and reopened for verification.
 

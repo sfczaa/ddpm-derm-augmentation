@@ -1,8 +1,8 @@
-# outputs/ — where run artifacts live
+# Output artifacts
 
-Everything here is generated and **git-ignored** (only this README and the
+Everything here is generated and git-ignored (only this README and the
 `.gitkeep` folder markers are tracked). On Colab, point `DDPM_DERM_OUTPUTS_DIR`
-at a Google Drive folder so nothing is lost on disconnect.
+at a Google Drive folder to persist completed writes across disconnects.
 
 ```
 outputs/
@@ -32,38 +32,38 @@ outputs/
   figures/         plots for the report (loss curves, confusion matrices, ...)
 ```
 
-## Where do I put things?
+## Artifact locations
 
-- **Classifier results** → `results_*.json` files go in
+- Classifier results -> `results_*.json` files go in
   `outputs/classifier/results/`; `python scripts/aggregate_results.py` builds
   the mean ± std table.
-- **Trained model checkpoints** → `outputs/classifier/checkpoints/<run>/`.
+- Trained model checkpoints -> `outputs/classifier/checkpoints/<run>/`.
   `train_classifier.py` writes these automatically. `best.pt` is the one to keep
   for evaluation and deployment.
-- **The dataset itself** → not here. It lives in `data/` inside the project
+- The dataset itself -> not here. It lives in `data/` inside the project
   (a sibling `../data` also resolves). It is git-ignored and non-commercially licensed;
   never commit it. On Colab, upload it to Drive and set `DDPM_DERM_DATA_DIR`.
-- **Stage 4 deploy checkpoint** → the selected local candidate is
+- Stage 4 deploy checkpoint -> the selected local candidate is
   `outputs/classifier_df585/checkpoints/C1_seed2/best.pt`. It remains ignored
   and must be mounted or published as a separate model asset, never committed.
   `scripts/export_deploy_checkpoint.py` derives the smaller
   `outputs/deploy/C1_seed2/deploy_weights.pt` without changing the formal file.
-- **Stage 4 gallery** → only use the versioned
+- Stage 4 gallery -> only use the versioned
   `outputs/synthetic_df/epoch0100_seed0/` directory after validating its
   `_READY.json`; do not fall back to an unversioned manifest.
   `scripts/package_gallery_for_deploy.py` creates the transport ZIP only after
   validating the complete versioned gallery.
 
-- **Exploratory balanced-DDPM artifacts** → use only a fresh version under
+- Exploratory balanced-DDPM artifacts -> use only a fresh version under
   outputs/exploratory_balanced_ddpm/. Never put its snapshots, previews,
   metadata, or candidate images into the frozen outputs/ddpm/ or
   outputs/synthetic_df/epoch0100_seed0/ paths.
-- **Exploratory downstream classifier archive** → keep the curated metadata,
+- Exploratory downstream classifier archive -> keep the curated metadata,
   result JSON, and executed notebooks under the same version's
   `downstream_classifier/` directory. `archive_manifest.json` records the
   source ZIP hash and verification status. Keep the complete ZIP and `.pt`
   weights outside Git; `outputs/**` remains ignored.
-- **Frozen CoCa robustness archive** → keep its curated validation records,
+- Frozen CoCa robustness archive -> keep its curated validation records,
   six formal result JSON files, aggregate/training records, completion marker,
   and executed training notebook under the same version's
   `coca_classifier/v1/` directory. Keep the complete ZIP and all `.pt`

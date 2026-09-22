@@ -1,4 +1,4 @@
-# Exploratory sqrt-balanced DDPM — Colab runbook
+# Exploratory sqrt-balanced DDPM - Colab runbook
 
 This is a post-Stage-4 exploratory run. It does not replace the frozen natural
 DDPM or the formal epoch-100 synthetic dataset. The strategy is deliberately
@@ -259,7 +259,6 @@ assert not CANDIDATE_FINAL.exists()
   --expect-n 500 --expect-epoch 100 --expect-seed 0 --expect-steps 50
 ~~~
 
-The runbook ends here. Review the sampler histogram, run metadata, epoch-100
-snapshot, previews, nearest-neighbour montage, and candidate path before any
-further step. C0, C1, and C4 are not rerun here; a downstream comparison is a
-separate decision.
+Candidate verification covers the sampler histogram, run metadata, epoch-100
+snapshot, previews, nearest-neighbour montage, and candidate path. Downstream
+C0, C1, and C4 classifier comparisons are outside this runbook.

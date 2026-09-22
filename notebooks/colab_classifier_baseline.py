@@ -4,7 +4,7 @@
 # %% [1] GPU check
 # !nvidia-smi
 
-# %% [2] Mount Drive (checkpoints/results survive disconnects)
+# %% [2] Mount Drive
 from google.colab import drive  # noqa
 drive.mount('/content/drive')
 
@@ -18,10 +18,10 @@ OUTPUTS_DIR = '/content/drive/MyDrive/ddpm-derm-augmentation/outputs'  # persist
 os.environ['DDPM_DERM_DATA_DIR'] = DATA_DIR
 os.environ['DDPM_DERM_OUTPUTS_DIR'] = OUTPUTS_DIR
 
-# %% [4] Verify the data layer BEFORE spending GPU time (torch-free)
+# %% [4] Validate data and split integrity
 # !cd "$PROJECT_DIR" && python scripts/smoke_test.py
 
-# %% [5] Install the light extras (torch already present on Colab)
+# %% [5] Install dependencies
 # !pip install -q pandas pillow
 
 # %% [6] Train classifiers across seeds
@@ -29,7 +29,7 @@ os.environ['DDPM_DERM_OUTPUTS_DIR'] = OUTPUTS_DIR
 import subprocess, sys, json
 from pathlib import Path
 
-SEEDS = [0, 1, 2]          # experiment seeds
+SEEDS = [0, 1, 2]
 EPOCHS = 20
 
 def run(variant, seed, extra=None):

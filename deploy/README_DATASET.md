@@ -74,4 +74,4 @@ Synthetic images may contain artifacts, reproduce training-data biases, or fail
 to reflect clinically meaningful diversity. In the formal matched-585
 experiment, using this gallery's synthetic data did not improve downstream `df`
 classification over real-image oversampling. The result is suggestive only and
-is neither statistically significant nor clinically validated.
+has not established statistical significance or clinical validity.

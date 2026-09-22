@@ -14,9 +14,9 @@ datasets:
   - sfczaa/ddpm-derm-synthetic-gallery
 ---
 
-# HAM10000 skin-lesion classifier — portfolio demo
+# HAM10000 skin-lesion classifier - portfolio demo
 
-**Educational portfolio demonstration only. Not for diagnosis or treatment.**
+Educational portfolio demonstration only. Not for diagnosis or treatment.
 The model can be wrong, and its training data and population coverage are
 limited.
 
@@ -26,8 +26,8 @@ the 500 DDPM-generated `df` images used by the project's C4 condition.
 
 ## What is being served
 
-The deployed model is **C1 seed 2**, chosen by the highest validation `df` F1
-among the C1 seeds — never on test performance. Weights and the synthetic
+The deployed model is C1 seed 2, chosen by the highest validation `df` F1
+among the C1 seeds - never on test performance. Weights and the synthetic
 gallery are fetched at startup by pinned revision and hash-checked, so the Space
 serves exactly the published artifacts:
 
@@ -36,15 +36,16 @@ serves exactly the published artifacts:
 | checkpoint | `sfczaa/ddpm-derm-c1-seed2` | `30b41486b5353f2a99aceecef2fc41b178c2697b` |
 | synthetic gallery | `sfczaa/ddpm-derm-synthetic-gallery` | `60b046e4c2ae77f1505e8c2b426c24763741c3a5` |
 
-## Does the synthetic data help?
+## Synthetic-data comparison
 
-Not beyond duplication. Across seeds 0/1/2 on the fixed test split, adding all
-500 synthetic `df` images scored **below** simply duplicating the 85 real ones
+Across seeds 0/1/2 on the fixed test split, adding all
+500 synthetic `df` images scored below simply duplicating the 85 real ones
 (df F1 `0.6115` vs `0.6598`). Filtering the pool to the 155 images nearest the
-real `df` manifold recovered that loss but did not beat duplication
-(`0.6657 +/- 0.0182`). With 16 real `df` in the test split none of these
-differences can be significant, and none was tested. Full method, diagnostics
-and limits are in the project repository.
+real `df` manifold gave a mean close to the duplication baseline
+(`0.6657 +/- 0.0182`). With 16 real `df` in the test split, estimates are
+imprecise. No significance test was performed, so these differences do not
+establish a reliable benefit. Full method, diagnostics and limits are in the
+project repository.
 
 ## Attribution and licence
 

@@ -1,110 +1,100 @@
-# C4-filtered — pre-registered design (executed 2026-09-06)
+# C4-filtered - pre-registered design (executed 2026-09-06)
 
-Status: **executed.** The gate was resolved on 2026-09-05 and the condition ran
+Status: executed. The gate was resolved on 2026-09-05 and the condition ran
 on 2026-09-06 under run version `v1_c4_filtered`, implementation commit
-`e68b3a7`. 155 of the 500 images cleared the threshold; the test split was
-evaluated once, across seeds 0/1/2.
+`e68b3a7`. 155 of the 500 images cleared the threshold; final test metrics
+were recorded across seeds 0/1/2.
 
-Result: **parity with C1, a higher mean than C4** — test df F1 `0.6657 +/- 0.0182`
+Result: parity with C1, a higher mean than C4 - test df F1 `0.6657 +/- 0.0182`
 against C1 `0.6598 +/- 0.0423` and C4 `0.6115 +/- 0.0423`. The `+0.0059` over C1
 is less than one test image's worth on 16 df; the `+0.0541` over C4 exceeds
 either seed spread. This is consistent with the distance criterion removing a loss
 from the unfiltered pool without beating plain duplication; no significance test
 was performed. The full result and its limits are in
-`README.md`, section Turning the diagnostic into a selection rule: C4-filtered.
+`README.md`, section C4-filtered selection experiment.
 
-Every rule below is as pre-registered. Nothing in §3 to §7 was changed at any
-point; only the gate in §2 was resolved, and it resolved against the reasoning
-that created it. See "Gate outcome" immediately below.
+The experimental parameters and selection rules in sections 3 to 7 are retained.
+The gate in section 2 was resolved using the corrected batch. The text below
+clarifies the historical decision and the limits of the descriptive results.
 
 ## Gate outcome (2026-09-05)
 
-Two things settle the gate, and they point the same way.
+The gate was resolved from the corrected batch identity and the sampler sweep.
 
-**1. §2's numbers came from the wrong batch.** This document was written
+1. §2's numbers came from the wrong batch. This document was written
 2026-08-11, five days before the batch mix-up was found. Its quoted synthetic
-distribution — range `0.160`–`1.180`, median `1.086`, `p1 = 0.6564`,
-`p5 = 0.8293` — matches `outputs/figures/ddpm_memorization_diagnostic.json`
-exactly, which measured the earlier **epoch-60** batch. On the published
+distribution - range `0.160`-`1.180`, median `1.086`, `p1 = 0.6564`,
+`p5 = 0.8293` - matches `outputs/figures/ddpm_memorization_diagnostic.json`
+exactly, which measured the earlier epoch-60 batch. On the published
 epoch-100 pool that C4 actually trains on
 (`ddpm_memorization_diagnostic_epoch100.json`, content SHA-256
 `e0bb7015...`), the same distribution is `p0 = 0.1290`, `p1 = 0.3211`,
 `p5 = 0.4724`, `p25 = 0.8508`, `p50 = 0.9990`, `p100 = 1.1843`.
 
-The §4 threshold is unchanged at `0.901291012763977` — it is derived from the
+The §4 threshold is unchanged at `0.901291012763977` - it is derived from the
 14 real val `df`, which no batch correction touches.
 
 Since `p25 = 0.8508` is at or below that threshold and `p50 = 0.9990` is above
-it, **between 125 and 250 of the 500 published images clear the bar**, i.e.
-25–50% of the pool. §2 predicted "somewhere in the region of one to five per
+it, between 125 and 250 of the 500 published images clear the bar, i.e.
+25-50% of the pool. §2 predicted "somewhere in the region of one to five per
 cent" and "a few dozen images at most". That prediction was about a different
-batch and is void. The §4 shortfall rule (fewer than 50 accepted ⇒ do not run)
+batch and is void. The §4 shortfall rule (fewer than 50 accepted => do not run)
 is cleared with a wide margin.
 
-The exact count is not computable here: the distance is a ResNet-18 embedding
-and this machine is deliberately torch-free. Recompute it on Colab as the
-first step of execution — the bound above is read off recorded percentiles, and
-the count, fraction and accepted-image manifest required by §5 must come from
-an actual run of the filter.
+The percentile bound was available at the gate decision. The subsequent filter
+run recomputed ResNet-18 distances and supplied the exact count, fraction, and accepted-image manifest required
+by section 5, as recorded in the status above.
 
-**2. The "strong version" in §2 no longer exists.** Its step 2 was "regenerate a
+2. The sweep did not support the alternative pool proposed in section 2. Its step 2 was "regenerate a
 larger pool under whichever sampler configuration recovers the most saturation
 and contrast". The sweep ran on 2026-08-16 and found no such configuration
-worth regenerating under: every setting sits at `embed_nn` 0.97–1.07 against
+worth regenerating under: every setting sits at `embed_nn` 0.97-1.07 against
 the real-val reference of `0.3678`, so none moves samples onto the real `df`
 manifold, and the configurations that do recover saturation (`eta 1.0`) produce
-fluorescent cyan, magenta and orange frames that are not skin. Regenerating
-under them would produce a pool that is worse on the exact distance the filter
-uses.
+fluorescent cyan, magenta and orange frames that are not skin. The sweep provided no measured distance improvement to justify generating
+a replacement pool under those settings.
 
-**Therefore the current pool is not the weak version of this experiment — it is
-the only version.** Running it on today's pool no longer burns the
-pre-registration on a likely null; the gate was constructed on a number that
-turned out to belong to another batch.
+The published pool was retained for the filtering experiment. The original
+deferral was based on measurements from a different batch.
 
-**Execution still needs Colab** (3 seeds × 20 epochs, plus the filter pass).
-Nothing about §3–§7 changes on the way there.
+The completed Colab run used 3 seeds × 20 epochs plus the filter pass, with
+the experimental parameters in sections 3-7 unchanged.
 
-This document fixes every rule *before* any number is seen, so the result
-cannot be chosen after the fact. That is the whole point: a filtering step that
-picks its threshold after looking at outcomes is not evidence of anything.
+The selection rule was fixed before C4-filtered training. Outcome-based
+threshold tuning would invalidate that comparison.
 
 ---
 
-## 1. The question
+## 1. Research question
 
-The memorisation diagnostic produced something the project did not have before:
-a per-image distance from each synthetic `df` to the real `df` manifold. That
-distance is a **distribution**, not a single number — in the C1 embedding the
-500 published images run from `0.160` (closest) to `1.180` (farthest), median
-`1.086`.
+The memorisation diagnostic measures per-image distance from synthetic `df`
+to the real `df` reference. The earlier epoch-60 batch of 500 images ranged
+from `0.160` (closest) to `1.180` (farthest), median `1.086`, in the C1 embedding.
+Those historical values are superseded by the epoch-100 values above.
 
-So: is there a subset of the synthetic pool that is close enough to real `df`
+Is there a subset of the synthetic pool that is close enough to real `df`
 to be more useful as augmentation than the pool as a whole?
 
-If yes, the diagnostic has been converted from a description into a selection
-criterion, and the improvement is attributable to a measurement rather than to
-luck. If no, that is a clean negative and costs one classifier training run.
+The comparison evaluates a fixed distance-based selection criterion. Any
+observed difference remains descriptive under the fixed split and small sample.
 
-## 2. Why this is gated on the sweep
+## 2. Original sweep gate
 
-> **Superseded 2026-09-05 — see "Gate outcome" above.** The numbers in this
+> Superseded 2026-09-05 - see "Gate outcome" above. The numbers in this
 > section were measured on the epoch-60 batch, not the published epoch-100 pool
-> they claim to describe. Retained unedited as the original pre-registered
-> reasoning.
+> they were originally used to describe. The historical measurements and
+> proposed sequence are retained below.
 
-The current pool is a poor candidate for filtering, and the numbers already on
-record say so.
+The original deferral used the following estimate of the accepted count.
 
 The acceptance threshold has to be anchored to something real (see §4). The
 loosest defensible anchor is the *maximum* distance among the 14 genuinely-new
 real `df`, which is `0.9012910127639771`. Against that, the synthetic
-distribution has `p1 = 0.6564393639564514` and `p5 = 0.8293142914772034` —
-so only somewhere in the region of one to five per cent of the 500 clear even
-that loosest bar. Filtering the current pool therefore selects "least bad", from
-a few dozen images at most, and a null result is the likely outcome.
+distribution has `p1 = 0.6564393639564514` and `p5 = 0.8293142914772034` -
+the original estimate was that one to five per cent of the 500 images would
+clear the threshold. This estimate applies to the earlier batch.
 
-The strong version of this experiment is:
+The proposed sequence was:
 
 1. run the sweep,
 2. regenerate a larger pool under whichever sampler configuration recovers the
@@ -112,13 +102,12 @@ The strong version of this experiment is:
 3. filter *that* pool,
 4. compare.
 
-Running step 3 on today's pool first would burn the pre-registration on the
-weakest available version of the question. The pool is therefore a **parameter**
-of this design, not a constant.
+Under that original plan, step 3 followed pool regeneration. Pool identity
+was a parameter of the design; the executed pool is identified above.
 
 ## 3. Conditions
 
-`df_target_count` stays at **585** for every condition. `build_classifier_frame`
+`df_target_count` stays at 585 for every condition. `build_classifier_frame`
 requires C1 and C4 to differ only in the *source* of the `df` rows; filtering to
 a smaller pool and letting the total fall would confound "filtering" with "less
 oversampling", and the comparison would answer neither question.
@@ -129,36 +118,36 @@ oversampling", and the comparison would answer neither question.
 | `C4` (existing) | 85 real + 500 synthetic |
 | `C4-filtered` (new) | 85 real + accepted synthetic + real duplication filling the remainder to 585 |
 
-The filler is real duplication precisely because that is what C1 does. If
-`C4-filtered` beats `C1`, the accepted synthetic images did something that
-duplication does not; if it only matches `C1`, they did not.
+Real duplication supplies the remaining rows to match the C1 construction.
+The `C4-filtered` versus `C1` comparison measures the observed effect of
+replacing those duplicates with accepted synthetic images.
 
 Everything else is held fixed: same fixed `lesion_id` split, same seeds
 `{0, 1, 2}`, same 20 epochs, same architecture, same `build_transforms`
 augmentation, same `validation_df_f1_strict_improvement` selection rule.
 
-## 4. The acceptance rule — fixed now
+## 4. Fixed acceptance rule
 
-- **Judge**: `outputs/classifier_df585/checkpoints/C1_seed2/best.pt`,
+- Judge: `outputs/classifier_df585/checkpoints/C1_seed2/best.pt`,
   penultimate 512-d features, L2-normalised, `img_size 128`. This is the judge
   the diagnostics already use. It is trained on real images only, so it never
   saw the pool it is filtering. It must not be a C4 model (circular) and must
   not be PanDerm (pretraining corpus cannot be shown to exclude HAM10000).
-- **Distance**: nearest-neighbour into the 85 real train `df` **and their
-  horizontal mirrors**, matching the diagnostics, since training used
+- Distance: nearest-neighbour into the 85 real train `df` and their
+  horizontal mirrors, matching the diagnostics, since training used
   `RandomHorizontalFlip`.
-- **Threshold**: accept a synthetic image when its distance is at or below
-  `max(val_df_to_train)` — the farthest of the 14 genuinely-new real `df`.
+- Threshold: accept a synthetic image when its distance is at or below
+  `max(val_df_to_train)` - the farthest of the 14 genuinely-new real `df`.
   On the current record that value is `0.9012910127639771`, but it is
-  **recomputed from the val set for whichever pool is used**, never hardcoded.
+  recomputed from the val set for whichever pool is used, never hardcoded.
   The rule is "no farther from real `df` than the most unusual genuinely new
   real `df`", which is defensible without reference to any outcome.
-- **No top-N.** A fixed count would silently change meaning with pool size and
+- No top-N. A fixed count would silently change meaning with pool size and
   invites tuning. The count is whatever clears the threshold, and it is
   reported.
-- If fewer than **50** images clear the threshold, the condition is **not run**;
+- If fewer than 50 images clear the threshold, the condition is not run;
   the shortfall is recorded and reported as the result. Training a condition on
-  a handful of images would produce noise, not an answer.
+  such a small accepted set was excluded by the preregistered minimum.
 
 ## 5. Required outputs
 
@@ -166,34 +155,25 @@ Alongside the usual per-seed metrics:
 
 - number and fraction of the pool accepted, and the distance distribution of
   the accepted subset;
-- **diversity of the accepted subset** — within-set nearest-neighbour spacing
+- diversity of the accepted subset - within-set nearest-neighbour spacing
   against the real `df` set, exactly as in the memorisation diagnostic.
-  Filtering by proximity to real data can easily collapse variety, and a
-  filtered set that is closer but far less varied is a different animal from
-  one that is closer and equally varied. This must be visible, not inferred.
+  This records whether filtering also reduces measured within-set variety.
 - the accepted-image manifest, so the condition is reproducible.
 
 ## 6. Reading the result
 
-- `C4-filtered` > `C4` and > `C1`: the selection criterion worked. This is the
-  only outcome that supports the claim that the diagnostic improved the result.
-- `C4-filtered` ≈ `C1`: the accepted images add nothing beyond duplication.
-- `C4-filtered` ≈ `C4`: filtering did not matter at this pool quality.
+- `C4-filtered` > `C4` and > `C1`: a higher observed mean under the selection criterion.
+- `C4-filtered` ≈ `C1`: little observed difference from duplication.
+- `C4-filtered` ≈ `C4`: little observed difference from the unfiltered pool.
 - fewer than 50 accepted: reported as-is; no condition is run.
 
-**With 16 real `df` in the test split, none of these differences can be
-significant, and no significance test is performed** — consistent with the
-project's standing constraint. Everything here is descriptive and suggestive,
-and must be written up that way. A difference of a few hundredths of df F1 on
-16 images is not a finding; the honest deliverable is the procedure and the
-measured distances, not the delta.
+With 16 real `df` in the test split, estimates are imprecise. No significance
+test was performed, so statistical significance has not been established.
+Report the procedure, measured distances, and observed differences as descriptive results.
 
-## 7. What this must not become
+## 7. Scope
 
-- Not a reason to re-open or re-run any existing C0/C1/C4 result. Those stay
-  frozen.
-- Not a replacement for the deployed classifier, which stays C1 seed 2.
-- Not a threshold that gets adjusted after seeing df F1. If the rule in §4
-  produces an uninteresting answer, the answer is uninteresting.
-- Not evaluated on the test split more than once, and not until the conditions
-  above are settled.
+- Existing C0/C1/C4 results remain frozen.
+- The deployed classifier remains C1 seed 2.
+- The threshold in section 4 remains fixed regardless of df F1.
+- The planned final test evaluation occurs only after all conditions above are fixed.

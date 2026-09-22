@@ -12,10 +12,11 @@ NumPy allowlist for legacy RNG state. This is not a sandbox against resource
 exhaustion: load only checkpoints from a trusted source, and verify published
 hashes. Deployment checks the model hash before loading it.
 
-The historical experiment notebooks pin earlier code revisions and validation
-records. Reproducing those experiments requires their original trusted assets;
-updating this repository does not change their pinned code or validate a new
-Colab training environment.
+Current notebook entry points pin the restricted-loader implementation and
+write new runs to separate versioned directories. Historical results remain
+unchanged. A new run requires matching validation records and cannot resume an
+old run with a different identity. Local checks do not validate a Colab training
+environment.
 
 The FastAPI upload endpoint bounds the request before multipart parsing and
 keeps one file in memory. Do not submit identifying or patient images to a

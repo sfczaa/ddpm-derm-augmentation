@@ -2,17 +2,17 @@
 
 An experimental comparison of DDPM augmentation and real-image duplication
 for classification on the imbalanced HAM10000 dataset. The target minority
-class is **df** (dermatofibroma, 115 images). The repository also contains a
+class is df (dermatofibroma, 115 images). The repository also contains a
 FastAPI demo with Docker packaging and versioned assets on Hugging Face Hub.
 
-> Status: **The formal matched-585 experiment is complete and the Stage 4
-> deployment MVP is implemented.** The selected deploy candidate is C1@585
+> Status: The formal matched-585 experiment is complete and the Stage 4
+> deployment MVP is implemented. The selected deploy candidate is C1@585
 > seed 2, chosen by the highest validation df F1 among C1 seeds. Asset and API
 > safety paths are locally verified. The public Render demo (2026-07-14) and a
 > local Docker build (2026-08-18) each passed a serving check; neither validates
 > model accuracy or load behavior.
 
-## What exists now
+## Repository layout
 
 ```
 ddpm-derm-augmentation/
@@ -40,10 +40,9 @@ ddpm-derm-augmentation/
   requirements.txt
 ```
 
-The layers are split by dependency weight on purpose: `config` / `manifests` /
-`metrics` need only pandas+numpy+pillow, so the whole data path can be verified
-locally before spending GPU time. `dataset` / `model` / `train_classifier` need
-torch and are meant to run on Colab.
+`config` / `manifests` / `metrics` support local data checks with
+pandas, NumPy, and Pillow. `dataset` / `model` / `train_classifier` require
+PyTorch.
 
 ## Data
 
@@ -53,17 +52,16 @@ must retain attribution, a license link, and an indication of modifications.
 Credit: HAM10000 Dataset © ViDIR Group, Department of Dermatology, Medical
 University of Vienna; Tschandl, Rosendahl & Kittler, *Scientific Data* 5,
 180161 (2018), https://doi.org/10.1038/sdata.2018.161.
-The dataset lives **inside the project** at `data/` (10k images + `manifests/`),
-so the whole project is a single self-contained upload. The code finds a data
-dir containing `manifests/class_to_idx.json` in this order
+The default dataset location is `data/` (10k images + `manifests/`).
+The code finds a data directory containing `manifests/class_to_idx.json` in this order
 (`src/ddpm_derm/config.py`):
 
 1. `$DDPM_DERM_DATA_DIR`
-2. `<project>/data`     ← current layout (data is inside the project)
-3. `<project>/../data`  ← fallback if data is kept as a sibling
+2. `<project>/data`     <- current layout (data is inside the project)
+3. `<project>/../data`  <- fallback if data is kept as a sibling
 
 `image_path` in each manifest is relative to that data dir. The
-`lesion_id`-grouped train/val/test split is **fixed** — do not re-split.
+`lesion_id`-grouped train/val/test split is fixed - do not re-split.
 
 ## Run the smoke test (local, no GPU, no torch)
 
@@ -73,7 +71,7 @@ python scripts/smoke_test.py
 ```
 
 Verifies: data dir resolves; per-class counts match `split_summary.csv`; images
-open; **no lesion_id/image_id leakage between train and val/test**; C0/C1 frame
+open; no lesion_id/image_id leakage between train and val/test; C0/C1 frame
 construction; metric correctness. Exits non-zero on any failure.
 
 ## Train baselines (Colab T4)
@@ -93,17 +91,17 @@ python -m ddpm_derm.train_classifier --variant C1 --seed 0 --epochs 20 --df-targ
 python scripts/aggregate_results.py   # mean +/- std across seeds
 ```
 
-Model selection uses **val df F1**; reported numbers are on the **test** split.
-Run 3–5 seeds per variant and report mean ± std. No k-fold, no significance
-tests (df is tiny → results are **suggestive**, and that is stated as such).
+Model selection uses val df F1; reported numbers are on the test split.
+Run 3-5 seeds per variant and report mean ± std. No k-fold, no significance
+tests (df is tiny -> results are suggestive, and that is stated as such).
 
 ### Checkpoints & Colab-disconnect resume
 
 Each run writes to `outputs/classifier/checkpoints/<variant>_seed<seed>/`:
-- `best.pt` — best-on-val-df-F1 weights (use this for eval / deployment)
-- `last.pt` — latest epoch + optimizer state, rewritten every epoch (atomic write)
+- `best.pt` - best-on-val-df-F1 weights (use this for eval / deployment)
+- `last.pt` - latest epoch + optimizer state, rewritten every epoch (atomic write)
 
-If a Colab session drops, re-run the **same** command with `--resume` and it
+If a Colab session drops, re-run the same command with `--resume` and it
 continues from `last.pt`. Results JSON lands in `outputs/classifier/results/`.
 Point `DDPM_DERM_OUTPUTS_DIR` at Google Drive so checkpoints survive disconnects.
 See `outputs/README.md` for the output layout.
@@ -116,12 +114,12 @@ See `outputs/README.md` for the output layout.
 | C1 | duplicate real train df up to `df_target_count` | rule out "just more df exposure" |
 | C4 | add DDPM-synthetic df | main result |
 
-**Fairness knob:** C1's `--df-target-count` must equal C4's total df count
+Matched exposure: C1's `--df-target-count` must equal C4's total df count
 (real + synthetic) so the two only differ in *how* the extra df is produced.
-The composition is **585 = 85 real train df + 500 generated**, so both
+The composition is 585 = 85 real train df + 500 generated, so both
 C1 and C4 run with `--df-target-count 585`.
 
-**C4 status:** the formal epoch-100 synthetic dataset and matched-585 C1/C4
+C4 status: the formal epoch-100 synthetic dataset and matched-585 C1/C4
 runs are complete. Across three seeds, C1@585 test df F1 was 0.660 +/- 0.042
 and C4@585 was 0.612 +/- 0.042. This does not support a downstream benefit
 from the current synthetic data; the fixed-split, small-df result is
@@ -149,14 +147,13 @@ outputs/exploratory_balanced_ddpm/<version>/
 ~~~
 
 See COLAB_BALANCED_DDPM.md for the tiny smoke, resume checks, 100-epoch run,
-and versioned candidate-generation commands. That runbook intentionally stops
-before downstream classification; the separately approved comparison is
-reported below.
+and versioned candidate-generation commands. The downstream classifier
+comparison is reported below.
 
 ### Exploratory downstream comparison (completed)
 
 The versioned sqrt-balanced candidate was evaluated as an isolated C4@585
-condition with the same fixed split, classifier configuration, and seeds 0–2
+condition with the same fixed split, classifier configuration, and seeds 0-2
 used by the frozen matched-585 comparison. Each run used 20 epochs; model
 selection remained based on validation df F1. Test results are mean +/-
 population standard deviation across three seeds.
@@ -263,25 +260,24 @@ the C1 seed 2 container, whose startup checkpoint integrity guard passed. Under
 Colab the same deployment-only checkpoint measured 385.5 MB RSS current and
 408.9 MB peak.
 
-**What this does not cover:** model accuracy, load or concurrency behavior,
+What this does not cover: model accuracy, load or concurrency behavior,
 platforms other than these two, and any deployment state later than the dates
 above.
 
-## Does the synthetic data actually help? A generator diagnostic
+## Synthetic-data diagnostics
 
 The sqrt-balanced exploratory comparison added 500 synthetic `df` images in C4 rather than duplicating the
-85 real train images as C1 did. Test df F1 moved by `+0.0223`. This is a small difference, so the first
-question was whether the generator was adding anything at all.
+85 real train images as C1 did. Test df F1 moved by `+0.0223`. The following diagnostics examine
+copying and distribution shift as possible explanations for the small difference.
 
-The DDPM had only 85 real train `df` images. If it had memorised them, C4 would be functionally equivalent
-to C1, and a near-zero gap would be the expected result. Memorisation therefore had to be measured before
-interpreting the downstream comparison.
+The DDPM had only 85 real train `df` images. Close copies could provide little additional diversity,
+so the diagnostic compares synthetic images with training images and held-out real images.
 
 The original check reported a 32px nearest-neighbour distance of `min=3.20` without a reference scale, so
 there was no basis for deciding whether that was close. It also compared only with unflipped originals,
 while DDPM training uses `RandomHorizontalFlip`, leaving memorisation up to a mirror image undetected.
 
-### Building a reference scale from the fixed split
+### Fixed-split reference distances
 
 The 14 validation `df` are real lesions that the generator never saw, so their distance to the train set
 is a reference for a genuinely new `df`. Leave-one-out distances among the 85 real train `df` provide a
@@ -311,7 +307,7 @@ probability that a synthetic image is closer to the training set than a random g
 `0.060` and `0.038` in the two spaces, against `0.5` for indistinguishable. These measurements do not indicate close copying under the tested distance
 measures; they do not rule out all forms of memorisation or privacy leakage.
 
-### The diagnostic instead points to distribution shift
+### Distribution-shift measurements
 
 Cosine similarity to the nearest real `df` is `0.988` for train-to-train comparisons and `0.932` for new
 real `df`, but `0.501` for the synthetic set: the synthetic samples sit outside the real `df` distribution.
@@ -325,36 +321,33 @@ colour while being scattered in semantic content, which is not the same failure 
 generator producing near-duplicates.
 
 A resolution ladder found a synthetic-to-new-real-`df` distance ratio of `1.550` at 64px and `1.532` at 8px.
-At 8px, only coarse colour and shape remain, so the gap is not high-frequency detail and raising generator
-resolution would not close it. This finding did not support prioritising a higher-resolution retrain.
+The gap persists at 8px, where coarse colour and shape dominate. This does not establish the effect
+of higher-resolution training, but provides no direct support for prioritising it.
 
 Saturation is `0.093` against `0.188` for real `df`, contrast is `0.088` against `0.145`, and mean RGB is
-approximately `0.5` in every channel, at the centre of the normalised range. This is a sample regressing
-toward the data mean rather than a model that learned the wrong thing. Two controls support that reading:
+approximately `0.5` in every channel, at the centre of the normalised range. These measurements
+describe low saturation and contrast; they do not identify the training failure. Two controls provide context:
 passing real validation `df` through the same 64px bottleneck moves cosine similarity only from `0.932` to
-`0.905`, so resolution does not reproduce the gap; and real `df` sit `0.053` from the all-class mean RGB
-while the synthetic sit `0.239` from it, so this is not the generator averaging over its seven classes.
+`0.905`, so this resolution control does not reproduce the gap; and real `df` sit `0.053` from the all-class mean RGB
+while the synthetic sit `0.239` from it, which does not support simple averaging over its seven classes.
 
-### What the sampler sweep found
+### Sampler sweep
 
 The published set was drawn with DDIM at 50 steps and eta 0. A sweep over sampler settings on the same
-checkpoint isolates how much of the above is a sampling artefact, and it contradicted the initial guess.
-Step count was not the lever: 1000 steps at eta 0 gives saturation `0.090`, no better than 50 steps at
-`0.094`. Stochasticity was. Moving eta from 0 to 1 at 50 steps raises saturation to `0.253`, `1.35x` real
+checkpoint measures sensitivity to sampling parameters. Increasing to 1000 steps at eta 0 gives
+saturation `0.090`, compared with 50 steps at `0.094`. Moving eta from 0 to 1 at 50 steps raises
+saturation to `0.253`, `1.35x` real
 `df` and therefore past it rather than onto it.
 
-Colour is recoverable, distance is not. Every configuration tested leaves the embedding nearest-neighbour
-median between `0.97` and `1.07`, against `0.368` for genuinely new real `df`. No sampler setting moved the
-samples onto the real `df` manifold, which is the measurement that matters for augmentation. The epoch
-sweep at the published setting shows saturation still climbing at the end of training (`0.054` at epoch 60,
-`0.069` at 80, `0.094` at 100), so the run was also stopped while it was still improving.
+Across the tested configurations, saturation changes while the embedding nearest-neighbour
+median remains between `0.97` and `1.07`, against `0.368` for genuinely new real `df`. No sampler setting moved the
+samples near the real `df` reference under this metric. The epoch sweep at the published setting
+shows saturation increasing at the end of training (`0.054` at epoch 60, `0.069` at 80, `0.094` at 100).
+This trend alone does not establish image-quality improvement or training convergence.
 
-Inspecting the sweep images rather than only its statistics changes how the eta result should be read. The
-highest-saturation configuration produces frames in fluorescent cyan, magenta and flat orange that are not
-skin at all, and the 1000-step deterministic setting produces colour speckle. The recovered saturation is
-noise rather than restored skin tone, which is consistent with distance never improving, and it is a
-reminder that a single summary statistic can move in the right direction while the underlying samples get
-worse. The published setting is washed out but every image still reads as skin.
+The saved sweep images show fluorescent cyan, magenta and flat orange in the highest-saturation
+configuration, and colour speckle in the 1000-step deterministic setting. These observations limit
+interpretation of the saturation increase as improved image quality.
 
 ### Limits of interpretation
 
@@ -363,28 +356,28 @@ worse. The published setting is washed out but every image still reads as skin.
 - This diagnostic is descriptive: it defines no thresholds or pass/fail rule and performs no significance testing, consistent with the project constraints.
 - Distribution shift may explain the weak downstream difference, but the evidence does not demonstrate that it caused the result.
 
-### Where this leaves the generator
+### Remaining hypotheses
 
 The diagnostics did not support close copying, a high-frequency resolution deficit, or class averaging
 as the main explanation under the tested measures. The sampler sweep also did not recover the measured
 real-df distribution. Colour and contrast respond to eta, but nothing moves the samples onto the real `df` manifold,
 so a sampler change would produce more saturated images that are still off-distribution.
 
-What remains consistent with all of it is a capacity or data limit: 85 real training images is very little
-to learn a lesion class from, and the epoch sweep shows the run had not converged. Neither claim is
-established here, and no retrain, architecture change, or new condition is proposed on this evidence alone.
+Limited model capacity or the 85 real training images are possible explanations. The epoch sweep
+does not establish convergence or identify a cause. No retrain, architecture change, or new condition
+is proposed on this evidence alone.
 
-### Turning the diagnostic into a selection rule: C4-filtered
+### C4-filtered selection experiment
 
-The distance above is a distribution, not a single number, so the pre-registered follow-up in
+The pre-registered follow-up in
 `C4_FILTERED_EXPERIMENT_DESIGN.md` asks whether the subset closest to the real `df` manifold is more useful
-than the pool as a whole. Judge, distance, threshold and gate were all fixed before any outcome was seen.
+than the pool as a whole. Judge, distance, threshold and gate were fixed before C4-filtered training.
 
 That design had deferred itself on the grounds that only one to five per cent of the pool would clear the
 threshold. Those percentiles came from the earlier epoch-60 batch: the document was written five days
 before the batch mix-up was found. On the published epoch-100 pool the quartiles are `p25 = 0.851` and
-`p50 = 0.999` against an unchanged threshold of `0.901`, so **155 of the 500 images clear it (31%)**, and
-the gate's own reasoning no longer applies.
+`p50 = 0.999` against an unchanged threshold of `0.901`. The filter accepted 155 of the 500 images (31%),
+which cleared the minimum-count gate.
 
 Accepted images fill the df slots and real duplication fills the rest, so df stays at 585 and the condition
 differs from C1 only in the source of those rows.
@@ -395,10 +388,10 @@ differs from C1 only in the source of those rows.
 | C4@585 - all 500 synthetic | 0.6115 +/- 0.0423 | 0.6450 | 0.5208 |
 | C4-filtered - the 155 accepted | 0.6657 +/- 0.0182 | 0.6532 | 0.6250 |
 
-Read against the pre-registered rules, the result is **parity with C1 and a higher mean than C4**. The
+Read against the pre-registered rules, the result is parity with C1 and a higher mean than C4. The
 `+0.0059` over C1 is about a seventh of C1's own seed spread, and one test image moves df F1 by roughly
-`0.03`, so it is less than a single image: the accepted synthetic images did not beat duplicating the real
-ones. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, which is
+`0.03`. The observed increase is small relative to these sources of variation and does not establish
+a benefit over duplication. The `+0.0541` over C4 is larger than either spread, and C4 sat *below* C1 to begin with, which is
 consistent with the unfiltered pool lowering df F1 and filtering removing that loss in these runs.
 
 In this experiment, filtering improved the mean relative to unfiltered C4, with little difference
@@ -419,11 +412,11 @@ read-only against the fixed train and validation manifests and never use the tes
 
 The C4-filtered condition is `notebooks/colab_c4_filtered_classifier.ipynb` with
 `scripts/c4_filtered_select.py`. The selection step is also read-only against train and val, but the
-condition it feeds is a downstream classifier run and does evaluate the test split, once.
+condition it feeds is a downstream classifier run that reports final test metrics.
 
-## Constraints honored
+## Experimental constraints
 
 - Fixed `lesion_id` split is read, never re-derived (smoke test asserts no leakage).
-- No paths hard-coded to a personal machine — all via config/env.
+- No paths hard-coded to a personal machine - all via config/env.
 - DDPM/classifier train on the train split only.
 - df F1 is the primary metric; accuracy is never the headline.

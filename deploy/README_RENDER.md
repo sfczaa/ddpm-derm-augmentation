@@ -59,5 +59,5 @@ passed.
 During a free-tier cold start, the first root request briefly returned Render's
 `x-render-routing: no-server` 404. The next health request woke the service and
 returned 200, after which the full acceptance suite passed. This is a hosting
-limitation, not clinical validation. A local Docker build was not run because
-Docker CLI was unavailable.
+limitation, not clinical validation. Docker CLI was unavailable during this
+validation session; the later local Docker check is recorded in the root README.
