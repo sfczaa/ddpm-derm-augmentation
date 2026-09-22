@@ -154,8 +154,9 @@ class SpaceAppTests(unittest.TestCase):
         self.assertIn("Not for diagnosis or treatment", self.readme)
 
     def test_readme_does_not_overstate_the_synthetic_result(self):
-        self.assertIn("Not beyond duplication", self.readme)
-        self.assertIn("none was tested", self.readme)
+        prose = " ".join(self.readme.split())
+        self.assertIn("No significance test was performed", prose)
+        self.assertIn("do not establish a reliable benefit", prose)
 
 
 if __name__ == "__main__":
