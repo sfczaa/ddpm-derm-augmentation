@@ -1,19 +1,23 @@
+# Percent-format companion generated from colab_balanced_ddpm_classifier_validate.ipynb.
+
 # %% [markdown]
 # # C4-sqrt-balanced@585: validation
 
-# %%
-EXPECTED_COMMIT = "a6fc90c8f946c0d11e3e5e22d65131a092be361a"
+# %% [1] Repository pin
+EXPECTED_COMMIT = "b584bd321dd11258469f8c564bcc8a82a3ae11ac"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
-BRANCH = "balanced-ddpm-exploration"
+BRANCH = "main"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
 RUN_STORAGE_DIRNAME = "ddpm-derm-classifier-runs"
+RUN_VERSION = "c4_sqrt_balanced_v1_safe_v2"
 
 # %% [markdown]
 # ## 1. Runtime setup
 
-# %%
+# %% [2] Runtime checkout
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from google.colab import drive, userdata
@@ -63,15 +67,20 @@ assert commit == EXPECTED_COMMIT and not status
 assert token not in remote and "@" not in remote
 print("exact clean commit:", commit)
 print("remote contains token: False")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pandas>=2.0", "pillow>=12.3.0"], check=True)
+sys.path.insert(0, str(PROJECT_DIR / "src"))
+from ddpm_derm.notebook_runtime import require_training_runtime
+require_training_runtime()
 
 # %% [markdown]
 # ## 2. Data, candidate, and protected-output inventory
 
-# %%
+# %% [3] Data preflight
 import hashlib
 import json
 import shutil
 import sys
+sys.path.insert(0, str(PROJECT_DIR / "src"))
 import uuid
 from datetime import datetime, timezone
 
@@ -89,10 +98,11 @@ CANDIDATE_DIR = (
 CANDIDATE_MANIFEST = CANDIDATE_DIR / "synthetic_df.csv"
 SHARED_FORMAL_RUN_DIR = (
     OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_balanced_seed0_v1"
-    / "downstream_classifier" / "c4_sqrt_balanced_v1"
+    / "downstream_classifier" / RUN_VERSION
 )
 RUNNER_OUTPUTS_DIR = Path("/content/drive/MyDrive") / RUN_STORAGE_DIRNAME
-resolved_runner_outputs = RUNNER_OUTPUTS_DIR.resolve()
+assert RUNNER_OUTPUTS_DIR.is_dir(), f"missing shared runner root: {RUNNER_OUTPUTS_DIR}"
+resolved_runner_outputs = RUNNER_OUTPUTS_DIR.resolve(strict=True)
 assert str(resolved_runner_outputs).startswith("/content/drive/MyDrive/"), (
     "runner output root must belong to the signed-in account, not a shared "
     f"shortcut: {resolved_runner_outputs}"
@@ -104,7 +114,8 @@ def ensure_runner_directory(path):
     if not path.is_dir():
         path.mkdir()
     marker = path / ".directory_ready"
-    marker.write_text("ready\n", encoding="utf-8")
+    if not marker.exists():
+        marker.write_text("ready\n", encoding="utf-8")
     assert marker.read_text(encoding="utf-8") == "ready\n"
     return path
 
@@ -119,8 +130,8 @@ RUNNER_DOWNSTREAM_ROOT = ensure_runner_tree(
     RUNNER_OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_balanced_seed0_v1"
     / "downstream_classifier"
 )
-VALIDATION_ROOT = ensure_runner_tree(RUNNER_DOWNSTREAM_ROOT / "validation_runs")
-FORMAL_RUN_DIR = RUNNER_DOWNSTREAM_ROOT / "c4_sqrt_balanced_v1"
+VALIDATION_ROOT = ensure_runner_tree(RUNNER_DOWNSTREAM_ROOT / "validation_runs" / RUN_VERSION)
+FORMAL_RUN_DIR = RUNNER_DOWNSTREAM_ROOT / RUN_VERSION
 VALIDATION_DIR = VALIDATION_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 probe = RUNNER_OUTPUTS_DIR / f".write_probe_{uuid.uuid4().hex}.json"
 child_probe = RUNNER_OUTPUTS_DIR / f".child_write_probe_{uuid.uuid4().hex}.txt"
@@ -155,6 +166,7 @@ protected = [
     OUTPUTS_DIR / "ddpm",
     OUTPUTS_DIR / "synthetic_df",
     OUTPUTS_DIR / "deploy",
+    OUTPUTS_DIR / "exploratory_balanced_ddpm",
 ]
 
 def inventory(paths):
@@ -220,10 +232,9 @@ print("candidate OK: 500 RGB 64x64 PNG; SHA256", CANDIDATE_SHA256)
 # %% [markdown]
 # ## 3. Dependencies and repository checks
 
-# %%
+# %% [4] Dependency checks
 import sys
 
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pandas", "pillow"], check=True)
 import torch
 assert torch.cuda.is_available(), "T4/CUDA required"
 env = os.environ.copy()
@@ -238,7 +249,9 @@ print("repository smoke + torch-free classifier guards passed; GPU:", torch.cuda
 # %% [markdown]
 # ## 4. Tiny run, resume, and mismatch checks
 
-# %%
+# %% [5] Validation smoke
+from ddpm_derm.checkpoint import load_checkpoint
+
 import time
 
 def wait_for_files(paths, timeout_seconds=120):
@@ -287,7 +300,7 @@ last_path = VALIDATION_DIR / "checkpoints" / "C4_seed0" / "last.pt"
 best_path = VALIDATION_DIR / "checkpoints" / "C4_seed0" / "best.pt"
 result_path = VALIDATION_DIR / "results" / "results_C4_seed0.json"
 wait_for_files((last_path, best_path, result_path))
-checkpoint = torch.load(last_path, map_location="cpu", weights_only=False)
+checkpoint = load_checkpoint(last_path, map_location="cpu")
 identity = checkpoint["run_identity"]
 assert checkpoint["epoch"] == 1 and len(checkpoint["history"]) == 1
 assert identity["run_label"] == "c4_sqrt_balanced_validation_smoke"
@@ -315,12 +328,14 @@ print("same-config resume, mismatch guard, unchanged checkpoint, and Drive-only 
 # %% [markdown]
 # ## 5. Stop before formal training
 
-# %%
+# %% [6] Validation record
 assert inventory(protected) == protected_before, "a frozen/formal output changed"
 assert not SHARED_FORMAL_RUN_DIR.exists(), "formal training path was created in shared project"
 assert not FORMAL_RUN_DIR.exists(), "formal training path was created"
 record = {
     "status": "passed",
+    "run_version": RUN_VERSION,
+    "source_manifest_sha256": sha256(LOCAL_DATA_DIR / "manifests" / "train.csv"),
     "formal_training_started": False,
     "git_commit": EXPECTED_COMMIT,
     "candidate_manifest_sha256": CANDIDATE_SHA256,
@@ -333,4 +348,8 @@ record = {
     json.dumps(record, indent=2), encoding="utf-8"
 )
 print(json.dumps(record, indent=2))
-print("VALIDATION PASSED — FORMAL TRAINING NOT STARTED")
+print("VALIDATION PASSED - FORMAL TRAINING NOT STARTED")
+validation_pointer = VALIDATION_ROOT / "validation_record.json"
+validation_tmp = validation_pointer.with_suffix(".json.tmp")
+validation_tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+validation_tmp.replace(validation_pointer)

@@ -1,20 +1,22 @@
+# Percent-format companion generated from colab_balanced_ddpm_classifier_train.ipynb.
+
 # %% [markdown]
 # # C4-sqrt-balanced@585: classifier training
 #
 # Descriptive comparisons only.
 
-# %%
+# %% [1] Run mode
 RUN_MODE = "fresh"  # "fresh" or "resume"
-RUN_VERSION = "c4_sqrt_balanced_v1"
+RUN_VERSION = "c4_sqrt_balanced_v1_safe_v2"
 
-# %%
-EXPECTED_COMMIT = "a6fc90c8f946c0d11e3e5e22d65131a092be361a"
+# %% [2] Repository pin
+EXPECTED_COMMIT = "b584bd321dd11258469f8c564bcc8a82a3ae11ac"
 REPO_URL = "https://github.com/sfczaa/ddpm-derm-augmentation.git"
-BRANCH = "balanced-ddpm-exploration"
+BRANCH = "main"
 CANDIDATE_SHA256 = "9ef9b44e404f74aab8211f4e7d123da3258ba8ba4e3004a4147d1761ed343b34"
 RUN_STORAGE_DIRNAME = "ddpm-derm-classifier-runs"
 assert RUN_MODE in {"fresh", "resume"}
-assert RUN_VERSION == "c4_sqrt_balanced_v1"
+assert RUN_VERSION == "c4_sqrt_balanced_v1_safe_v2"
 assert len(EXPECTED_COMMIT) == 40 and EXPECTED_COMMIT != "REPLACE_AFTER_PUSH", (
     "Notebook is not pinned to a pushed commit."
 )
@@ -22,9 +24,10 @@ assert len(EXPECTED_COMMIT) == 40 and EXPECTED_COMMIT != "REPLACE_AFTER_PUSH", (
 # %% [markdown]
 # ## 1. Runtime and data setup
 
-# %%
+# %% [3] Runtime checkout
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from google.colab import drive, userdata
@@ -68,13 +71,18 @@ status = subprocess.run(
 assert commit == EXPECTED_COMMIT and not status
 assert token not in remote and "@" not in remote
 print("exact clean commit:", commit, "remote contains token: False")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pandas>=2.0", "pillow>=12.3.0"], check=True)
+sys.path.insert(0, str(PROJECT_DIR / "src"))
+from ddpm_derm.notebook_runtime import require_training_runtime
+require_training_runtime()
 
-# %%
+# %% [4] Data preflight
 import hashlib
 import json
 import shutil
 import socket
 import sys
+sys.path.insert(0, str(PROJECT_DIR / "src"))
 import uuid
 from datetime import datetime, timezone
 
@@ -91,7 +99,8 @@ SOURCE_EXPLORATORY_ROOT = OUTPUTS_DIR / "exploratory_balanced_ddpm" / "sqrt_bala
 CANDIDATE_DIR = SOURCE_EXPLORATORY_ROOT / "candidate_synthetic_df" / "epoch0100_seed0"
 CANDIDATE_MANIFEST = CANDIDATE_DIR / "synthetic_df.csv"
 RUNNER_OUTPUTS_DIR = Path("/content/drive/MyDrive") / RUN_STORAGE_DIRNAME
-resolved_runner_outputs = RUNNER_OUTPUTS_DIR.resolve()
+assert RUNNER_OUTPUTS_DIR.is_dir(), f"missing shared runner root: {RUNNER_OUTPUTS_DIR}"
+resolved_runner_outputs = RUNNER_OUTPUTS_DIR.resolve(strict=True)
 assert str(resolved_runner_outputs).startswith("/content/drive/MyDrive/"), (
     "runner output root must belong to the signed-in account, not a shared "
     f"shortcut: {resolved_runner_outputs}"
@@ -103,7 +112,8 @@ def ensure_runner_directory(path):
     if not path.is_dir():
         path.mkdir()
     marker = path / ".directory_ready"
-    marker.write_text("ready\n", encoding="utf-8")
+    if not marker.exists():
+        marker.write_text("ready\n", encoding="utf-8")
     assert marker.read_text(encoding="utf-8") == "ready\n"
     return path
 
@@ -193,7 +203,7 @@ print("data/candidate preflight passed; candidate SHA256", CANDIDATE_SHA256)
 # ## 2. Fresh or resume gate and run marker
 # Never run this `RUN_VERSION` from two accounts at the same time.
 
-# %%
+# %% [5] Formal gate
 FIXED_CONFIG = {
     "run_label": RUN_VERSION,
     "variant": "C4",
@@ -211,12 +221,20 @@ FIXED_CONFIG = {
     "test_count": 1510,
 }
 SOURCE_MANIFEST_SHA256 = sha256(LOCAL_DATA_DIR / "manifests" / "train.csv")
+VALIDATION_RECORD = RUNNER_DOWNSTREAM_ROOT / "validation_runs" / RUN_VERSION / "validation_record.json"
+validation = json.loads(VALIDATION_RECORD.read_text(encoding="utf-8"))
+assert validation["status"] == "passed" and validation["formal_training_started"] is False
+assert validation["run_version"] == RUN_VERSION and validation["git_commit"] == EXPECTED_COMMIT
+assert validation["candidate_manifest_sha256"] == CANDIDATE_SHA256
+assert validation["source_manifest_sha256"] == SOURCE_MANIFEST_SHA256
+assert validation["runner_output_root"] == str(RUNNER_OUTPUTS_DIR)
 protected = [
     OUTPUTS_DIR / "classifier",
     OUTPUTS_DIR / "classifier_df585",
     OUTPUTS_DIR / "ddpm",
     OUTPUTS_DIR / "synthetic_df",
     OUTPUTS_DIR / "deploy",
+    OUTPUTS_DIR / "exploratory_balanced_ddpm",
 ]
 
 def inventory(paths):
@@ -295,7 +313,9 @@ print("checkpoint cadence: every epoch; worst-case loss: one unfinished epoch")
 # %% [markdown]
 # ## 3. Sequential training with heartbeat
 
-# %%
+# %% [6] Training
+from ddpm_derm.checkpoint import load_checkpoint
+
 import queue
 import threading
 import time
@@ -344,7 +364,7 @@ def validate_seed(seed):
         "df_target_count": 585, "pretrained": True, "limit": None,
     }
     for path, expected_epoch in ((best, None), (last, 20)):
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint = load_checkpoint(path, map_location="cpu")
         assert checkpoint["run_identity"] == identity
         checkpoint_epoch = checkpoint["epoch"]
         checkpoint_history = checkpoint["history"]
@@ -410,7 +430,7 @@ for seed in FIXED_CONFIG["seeds"]:
 # %% [markdown]
 # ## 4. Verify, aggregate, and compare with matched-585
 
-# %%
+# %% [7] Results
 import numpy as np
 
 new_runs = [validate_seed(seed) for seed in FIXED_CONFIG["seeds"]]
@@ -486,7 +506,7 @@ print(json.dumps(comparison["mean_difference_test_df_f1"], indent=2))
 # %% [markdown]
 # ## 5. Artifact inventory and completion marker
 
-# %%
+# %% [8] Completion
 checkpoint_inventory = []
 for seed in FIXED_CONFIG["seeds"]:
     for name in ("best.pt", "last.pt"):
