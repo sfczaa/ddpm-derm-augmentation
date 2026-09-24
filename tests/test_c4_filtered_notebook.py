@@ -74,7 +74,7 @@ class C4FilteredNotebookTests(unittest.TestCase):
         match = re.search(r'EXPECTED_GIT_COMMIT = "([^"]+)"', self.code)
         self.assertIsNotNone(match, "the notebook must declare EXPECTED_GIT_COMMIT")
         pin = match.group(1)
-        self.assertNotEqual(pin, "REPLACE_AFTER_PUSH", "pin the reviewed pushed commit")
+        self.assertNotEqual(pin, "REPLACE_AFTER_PUSH", "implementation commit is not pinned")
         self.assertRegex(pin, r"^[0-9a-f]{40}$")
 
         exists = subprocess.run(

@@ -1,12 +1,8 @@
 """Train a downstream classifier for one variant/seed and write a results JSON.
 
-Requires torch + torchvision, so this is meant to run on Colab (T4). Locally it
-is only import-checked indirectly; the data/metric logic it relies on is covered
-by scripts/smoke_test.py.
-
-Model selection uses the validation df F1 (the project's primary metric); the
-reported numbers are computed on the held-out test split. Run this once per
-(variant, seed) and aggregate with scripts/aggregate_results.py.
+Requires torch and torchvision. Model selection uses validation df F1.
+Reported metrics use the held-out test split; scripts/aggregate_results.py
+combines the per-variant, per-seed results.
 
 Example
 -------

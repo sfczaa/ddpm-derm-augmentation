@@ -745,7 +745,7 @@ class ValidationNotebookTests(unittest.TestCase):
         self.assertNotIn(f'EXPECTED_GIT_COMMIT = "{PIN_PLACEHOLDER}"', first)
         self.assertIn(f'EXPECTED_GIT_COMMIT != "{PIN_PLACEHOLDER}"', first)
         self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
-        self.assertIn("Pin the reviewed pushed commit", first)
+        self.assertIn("EXPECTED_GIT_COMMIT must contain a pinned full commit SHA", first)
 
     def test_pinned_first_cell_passes_its_own_guard(self):
         notebook, _ = load(VALIDATION)

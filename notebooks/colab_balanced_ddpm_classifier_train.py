@@ -201,7 +201,7 @@ print("data/candidate preflight passed; candidate SHA256", CANDIDATE_SHA256)
 
 # %% [markdown]
 # ## 2. Fresh or resume gate and run marker
-# Never run this `RUN_VERSION` from two accounts at the same time.
+# One active writer per `RUN_VERSION`.
 
 # %% [5] Formal gate
 FIXED_CONFIG = {

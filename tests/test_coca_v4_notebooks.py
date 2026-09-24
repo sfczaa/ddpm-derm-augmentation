@@ -56,7 +56,7 @@ class CoCaV4NotebookTests(unittest.TestCase):
             )
             self.assertNotIn('EXPECTED_GIT_COMMIT = "REPLACE_AFTER_PUSH"', first)
             self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
-            self.assertIn("Pin the reviewed pushed commit", first)
+            self.assertIn("EXPECTED_GIT_COMMIT must contain a pinned full commit SHA", first)
             for index, cell in enumerate(notebook["cells"]):
                 self.assertFalse(cell.get("outputs"))
                 if cell["cell_type"] == "code":

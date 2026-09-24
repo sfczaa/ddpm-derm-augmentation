@@ -1,10 +1,4 @@
-"""Static safety checks for the all-class separability Colab diagnostic.
-
-The notebook is pinned to the independently reviewed, pushed implementation
-commit (keeping the REPLACE_AFTER_PUSH fail-loud guard), stays unexecuted and
-compilable, and never reaches test data, synthetic images, formal training, or
-checkpoints.
-"""
+"""Static checks for diagnostic commit pins, syntax and data-access boundaries."""
 
 from __future__ import annotations
 

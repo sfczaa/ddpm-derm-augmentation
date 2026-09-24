@@ -1,12 +1,7 @@
-"""Static safety checks for the df DDPM sampling-sweep diagnostic notebook.
+"""Static checks for sampling-sweep syntax and optional GH_TOKEN authentication.
 
-Real Colab failure this guards against: the notebook cloned the private repo
-anonymously (``git clone REPO_URL CODE_DIR`` with no credential) and exit-128'd
-before dependency install, GPU checks, smoke, or the sweep ever ran. These
-checks pin the fix to this repository's reviewed GH_TOKEN clone pattern
-(Colab Secret -> extraheader Basic auth on a child env, never on REPO_URL,
-the remote, or process-wide state) and would fail against the old anonymous
-clone. No real credential, no network, and nothing here executes a cell.
+Credentials use a child-process environment, never the repository URL,
+saved remote or process-wide environment. Tests use no real credentials.
 """
 
 from __future__ import annotations

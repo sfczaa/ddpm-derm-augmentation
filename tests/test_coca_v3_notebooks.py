@@ -53,7 +53,7 @@ class CoCaV3NotebookTests(unittest.TestCase):
             self.assertRegex(first, r'EXPECTED_GIT_COMMIT = "[0-9a-f]{40}"')
             self.assertIn('EXPECTED_GIT_COMMIT != "REPLACE_AFTER_PUSH"', first)
             self.assertIn("len(EXPECTED_GIT_COMMIT) == 40", first)
-            self.assertIn("Pin the reviewed pushed commit", first)
+            self.assertIn("EXPECTED_GIT_COMMIT must contain a pinned full commit SHA", first)
             for index, cell in enumerate(notebook["cells"]):
                 self.assertFalse(cell.get("outputs"))
                 if cell["cell_type"] == "code":
