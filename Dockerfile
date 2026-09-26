@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.2,<27" "setuptools>=83,<84"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
