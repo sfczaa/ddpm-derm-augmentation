@@ -16,6 +16,8 @@ COPY requirements-deploy.txt ./
 RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
     python -m pip install --no-cache-dir -r requirements-deploy.txt
 
+RUN python -m pip check
+
 COPY src ./src
 COPY app ./app
 COPY deploy ./deploy
